@@ -1,0 +1,26 @@
+services:
+  hermes:
+    build: .
+    image: hermes:1.0.0
+    container_name: hermes
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      # container path; the .env default is Windows-friendly and relative
+      HERMES_AUDIT_PATH: /var/log/hermes/audit.jsonl
+      HERMES_POLICY: /srv/config/policy.yaml
+    volumes:
+      # Hot-reload policy without rebuilding: edit config/policy.yaml,
+      # then POST /v1/policy/reload
+      - ./config:/srv/config:ro
+      - hermes-logs:/var/log/hermes
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx;httpx.get('http://localhost:8080/healthz',timeout=4).raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  hermes-logs:

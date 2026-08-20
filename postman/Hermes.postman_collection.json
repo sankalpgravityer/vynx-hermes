@@ -1,0 +1,425 @@
+{
+  "info": {
+    "name": "Hermes - VNYX product verification",
+    "description": "Local test collection. Start with 00, then 01-06 which\nneed no VNYX token and no Gemini key.\n\nOpen Postman Console (Ctrl+Alt+C) to see the findings and\npatches printed as a readable list for each request.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080"
+    }
+  ],
+  "item": [
+    {
+      "name": "00 - Health check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/healthz",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "healthz"
+          ]
+        },
+        "description": "Confirms Hermes is up. Check llm_enabled and dry_run here."
+      },
+      "response": []
+    },
+    {
+      "name": "01 - Validate: your real Levi's record",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/validate",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "validate"
+          ]
+        },
+        "description": "The record from your screenshots, exactly as VNYX generated it.\nExpect: blocked. 6 findings, 3 patches.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"use_llm\": false,\n  \"product\": {\n    \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n    \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n    \"sku\": \"BEV-000325\",\n    \"productCode\": \"4314131618\",\n    \"lpnCode\": \"STCR-10032801\",\n    \"binCode\": \"ZONE A-02-12-3\",\n    \"binBarcode\": \"A-04-10-4\",\n    \"masterCategory\": \"Men\",\n    \"category\": \"Bottoms\",\n    \"subcategory\": \"Jeans\",\n    \"title\": \"Regular Levi's Jeans in Blue size 32\",\n    \"description\": \"Levi Strauss & Co. classic blue jeans with a straight, regular fit - a wardrobe staple crafted in denim and showing authentic lived-in character.\",\n    \"currency\": \"EUR\",\n    \"price\": \"38.99\",\n    \"retailPrice\": \"66.99\",\n    \"inventory\": 1,\n    \"gender\": \"Men\",\n    \"productSizingGuide\": \"Men Bottoms\",\n    \"internationalSize\": \"32\",\n    \"euSize\": \"42\",\n    \"size\": \"32\",\n    \"waist\": \"W32\",\n    \"lengthSize\": \"34\",\n    \"fit\": \"Regular\",\n    \"brand\": \"Levi Strauss & Co.\",\n    \"model\": \"Unknown\",\n    \"color\": \"Blue\",\n    \"material\": \"Denim\",\n    \"condition\": \"Lived In\",\n    \"grade\": \"C\",\n    \"defects\": [\n      \"Discoloration / fade\",\n      \"Snag / pull\"\n    ],\n    \"mannequin\": \"Women Top\",\n    \"hanger\": \"AM17226\",\n    \"supplier\": \"Unknown\",\n    \"confidence\": {\n      \"gender\": 90,\n      \"brand\": 99,\n      \"color\": 88,\n      \"material\": 90,\n      \"condition\": 95,\n      \"eu_size\": 90,\n      \"fit\": 90,\n      \"length_size\": 90,\n      \"model\": 0,\n      \"supplier\": 0,\n      \"waist\": 90,\n      \"size\": 90,\n      \"international_size\": 90\n    },\n    \"provenance\": {\n      \"price\": \"market\",\n      \"retail_price\": \"derived\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "console.log(\"STATUS:\", r.status, \"| publishable:\", r.publishable,",
+              "            \"| llm_calls:\", r.llm_calls, \"| \" + r.duration_ms + \"ms\");",
+              "(r.findings || []).forEach(f =>",
+              "  console.log(`  [${f.severity}] ${f.rule_id} ${f.message}`));",
+              "(r.patches || []).forEach(p =>",
+              "  console.log(`  [${p.action}] ${p.field}: ${JSON.stringify(p.old_value)} -> ${JSON.stringify(p.new_value)}`));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 - Validate: price ABOVE retail (the bug)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/validate",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "validate"
+          ]
+        },
+        "description": "price 79.99 vs retail 66.99. PRICE.001 fires as critical.\nprice is 'market' provenance and retail is 'derived', so Hermes\nback-solves the ANCHOR and only proposes it.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"use_llm\": false,\n  \"product\": {\n    \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n    \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n    \"sku\": \"BEV-000325\",\n    \"productCode\": \"4314131618\",\n    \"lpnCode\": \"STCR-10032801\",\n    \"binCode\": \"ZONE A-02-12-3\",\n    \"binBarcode\": \"A-04-10-4\",\n    \"masterCategory\": \"Men\",\n    \"category\": \"Bottoms\",\n    \"subcategory\": \"Jeans\",\n    \"title\": \"Regular Levi's Jeans in Blue size 32\",\n    \"description\": \"Levi Strauss & Co. classic blue jeans with a straight, regular fit - a wardrobe staple crafted in denim and showing authentic lived-in character.\",\n    \"currency\": \"EUR\",\n    \"price\": \"79.99\",\n    \"retailPrice\": \"66.99\",\n    \"inventory\": 1,\n    \"gender\": \"Men\",\n    \"productSizingGuide\": \"Men Bottoms\",\n    \"internationalSize\": \"32\",\n    \"euSize\": \"42\",\n    \"size\": \"32\",\n    \"waist\": \"W32\",\n    \"lengthSize\": \"34\",\n    \"fit\": \"Regular\",\n    \"brand\": \"Levi Strauss & Co.\",\n    \"model\": \"Unknown\",\n    \"color\": \"Blue\",\n    \"material\": \"Denim\",\n    \"condition\": \"Lived In\",\n    \"grade\": \"C\",\n    \"defects\": [\n      \"Discoloration / fade\",\n      \"Snag / pull\"\n    ],\n    \"mannequin\": \"Women Top\",\n    \"hanger\": \"AM17226\",\n    \"supplier\": \"Unknown\",\n    \"confidence\": {\n      \"gender\": 90,\n      \"brand\": 99,\n      \"color\": 88,\n      \"material\": 90,\n      \"condition\": 95,\n      \"eu_size\": 90,\n      \"fit\": 90,\n      \"length_size\": 90,\n      \"model\": 0,\n      \"supplier\": 0,\n      \"waist\": 90,\n      \"size\": 90,\n      \"international_size\": 90\n    },\n    \"provenance\": {\n      \"price\": \"market\",\n      \"retail_price\": \"derived\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "console.log(\"STATUS:\", r.status, \"| publishable:\", r.publishable,",
+              "            \"| llm_calls:\", r.llm_calls, \"| \" + r.duration_ms + \"ms\");",
+              "(r.findings || []).forEach(f =>",
+              "  console.log(`  [${f.severity}] ${f.rule_id} ${f.message}`));",
+              "(r.patches || []).forEach(p =>",
+              "  console.log(`  [${p.action}] ${p.field}: ${JSON.stringify(p.old_value)} -> ${JSON.stringify(p.new_value)}`));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 - Validate: grounded retail moves the price instead",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/validate",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "validate"
+          ]
+        },
+        "description": "Same numbers as 02, but retail_price provenance is 'grounded'.\nNow the anchor outranks the price, so the PRICE gets recomputed\ndown into the Grade C band. Same bug, opposite repair.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"use_llm\": false,\n  \"product\": {\n    \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n    \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n    \"sku\": \"BEV-000325\",\n    \"productCode\": \"4314131618\",\n    \"lpnCode\": \"STCR-10032801\",\n    \"binCode\": \"ZONE A-02-12-3\",\n    \"binBarcode\": \"A-04-10-4\",\n    \"masterCategory\": \"Men\",\n    \"category\": \"Bottoms\",\n    \"subcategory\": \"Jeans\",\n    \"title\": \"Regular Levi's Jeans in Blue size 32\",\n    \"description\": \"Levi Strauss & Co. classic blue jeans with a straight, regular fit - a wardrobe staple crafted in denim and showing authentic lived-in character.\",\n    \"currency\": \"EUR\",\n    \"price\": \"79.99\",\n    \"retailPrice\": \"66.99\",\n    \"inventory\": 1,\n    \"gender\": \"Men\",\n    \"productSizingGuide\": \"Men Bottoms\",\n    \"internationalSize\": \"32\",\n    \"euSize\": \"42\",\n    \"size\": \"32\",\n    \"waist\": \"W32\",\n    \"lengthSize\": \"34\",\n    \"fit\": \"Regular\",\n    \"brand\": \"Levi Strauss & Co.\",\n    \"model\": \"Unknown\",\n    \"color\": \"Blue\",\n    \"material\": \"Denim\",\n    \"condition\": \"Lived In\",\n    \"grade\": \"C\",\n    \"defects\": [\n      \"Discoloration / fade\",\n      \"Snag / pull\"\n    ],\n    \"mannequin\": \"Women Top\",\n    \"hanger\": \"AM17226\",\n    \"supplier\": \"Unknown\",\n    \"confidence\": {\n      \"gender\": 90,\n      \"brand\": 99,\n      \"color\": 88,\n      \"material\": 90,\n      \"condition\": 95,\n      \"eu_size\": 90,\n      \"fit\": 90,\n      \"length_size\": 90,\n      \"model\": 0,\n      \"supplier\": 0,\n      \"waist\": 90,\n      \"size\": 90,\n      \"international_size\": 90\n    },\n    \"provenance\": {\n      \"price\": \"ai\",\n      \"retail_price\": \"grounded\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "console.log(\"STATUS:\", r.status, \"| publishable:\", r.publishable,",
+              "            \"| llm_calls:\", r.llm_calls, \"| \" + r.duration_ms + \"ms\");",
+              "(r.findings || []).forEach(f =>",
+              "  console.log(`  [${f.severity}] ${f.rule_id} ${f.message}`));",
+              "(r.patches || []).forEach(p =>",
+              "  console.log(`  [${p.action}] ${p.field}: ${JSON.stringify(p.old_value)} -> ${JSON.stringify(p.new_value)}`));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 - Validate: operator-locked price",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/validate",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "validate"
+          ]
+        },
+        "description": "lockedFields:['price']. Hermes must escalate, never overwrite.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"use_llm\": false,\n  \"product\": {\n    \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n    \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n    \"sku\": \"BEV-000325\",\n    \"productCode\": \"4314131618\",\n    \"lpnCode\": \"STCR-10032801\",\n    \"binCode\": \"ZONE A-02-12-3\",\n    \"binBarcode\": \"A-04-10-4\",\n    \"masterCategory\": \"Men\",\n    \"category\": \"Bottoms\",\n    \"subcategory\": \"Jeans\",\n    \"title\": \"Regular Levi's Jeans in Blue size 32\",\n    \"description\": \"Levi Strauss & Co. classic blue jeans with a straight, regular fit - a wardrobe staple crafted in denim and showing authentic lived-in character.\",\n    \"currency\": \"EUR\",\n    \"price\": \"79.99\",\n    \"retailPrice\": \"66.99\",\n    \"inventory\": 1,\n    \"gender\": \"Men\",\n    \"productSizingGuide\": \"Men Bottoms\",\n    \"internationalSize\": \"32\",\n    \"euSize\": \"42\",\n    \"size\": \"32\",\n    \"waist\": \"W32\",\n    \"lengthSize\": \"34\",\n    \"fit\": \"Regular\",\n    \"brand\": \"Levi Strauss & Co.\",\n    \"model\": \"Unknown\",\n    \"color\": \"Blue\",\n    \"material\": \"Denim\",\n    \"condition\": \"Lived In\",\n    \"grade\": \"C\",\n    \"defects\": [\n      \"Discoloration / fade\",\n      \"Snag / pull\"\n    ],\n    \"mannequin\": \"Women Top\",\n    \"hanger\": \"AM17226\",\n    \"supplier\": \"Unknown\",\n    \"confidence\": {\n      \"gender\": 90,\n      \"brand\": 99,\n      \"color\": 88,\n      \"material\": 90,\n      \"condition\": 95,\n      \"eu_size\": 90,\n      \"fit\": 90,\n      \"length_size\": 90,\n      \"model\": 0,\n      \"supplier\": 0,\n      \"waist\": 90,\n      \"size\": 90,\n      \"international_size\": 90\n    },\n    \"provenance\": {\n      \"price\": \"market\",\n      \"retail_price\": \"derived\"\n    },\n    \"lockedFields\": [\n      \"price\"\n    ]\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "console.log(\"STATUS:\", r.status, \"| publishable:\", r.publishable,",
+              "            \"| llm_calls:\", r.llm_calls, \"| \" + r.duration_ms + \"ms\");",
+              "(r.findings || []).forEach(f =>",
+              "  console.log(`  [${f.severity}] ${f.rule_id} ${f.message}`));",
+              "(r.patches || []).forEach(p =>",
+              "  console.log(`  [${p.action}] ${p.field}: ${JSON.stringify(p.old_value)} -> ${JSON.stringify(p.new_value)}`));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 - Validate: clean control",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/validate",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "validate"
+          ]
+        },
+        "description": "Everything corrected. Expect status 'clean', no findings.\nRun this to prove the rules aren't just firing on everything.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"use_llm\": false,\n  \"product\": {\n    \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n    \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n    \"sku\": \"BEV-000325\",\n    \"productCode\": \"4314131618\",\n    \"lpnCode\": \"STCR-10032801\",\n    \"binCode\": \"ZONE A-02-12-3\",\n    \"binBarcode\": \"ZONE A-02-12-3\",\n    \"masterCategory\": \"Men\",\n    \"category\": \"Bottoms\",\n    \"subcategory\": \"Jeans\",\n    \"title\": \"Levi Strauss & Co. Blue Jeans size 32\",\n    \"description\": \"Levi Strauss & Co. classic blue jeans with a straight, regular fit - a wardrobe staple crafted in denim and showing authentic lived-in character.\",\n    \"currency\": \"EUR\",\n    \"price\": \"23.99\",\n    \"retailPrice\": \"66.99\",\n    \"inventory\": 1,\n    \"gender\": \"Men\",\n    \"productSizingGuide\": \"Men Bottoms\",\n    \"internationalSize\": \"32\",\n    \"euSize\": \"48\",\n    \"size\": \"32\",\n    \"waist\": \"W32\",\n    \"lengthSize\": \"34\",\n    \"fit\": \"Regular\",\n    \"brand\": \"Levi Strauss & Co.\",\n    \"model\": \"505 Regular Fit\",\n    \"color\": \"Blue\",\n    \"material\": \"Denim\",\n    \"condition\": \"Lived In\",\n    \"grade\": \"C\",\n    \"defects\": [\n      \"Discoloration / fade\",\n      \"Snag / pull\"\n    ],\n    \"mannequin\": \"Men Bottom\",\n    \"hanger\": \"AM17226\",\n    \"supplier\": \"Beverley Depot\",\n    \"confidence\": {\n      \"gender\": 90,\n      \"brand\": 99,\n      \"color\": 88,\n      \"material\": 90,\n      \"condition\": 95,\n      \"eu_size\": 90,\n      \"fit\": 90,\n      \"length_size\": 90,\n      \"model\": 82,\n      \"supplier\": 95,\n      \"waist\": 90,\n      \"size\": 90,\n      \"international_size\": 90\n    },\n    \"provenance\": {\n      \"price\": \"market\",\n      \"retail_price\": \"derived\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "console.log(\"STATUS:\", r.status, \"| publishable:\", r.publishable,",
+              "            \"| llm_calls:\", r.llm_calls, \"| \" + r.duration_ms + \"ms\");",
+              "(r.findings || []).forEach(f =>",
+              "  console.log(`  [${f.severity}] ${f.rule_id} ${f.message}`));",
+              "(r.patches || []).forEach(p =>",
+              "  console.log(`  [${p.action}] ${p.field}: ${JSON.stringify(p.old_value)} -> ${JSON.stringify(p.new_value)}`));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "06 - Validate: missing retail anchor",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/validate",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "validate"
+          ]
+        },
+        "description": "No RRP to multiply. With LLM off -> escalate.\nSet use_llm true and HERMES_LLM_ENABLED=true to see Gemini\nground the RRP via Google Search.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"use_llm\": false,\n  \"product\": {\n    \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n    \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n    \"sku\": \"BEV-000325\",\n    \"productCode\": \"4314131618\",\n    \"lpnCode\": \"STCR-10032801\",\n    \"binCode\": \"ZONE A-02-12-3\",\n    \"binBarcode\": \"A-04-10-4\",\n    \"masterCategory\": \"Men\",\n    \"category\": \"Bottoms\",\n    \"subcategory\": \"Jeans\",\n    \"title\": \"Regular Levi's Jeans in Blue size 32\",\n    \"description\": \"Levi Strauss & Co. classic blue jeans with a straight, regular fit - a wardrobe staple crafted in denim and showing authentic lived-in character.\",\n    \"currency\": \"EUR\",\n    \"price\": \"38.99\",\n    \"retailPrice\": null,\n    \"inventory\": 1,\n    \"gender\": \"Men\",\n    \"productSizingGuide\": \"Men Bottoms\",\n    \"internationalSize\": \"32\",\n    \"euSize\": \"42\",\n    \"size\": \"32\",\n    \"waist\": \"W32\",\n    \"lengthSize\": \"34\",\n    \"fit\": \"Regular\",\n    \"brand\": \"Levi Strauss & Co.\",\n    \"model\": \"Unknown\",\n    \"color\": \"Blue\",\n    \"material\": \"Denim\",\n    \"condition\": \"Lived In\",\n    \"grade\": \"C\",\n    \"defects\": [\n      \"Discoloration / fade\",\n      \"Snag / pull\"\n    ],\n    \"mannequin\": \"Women Top\",\n    \"hanger\": \"AM17226\",\n    \"supplier\": \"Unknown\",\n    \"confidence\": {\n      \"gender\": 90,\n      \"brand\": 99,\n      \"color\": 88,\n      \"material\": 90,\n      \"condition\": 95,\n      \"eu_size\": 90,\n      \"fit\": 90,\n      \"length_size\": 90,\n      \"model\": 0,\n      \"supplier\": 0,\n      \"waist\": 90,\n      \"size\": 90,\n      \"international_size\": 90\n    },\n    \"provenance\": {\n      \"price\": \"market\",\n      \"retail_price\": \"derived\"\n    }\n  }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": [],
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+              "const r = pm.response.json();",
+              "console.log(\"STATUS:\", r.status, \"| publishable:\", r.publishable,",
+              "            \"| llm_calls:\", r.llm_calls, \"| \" + r.duration_ms + \"ms\");",
+              "(r.findings || []).forEach(f =>",
+              "  console.log(`  [${f.severity}] ${f.rule_id} ${f.message}`));",
+              "(r.patches || []).forEach(p =>",
+              "  console.log(`  [${p.action}] ${p.field}: ${JSON.stringify(p.old_value)} -> ${JSON.stringify(p.new_value)}`));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "07 - Reconcile (writes to VNYX)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/reconcile",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "reconcile"
+          ]
+        },
+        "description": "Fetches by id and writes safe patches back. Needs VNYX_API_TOKEN.\nKeep HERMES_DRY_RUN=true until you trust the output.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"product_id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n  \"tenant_id\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n  \"use_llm\": true\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "08 - Batch sweep",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/v1/batch",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "batch"
+          ]
+        },
+        "description": "Background sweep. Results land in logs/audit.jsonl, not the response.",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"product_ids\": [\n    \"1a351701-7568-4414-8975-ce07d664ab95\"\n  ],\n  \"tenant_id\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n  \"apply\": false\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        }
+      },
+      "response": []
+    },
+    {
+      "name": "09 - Reload policy",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/v1/policy/reload",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "policy",
+            "reload"
+          ]
+        },
+        "description": "Edit config/policy.yaml, hit this, no restart needed.\nUse it to tune the grade bands while testing."
+      },
+      "response": []
+    }
+  ]
+}

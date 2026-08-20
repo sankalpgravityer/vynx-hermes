@@ -1,0 +1,47 @@
+# ── Secrets ─────────────────────────────────────────────────────────────────
+# .env holds a real GEMINI_API_KEY and (once set) a VNYX_API_TOKEN. Never
+# commit it — .env.example documents every variable instead.
+.env
+.env.*
+!.env.example
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtualenvs — 71MB here, and machine-specific. Recreate with
+# `pip install -r requirements.txt`.
+.venv/
+venv/
+env/
+ENV/
+
+# ── Test / tooling caches ───────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Runtime output ──────────────────────────────────────────────────────────
+# audit.jsonl records every product Hermes has judged, so it is real tenant
+# data and grows without bound. The directory is kept (the service writes into
+# it) but its contents are not tracked.
+logs/*
+!logs/.gitignore
+
+# ── Editors / OS ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,1483 @@
+{
+  "info": {
+    "name": "VNYX Review Verification (backend + Hermes)",
+    "description": "End-to-end tests for the review-queue verification endpoint.\n\nTWO SERVICES, run side by side:\n  vnyx-api  http://localhost:8000   (PORT in its .env)\n  hermes    http://localhost:8080\n\nRun folder 0 first \u2014 it logs in and stores the token and tenantId as collection variables, so nothing else needs manual setup.\n\nFolder 3 talks to Hermes DIRECTLY with hand-built payloads. Those need no database and no login, so they are the fastest way to see the rule engine work and the only part that runs if your DB is unreachable.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{accessToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "apiUrl",
+      "value": "http://localhost:8000",
+      "description": "vnyx-api. Matches PORT=8000 in its .env."
+    },
+    {
+      "key": "hermesUrl",
+      "value": "http://localhost:8080",
+      "description": "Hermes FastAPI service."
+    },
+    {
+      "key": "appUrl",
+      "value": "https://dev.vnyx.ai",
+      "description": "Frontend origin for the editUrl in folder-3 fixtures, which Hermes echoes back. Set to the DEPLOYED app because there is no local frontend and the backend reads the same dev database \u2014 so the link opens the real record. Keep it in step with PUBLIC_APP_BASE_URL in the backend .env."
+    },
+    {
+      "key": "email",
+      "value": "",
+      "description": "Login email."
+    },
+    {
+      "key": "password",
+      "value": "",
+      "description": "Login password."
+    },
+    {
+      "key": "accessToken",
+      "value": "",
+      "description": "Filled in by '0.2 Login'. Do not edit by hand."
+    },
+    {
+      "key": "tenantId",
+      "value": "34c354a5-3415-4513-85b8-d40c2ec3af7e",
+      "description": "Seeded by login; override to sweep another tenant."
+    },
+    {
+      "key": "productId",
+      "value": "1a351701-7568-4414-8975-ce07d664ab95",
+      "description": "A single product to re-check."
+    },
+    {
+      "key": "catalogJson",
+      "value": "{\"34c354a5-3415-4513-85b8-d40c2ec3af7e\": {\"categories\": {\"Men\": {\"Accessories\": [\"Belts\", \"Caps, Beanies & hats\", \"Gloves\", \"Scarves\"], \"Backpacks & Bags\": [\"Backpacks\", \"Bags\"], \"Bottoms\": [\"Chinos\", \"Dungarees\", \"Jeans\", \"Joggers\", \"Shorts\", \"Trousers\"], \"Jackets\": [\"Bomber Jackets\", \"Denim Jackets\", \"Fleece Jackets\", \"Leather Jackets\", \"Long Coats\", \"Outdoor Jackets\", \"Puffer Jackets\", \"Sports Jackets\", \"Windbreakers\", \"Winter Coats\"], \"Shirts\": [\"Business Shirts\", \"Casual Shirts\"], \"Shoes\": [\"Basketball\", \"Boots\", \"Football Boots\", \"Lifestyle\", \"Running\", \"Sandals & Slippers\"], \"Sweaters & Hoodies\": [\"Fleece Pullover\", \"Hoodies\", \"Sweaters\", \"Sweatshirts\"], \"T-Shirts & Polos\": [\"Long Sleeves\", \"Polo Shirts\", \"Sports T-shirts\", \"Tank Tops\", \"T-Shirts\"], \"Vests\": [\"Denim Vests\", \"Fleece Vests\", \"Leather Vests\", \"Puffer Vests\"]}, \"Women\": {\"Accessories\": [\"Belts\", \"Caps, Beanies & hats\", \"Gloves\", \"Scarves\"], \"Backpacks & Bags\": [\"Backpacks\", \"Bags\"], \"Bottoms\": [\"Chinos\", \"Dungarees\", \"Jeans\", \"Joggers\", \"Leather Trousers\", \"Leggings\", \"Trousers\"], \"Dresses\": [\"Casual Dresses\", \"Knitted Dresses\", \"Occasion Dresses\", \"Summer Dresses\"], \"Jackets\": [\"Bomber Jackets\", \"Denim Jackets\", \"Fleece Jackets\", \"Leather Jackets\", \"Long Coats\", \"Outdoor Jackets\", \"Puffer Jackets\", \"Sports Jackets\", \"Windbreakers\", \"Winter Coats\"], \"Shirts & Blouses\": [\"Blouses\", \"Shirt Blouses\", \"Tunics\"], \"Shoes\": [\"Basketball\", \"Boots\", \"Football Boots\", \"Heels\", \"Lifestyle\", \"Running\", \"Sandals & Slippers\"], \"Skirts\": [\"Denim Skirts\", \"Leather Skirts\", \"Maxi Skirts\", \"Mini Skirts\", \"Pencil Skirts\", \"Pleated Skirts\"], \"Sweaters & Hoodies\": [\"Fleece Pullover\", \"Hoodies\", \"Sweaters\", \"Sweatshirts\"], \"T-Shirts & Tops\": [\"Long-Sleeved Tops\", \"Polo Shirts\", \"Sports T-shirts\", \"Tops\", \"T-Shirts\"], \"Vests\": [\"Denim Vests\", \"Fleece Vests\", \"Leather Vests\", \"Puffer Vests\"]}}, \"sizingGuides\": {\"Defaults\": {\"sizes\": [\"XXS\", \"XS\", \"S\", \"M\", \"L\", \"XL\", \"XXL\", \"XXXL\", \"XXXXL\"], \"euSizes\": [\"42\", \"44\", \"46\", \"48\", \"50\", \"52\", \"54\", \"56\", \"58\"]}, \"Kids\": {\"sizes\": [\"56 cm\", \"62 cm\", \"68 cm\", \"74 cm\", \"80 cm\", \"86 cm\", \"92 cm\", \"98 cm\", \"104 cm\", \"110 cm\"], \"euSizes\": [\"56\", \"62\", \"68\", \"74\", \"80\", \"86\", \"92\", \"98\", \"104\", \"110\"]}, \"Men Bottoms\": {\"sizes\": [\"W21\", \"W22\", \"W23\", \"W24\", \"W25\", \"W26\", \"W27\", \"W28\", \"W29\", \"W30\", \"W31\", \"W32\", \"W33\", \"W34\", \"W35\", \"W36\", \"W37\", \"W38\", \"W39\", \"W40\", \"W41\", \"W42\", \"W43\", \"W44\"], \"euSizes\": [\"37\", \"38\", \"39\", \"40\", \"41\", \"42\", \"43\", \"44\", \"45\", \"46\", \"47\", \"48\", \"49\", \"50\", \"51\", \"52\", \"53\", \"54\", \"55\", \"56\", \"57\", \"58\", \"59\", \"60\"]}, \"Men DressShirts\": {\"sizes\": [\"XS\", \"S\", \"M\", \"L\", \"XL\", \"XXL\", \"XXXL\"], \"euSizes\": [\"44\", \"46\", \"48\", \"50\", \"52\", \"54\", \"56\"]}, \"Men Uppers\": {\"sizes\": [\"XXS\", \"XS\", \"S\", \"M\", \"L\", \"XL\", \"XXL\", \"XXXL\"], \"euSizes\": [\"42\", \"44\", \"46\", \"48\", \"50\", \"52\", \"54\", \"56\"]}, \"Women Bottoms\": {\"sizes\": [\"W23\", \"W24\", \"W25\", \"W26\", \"W27\", \"W28\", \"W29\", \"W30\", \"W31\", \"W32\", \"W33\", \"W34\", \"W35\", \"W36\", \"W37\", \"W38\", \"W39\", \"W40\"], \"euSizes\": [\"31\", \"32\", \"33\", \"34\", \"35\", \"36\", \"37\", \"38\", \"39\", \"40\", \"41\", \"42\", \"43\", \"44\", \"45\", \"46\", \"47\", \"48\"]}, \"Women Uppers\": {\"sizes\": [\"XXS\", \"XS\", \"S\", \"M\", \"L\", \"XL\", \"XXL\", \"XXXL\"], \"euSizes\": [\"32\", \"34\", \"36\", \"38\", \"40\", \"42\", \"44\", \"46\"]}}, \"colors\": [\"Beige\", \"Green\", \"Black\", \"Blue\", \"Pale Yellow\", \"Grey\", \"Charcoal\", \"Turquoise\", \"Pink\", \"Brown\", \"Burgundy\", \"Sage Green\", \"Taupe\", \"Light Grey\", \"Navy\", \"Forest Green\", \"Red\", \"Orange\", \"Mint\", \"Dusty Rose\", \"Teal\", \"Beige & Navy\", \"Cream\", \"Blue/Green/Cream\", \"Tan & Blue\", \"Light Blue\", \"Magenta\", \"Grey / Navy / Yellow (Multi-colour)\", \"Aqua\", \"Slate Blue\", \"Olive\", \"Dark Grey\", \"Red/Olive Plaid\", \"Blue on Cream\", \"Light Green\", \"Stone Grey\", \"Blue Grey\", \"Mustard\", \"Beige/Grey\", \"Black/Gray\", \"Camel\", \"Light Taupe\", \"Beige Plaid\", \"Light Beige\", \"Pink & Blue\", \"Steel Blue\", \"Yellow\", \"Dusty Blue\", \"Grey/Black\", \"Peach\", \"Light Khaki\", \"Stone\", \"Tan\", \"Light Mint\", \"Dark Grey & Orange\", \"Bronze\", \"Silver\", \"White/Teal\", \"Khaki\", \"White & Navy Plaid\", \"Olive Green\", \"Off White\", \"Light Pink\", \"Plum\", \"White & Navy\", \"Blue/Orange\", \"Grey multi\"], \"materials\": [\"Cotton\", \"Polar fleece\", \"Polyester\", \"Textile\", \"Cotton Blend\", \"Lightweight woven nylon\", \"Polyester, Virgin Wool (Merino), Elastane\", \"Fleece\", \"Technical fleece\", \"60% Lyocell, 40% Wool\", \"Polyester, Nylon, Elastane\", \"Synthetic\", \"Wool\", \"Polyester, Nylon\", \"Organic Cotton\", \"Lyocell/Wool\", \"Woolen\", \"Linen\", \"89% Polyester, 11% Cotton\", \"Brushed fleece\", \"87% Wool / 13% Nylon\", \"Cool-Lite\", \"Merino\", \"Technical waterproof shell\", \"Woolen Knit\", \"Sherpa fleece\", \"83% Polyester, 11% Lyocell (Tencel), 6% Spandex\", \"Flannel\", \"Technical shell\", \"100% Recycled Polyamide\", \"Polyester, Elastane\", \"100% RECYCLED POLYESTER\", \"Nylon/Polyester\", \"100% Polyester (Recycled)\", \"98% Polyester, 2% Elastane\", \"Wool blend\", \"Plush\", \"Nylon\", \"55% Wool (recycled), 15% Wool (recycled), 30% Polyamide\", \"GORE-TEX\", \"100% Recycled Nylon\", \"Softshell\", \"Softshell & Fleece\", \"60% Cotton, 20% Cotton (recycled denim), 20% Tencel\", \"70% Tencel (Lyocell), 30% Cotton\", \"Polyamide/Elastane\", \"70% TENCEL (LYOCELL) / 30% COTTON\", \"88% recycled polyamide, 12% elastane\", \"Knit\", \"Mesh\", \"Down-filled (90/10, 600 CUIN) with nylon shell\", \"Polyester shell with polar fleece lining\", \"Cotton Terry\", \"Technical shell fabric\", \"Synthetic stretch (nylon/elastane)\", \"91% Polyester, 9% Elastane\", \"Denim\"], \"brands\": [\"8848 ALTITUDE\", \"Adidas\", \"AGU\", \"Aigle\", \"ARC'TERYX\", \"AVABUCHS\", \"AVALLAR\", \"AYACUCHO\", \"Berghaus\", \"Bever\", \"BJ\\u00d6RN BORG\", \"BLUE LOOP\", \"BOAS\", \"BORG\", \"BRUNOTTI\", \"BUAS\", \"CAVALLARO\", \"Columbia\", \"CRAFT\", \"CRAGHOPPERS\", \"Dare 2b\", \"DIDRIKSONS\", \"EIDER\", \"Falcon\", \"FICON\", \"Fjall Raven\", \"Fj\\u00e4llr\\u00e4ven\", \"G Adventures\", \"GOREWEAR\", \"Hagl\\u00f6fs\", \"Harley-Davidson\", \"Helly Hansen\", \"HIBP\", \"icebreaker\", \"ICEPEAK\", \"INNOWIVE\", \"Jack Wolfskin\", \"KAVU\", \"Levi Strauss & Co.\", \"Mammut\", \"MCKINLEY\", \"Mountain Hardwear\", \"mountainlife\", \"Nike\", \"Odlo\", \"ONEILL\", \"Patagonia\", \"PeakPerformance\", \"Picture Organic Clothing\", \"prAna\", \"Protest\", \"Rab\", \"ROYAL ROBBINS\", \"RYX\", \"sherpa\", \"Superdry\", \"TENSON\", \"TERNUA\", \"The North Face\", \"TOM DAV\", \"TRAIL\", \"ULTRA FLIRT\", \"VAUDE\"]}}",
+      "description": "Real tenant option lists (categories, sizing charts, colours, materials, brands), captured from dev.vnyx.ai. Referenced by every folder-3 body so there is one copy, not eight. Delete the `catalog` key from a body to see what the hardcoded fallbacks would have reported instead."
+    }
+  ],
+  "item": [
+    {
+      "name": "0 - Setup (run these first)",
+      "item": [
+        {
+          "name": "0.1 Hermes is up",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{hermesUrl}}/healthz",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "healthz"
+              ]
+            },
+            "description": "Liveness, active model, dry-run state, and the rule groups loaded. `rule_groups` should list 8 including `catalog`.\n\nIf this fails, nothing else in folder 1 or 3 will work.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`llm_enabled=${b.llm_enabled} model=${b.model} dry_run=${b.dry_run}`);",
+                  "console.log(\"rule groups: \" + (b.rule_groups || []).join(\", \"));",
+                  "pm.test(\"catalog rule group is loaded\", () =>",
+                  "  pm.expect(b.rule_groups).to.include(\"catalog\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "0.2 Login (saves token + tenantId)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{apiUrl}}/auth/login",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Set the `email` and `password` collection variables first.\n\nStores `accessToken` and `tenantId` for every later request, and prints the tenants you can sweep.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "",
+                  "const b = pm.response.json();",
+                  "pm.test(\"got an access token\", () => pm.expect(b.accessToken).to.be.a(\"string\"));",
+                  "",
+                  "pm.collectionVariables.set(\"accessToken\", b.accessToken);",
+                  "console.log(\"accessToken saved to the collection.\");",
+                  "",
+                  "// Seed tenantId from the login response so the rest of the collection works",
+                  "// with no manual setup. MASTER_ADMIN / OWNER get no tenant here (their scope is",
+                  "// chosen per request), so it is only overwritten when the response carries one.",
+                  "const tid = b.lastActiveTenantId || (b.user && b.user.tenant && b.user.tenant.id);",
+                  "if (tid) {",
+                  "  pm.collectionVariables.set(\"tenantId\", tid);",
+                  "  console.log(\"tenantId set to \" + tid);",
+                  "} else {",
+                  "  console.log(\"No tenant on the login response (OWNER/MASTER_ADMIN) \u2014 \" +",
+                  "              \"set the tenantId variable by hand.\");",
+                  "}",
+                  "",
+                  "if (b.memberships && b.memberships.length) {",
+                  "  console.log(\"Tenants you can pass as tenantId:\");",
+                  "  b.memberships.forEach((m) =>",
+                  "    console.log(`  ${m.tenantId}  ${m.tenantName || \"\"} (${m.role})`));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "0.3 Backend can reach Hermes",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/health",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "health"
+              ]
+            },
+            "description": "Proves the LINK between the two services, which 0.1 does not: this is the backend calling Hermes using its own HERMES_BASE_URL.\n\n503 here with 0.1 passing means HERMES_BASE_URL in the backend .env is wrong."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK \u2014 backend reached Hermes\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "if (pm.response.code === 503) {",
+                  "  console.warn(\"Backend could not reach Hermes: \" + b.error);",
+                  "  console.warn(\"Check HERMES_BASE_URL in the vnyx-api .env.\");",
+                  "} else {",
+                  "  console.log(\"Backend -> Hermes OK. \" + JSON.stringify(b.hermes));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1 - Review queue (the endpoint you call)",
+      "item": [
+        {
+          "name": "1.1 Pending tab, all rows + verdicts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/queue?tenantId={{tenantId}}&status=pending&take=20",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "queue"
+              ],
+              "query": [
+                {
+                  "key": "tenantId",
+                  "value": "{{tenantId}}"
+                },
+                {
+                  "key": "status",
+                  "value": "pending"
+                },
+                {
+                  "key": "take",
+                  "value": "20"
+                }
+              ]
+            },
+            "description": "The main call. Every product in the Review tab, each judged correct or not, with `editUrl` on every row.\n\nOpen the Postman console (Ctrl+Alt+C) \u2014 the test script prints each failing product, its findings and its fix link."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "",
+                  "const b = pm.response.json();",
+                  "",
+                  "console.log(\"\u2500\".repeat(70));",
+                  "console.log(`tab=${b.fromTab}  total=${b.total}  returned=${b.items.length}`);",
+                  "console.log(`checked=${b.checked}  incorrect=${b.incorrect}`);",
+                  "console.log(`hermes reachable: ${b.verification.available}`);",
+                  "",
+                  "if (!b.verification.available) {",
+                  "  console.warn(\"Hermes did NOT answer: \" + b.verification.error);",
+                  "  console.warn(\"Every verdict is correct:null \u2014 that means UNCHECKED, not clean.\");",
+                  "}",
+                  "",
+                  "b.items.forEach((i) => {",
+                  "  const v = i.verification;",
+                  "  if (v.correct === true) return;",
+                  "  const mark = v.correct === null ? \"?\" : \"x\";",
+                  "  console.log(\"\");",
+                  "  console.log(`${mark} ${i.sku || i.id}  ${i.title || \"\"}`);",
+                  "  console.log(`   price=${i.price} retail=${i.retailPrice} grade=${i.grade}`);",
+                  "  if (i.priceExpectation && i.priceExpectation.expectedPrice !== null) {",
+                  "    console.log(`   expected=${i.priceExpectation.expectedPrice} ` +",
+                  "                `(factor ${i.priceExpectation.priceFactor}) ` +",
+                  "                `delta=${i.priceExpectation.delta}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (v.advisory_count) console.log(`   (+${v.advisory_count} advisory)`);",
+                  "  console.log(`   FIX HERE: ${i.editUrl}`);",
+                  "});",
+                  "",
+                  "// A queue that answered but checked nothing means Hermes is down \u2014 the whole",
+                  "// point of the fail-soft design is that you can tell the difference.",
+                  "pm.test(\"verification service answered\", () =>",
+                  "  pm.expect(b.verification.available, b.verification.error || \"\").to.be.true);",
+                  "",
+                  "pm.test(\"every returned row carries an edit URL\", () =>",
+                  "  b.items.forEach((i) => pm.expect(i.editUrl).to.be.a(\"string\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.2 Only the incorrect ones",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/queue?tenantId={{tenantId}}&status=pending&take=50&onlyIncorrect=true",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "queue"
+              ],
+              "query": [
+                {
+                  "key": "tenantId",
+                  "value": "{{tenantId}}"
+                },
+                {
+                  "key": "status",
+                  "value": "pending"
+                },
+                {
+                  "key": "take",
+                  "value": "50"
+                },
+                {
+                  "key": "onlyIncorrect",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "The work list. Rows that passed are withheld; rows that could not be CHECKED are kept, because dropping them would present a Hermes outage as a clean queue."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "",
+                  "const b = pm.response.json();",
+                  "",
+                  "console.log(\"\u2500\".repeat(70));",
+                  "console.log(`tab=${b.fromTab}  total=${b.total}  returned=${b.items.length}`);",
+                  "console.log(`checked=${b.checked}  incorrect=${b.incorrect}`);",
+                  "console.log(`hermes reachable: ${b.verification.available}`);",
+                  "",
+                  "if (!b.verification.available) {",
+                  "  console.warn(\"Hermes did NOT answer: \" + b.verification.error);",
+                  "  console.warn(\"Every verdict is correct:null \u2014 that means UNCHECKED, not clean.\");",
+                  "}",
+                  "",
+                  "b.items.forEach((i) => {",
+                  "  const v = i.verification;",
+                  "  if (v.correct === true) return;",
+                  "  const mark = v.correct === null ? \"?\" : \"x\";",
+                  "  console.log(\"\");",
+                  "  console.log(`${mark} ${i.sku || i.id}  ${i.title || \"\"}`);",
+                  "  console.log(`   price=${i.price} retail=${i.retailPrice} grade=${i.grade}`);",
+                  "  if (i.priceExpectation && i.priceExpectation.expectedPrice !== null) {",
+                  "    console.log(`   expected=${i.priceExpectation.expectedPrice} ` +",
+                  "                `(factor ${i.priceExpectation.priceFactor}) ` +",
+                  "                `delta=${i.priceExpectation.delta}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (v.advisory_count) console.log(`   (+${v.advisory_count} advisory)`);",
+                  "  console.log(`   FIX HERE: ${i.editUrl}`);",
+                  "});",
+                  "",
+                  "// A queue that answered but checked nothing means Hermes is down \u2014 the whole",
+                  "// point of the fail-soft design is that you can tell the difference.",
+                  "pm.test(\"verification service answered\", () =>",
+                  "  pm.expect(b.verification.available, b.verification.error || \"\").to.be.true);",
+                  "",
+                  "pm.test(\"every returned row carries an edit URL\", () =>",
+                  "  b.items.forEach((i) => pm.expect(i.editUrl).to.be.a(\"string\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.3 Every finding counts (minSeverity=low)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/queue?tenantId={{tenantId}}&status=pending&take=20&minSeverity=low",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "queue"
+              ],
+              "query": [
+                {
+                  "key": "tenantId",
+                  "value": "{{tenantId}}"
+                },
+                {
+                  "key": "status",
+                  "value": "pending"
+                },
+                {
+                  "key": "take",
+                  "value": "20"
+                },
+                {
+                  "key": "minSeverity",
+                  "value": "low"
+                }
+              ]
+            },
+            "description": "Default is `medium`, which treats CONF.* and TEXT.* as advisories. `low` makes them disqualifying too \u2014 expect many more incorrect rows, most of them cosmetic."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "",
+                  "const b = pm.response.json();",
+                  "",
+                  "console.log(\"\u2500\".repeat(70));",
+                  "console.log(`tab=${b.fromTab}  total=${b.total}  returned=${b.items.length}`);",
+                  "console.log(`checked=${b.checked}  incorrect=${b.incorrect}`);",
+                  "console.log(`hermes reachable: ${b.verification.available}`);",
+                  "",
+                  "if (!b.verification.available) {",
+                  "  console.warn(\"Hermes did NOT answer: \" + b.verification.error);",
+                  "  console.warn(\"Every verdict is correct:null \u2014 that means UNCHECKED, not clean.\");",
+                  "}",
+                  "",
+                  "b.items.forEach((i) => {",
+                  "  const v = i.verification;",
+                  "  if (v.correct === true) return;",
+                  "  const mark = v.correct === null ? \"?\" : \"x\";",
+                  "  console.log(\"\");",
+                  "  console.log(`${mark} ${i.sku || i.id}  ${i.title || \"\"}`);",
+                  "  console.log(`   price=${i.price} retail=${i.retailPrice} grade=${i.grade}`);",
+                  "  if (i.priceExpectation && i.priceExpectation.expectedPrice !== null) {",
+                  "    console.log(`   expected=${i.priceExpectation.expectedPrice} ` +",
+                  "                `(factor ${i.priceExpectation.priceFactor}) ` +",
+                  "                `delta=${i.priceExpectation.delta}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (v.advisory_count) console.log(`   (+${v.advisory_count} advisory)`);",
+                  "  console.log(`   FIX HERE: ${i.editUrl}`);",
+                  "});",
+                  "",
+                  "// A queue that answered but checked nothing means Hermes is down \u2014 the whole",
+                  "// point of the fail-soft design is that you can tell the difference.",
+                  "pm.test(\"verification service answered\", () =>",
+                  "  pm.expect(b.verification.available, b.verification.error || \"\").to.be.true);",
+                  "",
+                  "pm.test(\"every returned row carries an edit URL\", () =>",
+                  "  b.items.forEach((i) => pm.expect(i.editUrl).to.be.a(\"string\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.4 High and above only",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/queue?tenantId={{tenantId}}&status=pending&take=20&minSeverity=high",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "queue"
+              ],
+              "query": [
+                {
+                  "key": "tenantId",
+                  "value": "{{tenantId}}"
+                },
+                {
+                  "key": "status",
+                  "value": "pending"
+                },
+                {
+                  "key": "take",
+                  "value": "20"
+                },
+                {
+                  "key": "minSeverity",
+                  "value": "high"
+                }
+              ]
+            },
+            "description": "Only real defects: pricing drift, size and taxonomy errors."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "",
+                  "const b = pm.response.json();",
+                  "",
+                  "console.log(\"\u2500\".repeat(70));",
+                  "console.log(`tab=${b.fromTab}  total=${b.total}  returned=${b.items.length}`);",
+                  "console.log(`checked=${b.checked}  incorrect=${b.incorrect}`);",
+                  "console.log(`hermes reachable: ${b.verification.available}`);",
+                  "",
+                  "if (!b.verification.available) {",
+                  "  console.warn(\"Hermes did NOT answer: \" + b.verification.error);",
+                  "  console.warn(\"Every verdict is correct:null \u2014 that means UNCHECKED, not clean.\");",
+                  "}",
+                  "",
+                  "b.items.forEach((i) => {",
+                  "  const v = i.verification;",
+                  "  if (v.correct === true) return;",
+                  "  const mark = v.correct === null ? \"?\" : \"x\";",
+                  "  console.log(\"\");",
+                  "  console.log(`${mark} ${i.sku || i.id}  ${i.title || \"\"}`);",
+                  "  console.log(`   price=${i.price} retail=${i.retailPrice} grade=${i.grade}`);",
+                  "  if (i.priceExpectation && i.priceExpectation.expectedPrice !== null) {",
+                  "    console.log(`   expected=${i.priceExpectation.expectedPrice} ` +",
+                  "                `(factor ${i.priceExpectation.priceFactor}) ` +",
+                  "                `delta=${i.priceExpectation.delta}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (v.advisory_count) console.log(`   (+${v.advisory_count} advisory)`);",
+                  "  console.log(`   FIX HERE: ${i.editUrl}`);",
+                  "});",
+                  "",
+                  "// A queue that answered but checked nothing means Hermes is down \u2014 the whole",
+                  "// point of the fail-soft design is that you can tell the difference.",
+                  "pm.test(\"verification service answered\", () =>",
+                  "  pm.expect(b.verification.available, b.verification.error || \"\").to.be.true);",
+                  "",
+                  "pm.test(\"every returned row carries an edit URL\", () =>",
+                  "  b.items.forEach((i) => pm.expect(i.editUrl).to.be.a(\"string\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.5 Re-check one product",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/queue?productIds={{productId}}",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "queue"
+              ],
+              "query": [
+                {
+                  "key": "productIds",
+                  "value": "{{productId}}"
+                }
+              ]
+            },
+            "description": "Targeted re-check after a fix. An explicit id list ignores the tab filter, so it works whatever state the product is in."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "",
+                  "const b = pm.response.json();",
+                  "",
+                  "console.log(\"\u2500\".repeat(70));",
+                  "console.log(`tab=${b.fromTab}  total=${b.total}  returned=${b.items.length}`);",
+                  "console.log(`checked=${b.checked}  incorrect=${b.incorrect}`);",
+                  "console.log(`hermes reachable: ${b.verification.available}`);",
+                  "",
+                  "if (!b.verification.available) {",
+                  "  console.warn(\"Hermes did NOT answer: \" + b.verification.error);",
+                  "  console.warn(\"Every verdict is correct:null \u2014 that means UNCHECKED, not clean.\");",
+                  "}",
+                  "",
+                  "b.items.forEach((i) => {",
+                  "  const v = i.verification;",
+                  "  if (v.correct === true) return;",
+                  "  const mark = v.correct === null ? \"?\" : \"x\";",
+                  "  console.log(\"\");",
+                  "  console.log(`${mark} ${i.sku || i.id}  ${i.title || \"\"}`);",
+                  "  console.log(`   price=${i.price} retail=${i.retailPrice} grade=${i.grade}`);",
+                  "  if (i.priceExpectation && i.priceExpectation.expectedPrice !== null) {",
+                  "    console.log(`   expected=${i.priceExpectation.expectedPrice} ` +",
+                  "                `(factor ${i.priceExpectation.priceFactor}) ` +",
+                  "                `delta=${i.priceExpectation.delta}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (v.advisory_count) console.log(`   (+${v.advisory_count} advisory)`);",
+                  "  console.log(`   FIX HERE: ${i.editUrl}`);",
+                  "});",
+                  "",
+                  "// A queue that answered but checked nothing means Hermes is down \u2014 the whole",
+                  "// point of the fail-soft design is that you can tell the difference.",
+                  "pm.test(\"verification service answered\", () =>",
+                  "  pm.expect(b.verification.available, b.verification.error || \"\").to.be.true);",
+                  "",
+                  "pm.test(\"every returned row carries an edit URL\", () =>",
+                  "  b.items.forEach((i) => pm.expect(i.editUrl).to.be.a(\"string\")));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "1.6 Sweep the Approved tab",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/queue?tenantId={{tenantId}}&status=uploaded&take=20&onlyIncorrect=true",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "queue"
+              ],
+              "query": [
+                {
+                  "key": "tenantId",
+                  "value": "{{tenantId}}"
+                },
+                {
+                  "key": "status",
+                  "value": "uploaded"
+                },
+                {
+                  "key": "take",
+                  "value": "20"
+                },
+                {
+                  "key": "onlyIncorrect",
+                  "value": "true"
+                }
+              ]
+            },
+            "description": "Already-accepted stock. `status` takes the same values as GET /products: pending, uploaded, rejected, photobooth, decision, all."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "",
+                  "const b = pm.response.json();",
+                  "",
+                  "console.log(\"\u2500\".repeat(70));",
+                  "console.log(`tab=${b.fromTab}  total=${b.total}  returned=${b.items.length}`);",
+                  "console.log(`checked=${b.checked}  incorrect=${b.incorrect}`);",
+                  "console.log(`hermes reachable: ${b.verification.available}`);",
+                  "",
+                  "if (!b.verification.available) {",
+                  "  console.warn(\"Hermes did NOT answer: \" + b.verification.error);",
+                  "  console.warn(\"Every verdict is correct:null \u2014 that means UNCHECKED, not clean.\");",
+                  "}",
+                  "",
+                  "b.items.forEach((i) => {",
+                  "  const v = i.verification;",
+                  "  if (v.correct === true) return;",
+                  "  const mark = v.correct === null ? \"?\" : \"x\";",
+                  "  console.log(\"\");",
+                  "  console.log(`${mark} ${i.sku || i.id}  ${i.title || \"\"}`);",
+                  "  console.log(`   price=${i.price} retail=${i.retailPrice} grade=${i.grade}`);",
+                  "  if (i.priceExpectation && i.priceExpectation.expectedPrice !== null) {",
+                  "    console.log(`   expected=${i.priceExpectation.expectedPrice} ` +",
+                  "                `(factor ${i.priceExpectation.priceFactor}) ` +",
+                  "                `delta=${i.priceExpectation.delta}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (v.advisory_count) console.log(`   (+${v.advisory_count} advisory)`);",
+                  "  console.log(`   FIX HERE: ${i.editUrl}`);",
+                  "});",
+                  "",
+                  "// A queue that answered but checked nothing means Hermes is down \u2014 the whole",
+                  "// point of the fail-soft design is that you can tell the difference.",
+                  "pm.test(\"verification service answered\", () =>",
+                  "  pm.expect(b.verification.available, b.verification.error || \"\").to.be.true);",
+                  "",
+                  "pm.test(\"every returned row carries an edit URL\", () =>",
+                  "  b.items.forEach((i) => pm.expect(i.editUrl).to.be.a(\"string\")));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "2 - Feed (debug a verdict)",
+      "item": [
+        {
+          "name": "2.1 Feed for the pending tab",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/feed?tenantId={{tenantId}}&status=pending&take=5",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "feed"
+              ],
+              "query": [
+                {
+                  "key": "tenantId",
+                  "value": "{{tenantId}}"
+                },
+                {
+                  "key": "status",
+                  "value": "pending"
+                },
+                {
+                  "key": "take",
+                  "value": "5"
+                }
+              ]
+            },
+            "description": "The exact payload sent to Hermes \u2014 no verification performed.\n\nReach for this when a verdict looks wrong: it shows whether a rule misfired or the field simply arrived null because a tenant spells a property key differently."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`${b.products.length} products, ${b.total} total`);",
+                  "const tids = Object.keys(b.catalog || {});",
+                  "tids.forEach((t) => {",
+                  "  const c = b.catalog[t];",
+                  "  console.log(`catalog[${t}]: ` +",
+                  "    `${Object.keys(c.categories).length} master categories, ` +",
+                  "    `${Object.keys(c.sizingGuides).length} sizing guides, ` +",
+                  "    `${c.colors.length} colors, ${c.materials.length} materials, ` +",
+                  "    `${c.brands.length} brands`);",
+                  "});",
+                  "(b.products || []).slice(0, 5).forEach((p) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${p.sku} ${p.title}`);",
+                  "  console.log(`  price=${p.price} (${p.priceAmount}) retail=${p.retailPrice}`);",
+                  "  console.log(`  grade=${p.grade}/${p.gradeLabel} factor=${p.priceExpectation.priceFactor} ` +",
+                  "              `expected=${p.priceExpectation.expectedPrice} skipped=${p.priceExpectation.skipped}`);",
+                  "  console.log(`  variant mirror: ${p.variantPriceDrift.variantBasePrice} ` +",
+                  "              `drift=${p.variantPriceDrift.drift} inSync=${p.variantPriceDrift.inSync}`);",
+                  "  console.log(`  taxonomy: ${p.masterCategory} > ${p.category} > ${p.subCategory} ` +",
+                  "              `guide=${p.sizingGuide}`);",
+                  "  console.log(`  attrs: brand=${p.brand} color=${p.color} material=${p.material} ` +",
+                  "              `size=${p.size} eu=${p.euSize} gender=${p.gender}`);",
+                  "});",
+                  "pm.test(\"a grade ladder was resolved\", () =>",
+                  "  pm.expect(Object.keys(b.grade_ladder || {}).length).to.be.above(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.2 Feed for one product",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/review-verification/feed?productIds={{productId}}",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "review-verification",
+                "feed"
+              ],
+              "query": [
+                {
+                  "key": "productIds",
+                  "value": "{{productId}}"
+                }
+              ]
+            },
+            "description": "One product, fully flattened. Copy the object out of `products[0]` and paste it into a folder-3 request to replay it against Hermes directly."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const p = pm.response.json().products[0];",
+                  "if (!p) { console.warn(\"No such product in scope.\"); return; }",
+                  "console.log(JSON.stringify(p, null, 2));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "2.3 Grade ladder \u2014 what the factor really is",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{apiUrl}}/grades?tenantId={{tenantId}}",
+              "host": [
+                "{{apiUrl}}"
+              ],
+              "path": [
+                "grades"
+              ],
+              "query": [
+                {
+                  "key": "tenantId",
+                  "value": "{{tenantId}}"
+                }
+              ]
+            },
+            "description": "The tenant's grade ladder, straight from the API \u2014 the same rows the verification feed joins per product.\n\nRun this after changing a Regrade Factor in Product settings > Pricing Multiplier to confirm the new value is what the checker sees. It is read per request, so a change takes effect on the next call: no redeploy, no cache, no policy.yaml edit.\n\nUNITS WARNING: this endpoint is asymmetric. `priceMultiplier` comes back as a whole percent (200) because the route scales it, but `priceFactor` comes back as the raw fraction (0.5) because it does not. Both are WRITTEN as whole percents. The verification feed reads priceFactor straight from the database, so it always sees the fraction and is unaffected \u2014 but do not GET-then-PUT this payload unchanged, or 0.5 will be stored as 0.005."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const grades = pm.response.json();",
+                  "",
+                  "console.log(\"What the verification feed reads for this tenant:\");",
+                  "console.log(\"code  label            regradeFactor  multiplier  multEnabled  factor x mult\");",
+                  "",
+                  "let suspect = false;",
+                  "grades.forEach((g) => {",
+                  "  const f = g.priceFactor;                 // fraction in the API response",
+                  "  const m = g.priceMultiplier;             // PERCENT in the API response",
+                  "  const mf = m === null ? null : m / 100;  // ...so scale it back to compare",
+                  "  console.log(",
+                  "    `${(g.code || \"\").padEnd(5)} ${(g.label || \"\").padEnd(16)} ` +",
+                  "    `${f === null ? \"(none)\" : (f * 100).toFixed(2) + \"%\"}`.padEnd(15) +",
+                  "    `${m === null ? \"(none)\" : m + \"%\"}`.padEnd(12) +",
+                  "    `${String(g.priceMultiplierEnabled).padEnd(13)}` +",
+                  "    `${f !== null && mf !== null ? (f * mf).toFixed(4) : \"-\"}`",
+                  "  );",
+                  "  if (f !== null && f > 1) suspect = true;",
+                  "});",
+                  "",
+                  "// priceFactor must be a FRACTION here (0.50 for 50%). The write path divides by",
+                  "// 100, and the read path deliberately does not multiply it back, so anything",
+                  "// above 1 means the stored value is 100x too large.",
+                  "pm.test(\"priceFactor is stored as a fraction, not a percent\", () =>",
+                  "  pm.expect(suspect, \"a priceFactor > 1 means the stored value is 100x too big\").to.be.false);",
+                  "",
+                  "const missing = grades.filter((g) => g.priceFactor === null).map((g) => g.code);",
+                  "if (missing.length) {",
+                  "  console.warn(\"No regrade factor on: \" + missing.join(\", \") +",
+                  "               \" \u2014 products on those grades fall back to the policy band (PRICE.101).\");",
+                  "}",
+                  "",
+                  "// factor x multiplier ~= 1 means the two are reciprocal: for any product whose",
+                  "// retailPrice was DERIVED from the multiplier, expected price == actual price by",
+                  "// construction, so the price check is tautological for it. Only products with",
+                  "// retailProvenance == \"market\" get a meaningful comparison.",
+                  "const recip = grades.filter((g) => {",
+                  "  if (g.priceFactor === null || g.priceMultiplier === null) return false;",
+                  "  return Math.abs(g.priceFactor * (g.priceMultiplier / 100) - 1) < 0.01;",
+                  "});",
+                  "if (recip.length) {",
+                  "  console.log(\"\");",
+                  "  console.log(\"NOTE: factor x multiplier ~= 1.00 on: \" +",
+                  "              recip.map((g) => g.code).join(\", \"));",
+                  "  console.log(\"For products whose retailPrice was derived from the multiplier, \" +",
+                  "              \"expected == actual by construction. Filter the feed on \" +",
+                  "              \"retailProvenance == 'market' for the products where the price \" +",
+                  "              \"check actually says something.\");",
+                  "}"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "3 - Hermes direct (no DB, no login)",
+      "item": [
+        {
+          "name": "3.1 A correct product -> correct:true",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/review-queue",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "review-queue"
+              ]
+            },
+            "description": "Price 38.99 against a Grade C priceFactor of 0.58 on a 66.99 retail (expected 38.85) \u2014 inside the window.\n\nUses the REAL tenant catalog, so taxonomy, sizing and attribute rules all pass. Expect zero findings from all 8 rule groups.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"products\": [\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Men\",\n      \"category\": \"Bottoms\",\n      \"subCategory\": \"Jeans\",\n      \"sizingGuide\": \"Men Bottoms\",\n      \"mannequinType\": \"Men Bottom\",\n      \"title\": \"Regular Levi's Jeans in Blue size W32\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"38.99\",\n      \"priceAmount\": 38.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 38.99,\n        \"drift\": 0.0,\n        \"inSync\": true\n      },\n      \"gender\": \"men\",\n      \"brand\": \"Levi Strauss & Co.\",\n      \"color\": \"Blue\",\n      \"material\": \"Denim\",\n      \"size\": \"W32\",\n      \"euSize\": \"48\",\n      \"internationalSize\": \"32\",\n      \"waist\": \"W32\",\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 99,\n        \"color\": 88,\n        \"material\": 90\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    }\n  ],\n  \"grade_ladder\": {},\n  \"catalog\": {{catalogJson}},\n  \"use_llm\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`checked=${b.checked} incorrect=${b.incorrect} ` +",
+                  "            `groups=${(b.rule_groups || []).length} in ${b.duration_ms}ms`);",
+                  "b.verdicts.forEach((v) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${v.correct ? \"OK \" : \"BAD\"}  ${v.product_id}  status=${v.status}` +",
+                  "              `  worst=${v.worst_severity}  advisories=${v.advisory_count}`);",
+                  "  if (v.price) {",
+                  "    console.log(`   price: ${v.price.verdict} rule=${v.price.rule} ` +",
+                  "                `expected=${v.price.expected_price} ` +",
+                  "                `window=${v.price.min_allowed}-${v.price.max_allowed}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (!v.correct) console.log(`   FIX HERE: ${v.edit_url}`);",
+                  "});",
+                  "",
+                  "pm.test(\"clean product is correct\", () =>",
+                  "  pm.expect(pm.response.json().verdicts[0].correct).to.be.true);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.2 Price differs from the grade factor",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/review-queue",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "review-queue"
+              ]
+            },
+            "description": "The bug this exists for. 58.99 is 88% of retail where Grade C targets 58%.\n\nExpect PRICE.002 (outside the factor window) and PRICE.110 (the published variant price still says 38.99, so the channel would sell at a different price from the catalog).",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"products\": [\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Men\",\n      \"category\": \"Bottoms\",\n      \"subCategory\": \"Jeans\",\n      \"sizingGuide\": \"Men Bottoms\",\n      \"mannequinType\": \"Men Bottom\",\n      \"title\": \"Regular Levi's Jeans in Blue size W32\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"58.99\",\n      \"priceAmount\": 58.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 58.99,\n        \"drift\": 20.0,\n        \"inSync\": false\n      },\n      \"gender\": \"men\",\n      \"brand\": \"Levi Strauss & Co.\",\n      \"color\": \"Blue\",\n      \"material\": \"Denim\",\n      \"size\": \"W32\",\n      \"euSize\": \"48\",\n      \"internationalSize\": \"32\",\n      \"waist\": \"W32\",\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 99,\n        \"color\": 88,\n        \"material\": 90\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    }\n  ],\n  \"grade_ladder\": {},\n  \"catalog\": {{catalogJson}},\n  \"use_llm\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`checked=${b.checked} incorrect=${b.incorrect} ` +",
+                  "            `groups=${(b.rule_groups || []).length} in ${b.duration_ms}ms`);",
+                  "b.verdicts.forEach((v) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${v.correct ? \"OK \" : \"BAD\"}  ${v.product_id}  status=${v.status}` +",
+                  "              `  worst=${v.worst_severity}  advisories=${v.advisory_count}`);",
+                  "  if (v.price) {",
+                  "    console.log(`   price: ${v.price.verdict} rule=${v.price.rule} ` +",
+                  "                `expected=${v.price.expected_price} ` +",
+                  "                `window=${v.price.min_allowed}-${v.price.max_allowed}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (!v.correct) console.log(`   FIX HERE: ${v.edit_url}`);",
+                  "});",
+                  "",
+                  "const ids = pm.response.json().verdicts[0].findings.map((f) => f.rule_id);",
+                  "pm.test(\"PRICE.002 fired\", () => pm.expect(ids).to.include(\"PRICE.002\"));",
+                  "pm.test(\"PRICE.110 mirror drift fired\", () => pm.expect(ids).to.include(\"PRICE.110\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.3 Price at retail -> critical",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/review-queue",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "review-queue"
+              ]
+            },
+            "description": "A second-hand item priced at its own RRP. PRICE.001, critical, and `publishable:false` \u2014 checked independently of the grade factor because it is arithmetic, not a pricing opinion.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"products\": [\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Men\",\n      \"category\": \"Bottoms\",\n      \"subCategory\": \"Jeans\",\n      \"sizingGuide\": \"Men Bottoms\",\n      \"mannequinType\": \"Men Bottom\",\n      \"title\": \"Regular Levi's Jeans in Blue size W32\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"66.99\",\n      \"priceAmount\": 66.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 38.99,\n        \"drift\": 0.0,\n        \"inSync\": true\n      },\n      \"gender\": \"men\",\n      \"brand\": \"Levi Strauss & Co.\",\n      \"color\": \"Blue\",\n      \"material\": \"Denim\",\n      \"size\": \"W32\",\n      \"euSize\": \"48\",\n      \"internationalSize\": \"32\",\n      \"waist\": \"W32\",\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 99,\n        \"color\": 88,\n        \"material\": 90\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    }\n  ],\n  \"grade_ladder\": {},\n  \"catalog\": {{catalogJson}},\n  \"use_llm\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`checked=${b.checked} incorrect=${b.incorrect} ` +",
+                  "            `groups=${(b.rule_groups || []).length} in ${b.duration_ms}ms`);",
+                  "b.verdicts.forEach((v) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${v.correct ? \"OK \" : \"BAD\"}  ${v.product_id}  status=${v.status}` +",
+                  "              `  worst=${v.worst_severity}  advisories=${v.advisory_count}`);",
+                  "  if (v.price) {",
+                  "    console.log(`   price: ${v.price.verdict} rule=${v.price.rule} ` +",
+                  "                `expected=${v.price.expected_price} ` +",
+                  "                `window=${v.price.min_allowed}-${v.price.max_allowed}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (!v.correct) console.log(`   FIX HERE: ${v.edit_url}`);",
+                  "});",
+                  "",
+                  "const v = pm.response.json().verdicts[0];",
+                  "pm.test(\"PRICE.001 critical\", () =>",
+                  "  pm.expect(v.findings.map((f) => f.rule_id)).to.include(\"PRICE.001\"));",
+                  "pm.test(\"not publishable\", () => pm.expect(v.publishable).to.be.false);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.4 Tenant catalog vs hardcoded tables",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/review-queue",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "review-queue"
+              ]
+            },
+            "description": "Both of these are CORRECT, and both would be flagged against policy.yaml's built-in tables:\n\n- The men's t-shirt sits under `Men > T-Shirts & Polos`. The policy tree has no such category (it assumes Tops/Outerwear/Footwear) -> TAX.002.\n- The women's W28 maps to EU 36 on this tenant's chart. The generic waist table says 40 -> SIZE.002, off by 4.\n\nExpect zero findings. Remove the `catalog` key from the body and re-send: both fire, each carrying `detail.basis = \"policy\"` so you can see which side judged them. (TAX.006 stays silent without a catalog rather than guessing a guide name.)",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"products\": [\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Men\",\n      \"category\": \"T-Shirts & Polos\",\n      \"subCategory\": \"T-Shirts\",\n      \"sizingGuide\": \"Men Uppers\",\n      \"mannequinType\": \"Men Bottom\",\n      \"title\": \"Nike T-Shirt in Blue size L\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"38.99\",\n      \"priceAmount\": 38.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 38.99,\n        \"drift\": 0.0,\n        \"inSync\": true\n      },\n      \"gender\": \"men\",\n      \"brand\": \"Nike\",\n      \"color\": \"Blue\",\n      \"material\": \"Denim\",\n      \"size\": \"L\",\n      \"euSize\": \"50\",\n      \"internationalSize\": \"32\",\n      \"waist\": null,\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 99,\n        \"color\": 88,\n        \"material\": 90\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    },\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Women\",\n      \"category\": \"Bottoms\",\n      \"subCategory\": \"Jeans\",\n      \"sizingGuide\": \"Women Bottoms\",\n      \"mannequinType\": \"Women Bottom\",\n      \"title\": \"Levi Strauss Jeans in Blue size W28\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"38.99\",\n      \"priceAmount\": 38.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 38.99,\n        \"drift\": 0.0,\n        \"inSync\": true\n      },\n      \"gender\": \"women\",\n      \"brand\": \"Levi Strauss & Co.\",\n      \"color\": \"Blue\",\n      \"material\": \"Denim\",\n      \"size\": \"W28\",\n      \"euSize\": \"36\",\n      \"internationalSize\": \"28\",\n      \"waist\": \"W28\",\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 99,\n        \"color\": 88,\n        \"material\": 90\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    }\n  ],\n  \"grade_ladder\": {},\n  \"catalog\": {{catalogJson}},\n  \"use_llm\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`checked=${b.checked} incorrect=${b.incorrect} ` +",
+                  "            `groups=${(b.rule_groups || []).length} in ${b.duration_ms}ms`);",
+                  "b.verdicts.forEach((v) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${v.correct ? \"OK \" : \"BAD\"}  ${v.product_id}  status=${v.status}` +",
+                  "              `  worst=${v.worst_severity}  advisories=${v.advisory_count}`);",
+                  "  if (v.price) {",
+                  "    console.log(`   price: ${v.price.verdict} rule=${v.price.rule} ` +",
+                  "                `expected=${v.price.expected_price} ` +",
+                  "                `window=${v.price.min_allowed}-${v.price.max_allowed}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (!v.correct) console.log(`   FIX HERE: ${v.edit_url}`);",
+                  "});",
+                  "",
+                  "const vs = pm.response.json().verdicts;",
+                  "pm.test(\"both are correct with the tenant catalog\", () =>",
+                  "  vs.forEach((v) => pm.expect(v.correct, JSON.stringify(v.findings)).to.be.true));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.5 Value the dropdown cannot offer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/review-queue",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "review-queue"
+              ]
+            },
+            "description": "'Cerulean' is not one of this tenant's 67 configured colours, so the edit screen's colour select cannot represent it and the value will not round-trip.\n\nATTR.002, medium. The finding offers near matches so a reviewer can tell a typo from a missing option.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"products\": [\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Men\",\n      \"category\": \"Bottoms\",\n      \"subCategory\": \"Jeans\",\n      \"sizingGuide\": \"Men Bottoms\",\n      \"mannequinType\": \"Men Bottom\",\n      \"title\": \"Levi Strauss Jeans in Cerulean size W32\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"38.99\",\n      \"priceAmount\": 38.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 38.99,\n        \"drift\": 0.0,\n        \"inSync\": true\n      },\n      \"gender\": \"men\",\n      \"brand\": \"Levi Strauss & Co.\",\n      \"color\": \"Cerulean\",\n      \"material\": \"Denim\",\n      \"size\": \"W32\",\n      \"euSize\": \"48\",\n      \"internationalSize\": \"32\",\n      \"waist\": \"W32\",\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 99,\n        \"color\": 88,\n        \"material\": 90\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    }\n  ],\n  \"grade_ladder\": {},\n  \"catalog\": {{catalogJson}},\n  \"use_llm\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`checked=${b.checked} incorrect=${b.incorrect} ` +",
+                  "            `groups=${(b.rule_groups || []).length} in ${b.duration_ms}ms`);",
+                  "b.verdicts.forEach((v) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${v.correct ? \"OK \" : \"BAD\"}  ${v.product_id}  status=${v.status}` +",
+                  "              `  worst=${v.worst_severity}  advisories=${v.advisory_count}`);",
+                  "  if (v.price) {",
+                  "    console.log(`   price: ${v.price.verdict} rule=${v.price.rule} ` +",
+                  "                `expected=${v.price.expected_price} ` +",
+                  "                `window=${v.price.min_allowed}-${v.price.max_allowed}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (!v.correct) console.log(`   FIX HERE: ${v.edit_url}`);",
+                  "});",
+                  "",
+                  "const f = pm.response.json().verdicts[0].findings.find((x) => x.rule_id === \"ATTR.002\");",
+                  "pm.test(\"ATTR.002 fired\", () => pm.expect(f).to.not.be.undefined);",
+                  "if (f) console.log(\"near matches offered: \" + JSON.stringify(f.detail.near));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.6 Wrong EU size for the chart",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/review-queue",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "review-queue"
+              ]
+            },
+            "description": "W32 pairs with EU 48 on this tenant's Men Bottoms chart, not 42. SIZE.002 with `basis: \"tenant_chart\"` \u2014 read that field to confirm the tenant's own chart judged it rather than the policy fallback.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"products\": [\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Men\",\n      \"category\": \"Bottoms\",\n      \"subCategory\": \"Jeans\",\n      \"sizingGuide\": \"Men Bottoms\",\n      \"mannequinType\": \"Men Bottom\",\n      \"title\": \"Regular Levi's Jeans in Blue size W32\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"38.99\",\n      \"priceAmount\": 38.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 38.99,\n        \"drift\": 0.0,\n        \"inSync\": true\n      },\n      \"gender\": \"men\",\n      \"brand\": \"Levi Strauss & Co.\",\n      \"color\": \"Blue\",\n      \"material\": \"Denim\",\n      \"size\": \"W32\",\n      \"euSize\": \"42\",\n      \"internationalSize\": \"32\",\n      \"waist\": \"W32\",\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 99,\n        \"color\": 88,\n        \"material\": 90\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    }\n  ],\n  \"grade_ladder\": {},\n  \"catalog\": {{catalogJson}},\n  \"use_llm\": false\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`checked=${b.checked} incorrect=${b.incorrect} ` +",
+                  "            `groups=${(b.rule_groups || []).length} in ${b.duration_ms}ms`);",
+                  "b.verdicts.forEach((v) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${v.correct ? \"OK \" : \"BAD\"}  ${v.product_id}  status=${v.status}` +",
+                  "              `  worst=${v.worst_severity}  advisories=${v.advisory_count}`);",
+                  "  if (v.price) {",
+                  "    console.log(`   price: ${v.price.verdict} rule=${v.price.rule} ` +",
+                  "                `expected=${v.price.expected_price} ` +",
+                  "                `window=${v.price.min_allowed}-${v.price.max_allowed}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (!v.correct) console.log(`   FIX HERE: ${v.edit_url}`);",
+                  "});",
+                  "",
+                  "const f = pm.response.json().verdicts[0].findings.find((x) => x.rule_id === \"SIZE.002\");",
+                  "pm.test(\"SIZE.002 fired\", () => pm.expect(f).to.not.be.undefined);",
+                  "pm.test(\"judged by the tenant chart\", () =>",
+                  "  pm.expect(f.detail.basis).to.eql(\"tenant_chart\"));",
+                  "pm.test(\"expected EU 48\", () => pm.expect(f.detail.expected_eu).to.eql(48));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.7 Advisories do not flip `correct`",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/review-queue",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "review-queue"
+              ]
+            },
+            "description": "Three low-confidence fields fire CONF.001 (low). At the default `medium` floor the product stays `correct:true` with `advisory_count:3` \u2014 the findings are reported, not disqualifying.\n\nChange `min_severity` to `low` in the body and `correct` flips to false.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"products\": [\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Men\",\n      \"category\": \"Bottoms\",\n      \"subCategory\": \"Jeans\",\n      \"sizingGuide\": \"Men Bottoms\",\n      \"mannequinType\": \"Men Bottom\",\n      \"title\": \"Regular Levi's Jeans in Blue size W32\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"38.99\",\n      \"priceAmount\": 38.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 38.99,\n        \"drift\": 0.0,\n        \"inSync\": true\n      },\n      \"gender\": \"men\",\n      \"brand\": \"Levi Strauss & Co.\",\n      \"color\": \"Blue\",\n      \"material\": \"Denim\",\n      \"size\": \"W32\",\n      \"euSize\": \"48\",\n      \"internationalSize\": \"32\",\n      \"waist\": \"W32\",\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 10,\n        \"color\": 5,\n        \"material\": 0\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    }\n  ],\n  \"grade_ladder\": {},\n  \"catalog\": {{catalogJson}},\n  \"use_llm\": false,\n  \"min_severity\": \"medium\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`checked=${b.checked} incorrect=${b.incorrect} ` +",
+                  "            `groups=${(b.rule_groups || []).length} in ${b.duration_ms}ms`);",
+                  "b.verdicts.forEach((v) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${v.correct ? \"OK \" : \"BAD\"}  ${v.product_id}  status=${v.status}` +",
+                  "              `  worst=${v.worst_severity}  advisories=${v.advisory_count}`);",
+                  "  if (v.price) {",
+                  "    console.log(`   price: ${v.price.verdict} rule=${v.price.rule} ` +",
+                  "                `expected=${v.price.expected_price} ` +",
+                  "                `window=${v.price.min_allowed}-${v.price.max_allowed}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (!v.correct) console.log(`   FIX HERE: ${v.edit_url}`);",
+                  "});",
+                  "",
+                  "const v = pm.response.json().verdicts[0];",
+                  "pm.test(\"still correct at the medium floor\", () => pm.expect(v.correct).to.be.true);",
+                  "pm.test(\"advisories counted\", () => pm.expect(v.advisory_count).to.be.above(0));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "3.8 Pricing rules only",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/review-queue",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "review-queue"
+              ]
+            },
+            "description": "Restrict to one rule group. `rule_groups` accepts any subset of: pricing, taxonomy, sizing, grading, identity, copy, completeness, catalog.",
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"products\": [\n    {\n      \"id\": \"1a351701-7568-4414-8975-ce07d664ab95\",\n      \"tenantId\": \"34c354a5-3415-4513-85b8-d40c2ec3af7e\",\n      \"editUrl\": \"{{appUrl}}/product/1a351701-7568-4414-8975-ce07d664ab95/edit?tenantId=34c354a5-3415-4513-85b8-d40c2ec3af7e&fromTab=pending\",\n      \"sku\": \"BEV-000325\",\n      \"productCode\": \"4314131618\",\n      \"masterCategory\": \"Men\",\n      \"category\": \"Bottoms\",\n      \"subCategory\": \"Jeans\",\n      \"sizingGuide\": \"Men Bottoms\",\n      \"mannequinType\": \"Men Bottom\",\n      \"title\": \"Regular Levi's Jeans in Blue size W32\",\n      \"description\": \"Levi Strauss classic blue jeans, straight regular fit in denim.\",\n      \"currency\": \"EUR\",\n      \"price\": \"58.99\",\n      \"priceAmount\": 58.99,\n      \"retailPrice\": \"66.99\",\n      \"retailPriceAmount\": 66.99,\n      \"inventoryQuantity\": 1,\n      \"retailProvenance\": \"market\",\n      \"grade\": \"C\",\n      \"gradeLabel\": \"Lived In\",\n      \"defects\": [\n        \"Discoloration / fade\",\n        \"Snag / pull\"\n      ],\n      \"operatorDefects\": [],\n      \"priceExpectation\": {\n        \"priceFactor\": 0.58,\n        \"expectedPrice\": 38.85,\n        \"delta\": 0.14,\n        \"withinTolerance\": false,\n        \"skipped\": null\n      },\n      \"variantPriceDrift\": {\n        \"variantBasePrice\": 38.99,\n        \"variantCurrency\": \"EUR\",\n        \"mirrorInput\": 38.99,\n        \"drift\": 0.0,\n        \"inSync\": true\n      },\n      \"gender\": \"men\",\n      \"brand\": \"Levi Strauss & Co.\",\n      \"color\": \"Blue\",\n      \"material\": \"Denim\",\n      \"size\": \"W32\",\n      \"euSize\": \"48\",\n      \"internationalSize\": \"32\",\n      \"waist\": \"W32\",\n      \"lengthSize\": \"34\",\n      \"fit\": \"Regular\",\n      \"condition\": \"Lived In\",\n      \"properties\": {},\n      \"propertyConfidence\": {\n        \"brand\": 99,\n        \"color\": 88,\n        \"material\": 90\n      },\n      \"reviewStatus\": \"PENDING\",\n      \"currentStage\": \"REVIEW\",\n      \"images\": [\n        \"front.jpg\"\n      ]\n    }\n  ],\n  \"grade_ladder\": {},\n  \"catalog\": {{catalogJson}},\n  \"use_llm\": false,\n  \"rule_groups\": [\n    \"pricing\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`checked=${b.checked} incorrect=${b.incorrect} ` +",
+                  "            `groups=${(b.rule_groups || []).length} in ${b.duration_ms}ms`);",
+                  "b.verdicts.forEach((v) => {",
+                  "  console.log(\"\");",
+                  "  console.log(`${v.correct ? \"OK \" : \"BAD\"}  ${v.product_id}  status=${v.status}` +",
+                  "              `  worst=${v.worst_severity}  advisories=${v.advisory_count}`);",
+                  "  if (v.price) {",
+                  "    console.log(`   price: ${v.price.verdict} rule=${v.price.rule} ` +",
+                  "                `expected=${v.price.expected_price} ` +",
+                  "                `window=${v.price.min_allowed}-${v.price.max_allowed}`);",
+                  "  }",
+                  "  (v.findings || []).forEach((f) =>",
+                  "    console.log(`   [${f.severity}] ${f.rule_id}: ${f.message}`));",
+                  "  if (!v.correct) console.log(`   FIX HERE: ${v.edit_url}`);",
+                  "});",
+                  "",
+                  "pm.test(\"only pricing ran\", () =>",
+                  "  pm.expect(pm.response.json().rule_groups).to.eql([\"pricing\"]));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "4 - Policy",
+      "item": [
+        {
+          "name": "4.1 Reload policy.yaml",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{hermesUrl}}/v1/policy/reload",
+              "host": [
+                "{{hermesUrl}}"
+              ],
+              "path": [
+                "v1",
+                "policy",
+                "reload"
+              ]
+            },
+            "description": "Re-reads config/policy.yaml with no restart. Edit `factor_tolerance` and re-run a folder-3 request to see the window move.\n\nReturns grade_targets, tolerance, factor_tolerance and hard_max_ratio.",
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"200 OK\", () => pm.response.to.have.status(200));",
+                  "const b = pm.response.json();",
+                  "console.log(`factor_tolerance=${b.factor_tolerance} tolerance=${b.tolerance} ` +",
+                  "            `hard_max_ratio=${b.hard_max_ratio}`);",
+                  "console.log(\"grade_targets (fallback only): \" + JSON.stringify(b.grade_targets));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,176 @@
+# Hermes policy. Everything tunable lives here — no magic numbers in code.
+
+pricing:
+  default_currency: EUR
+  min_price: 3.00
+
+  # ---------------------------------------------------------------------------
+  # THE PRICE MODEL
+  #
+  #   expected_price = retail_price * grade_targets[grade]
+  #   min_allowed    = expected_price * (1 - tolerance)
+  #   max_allowed    = expected_price * (1 + tolerance)
+  #
+  # Inside the window  -> correct, left untouched.
+  # Outside the window -> clamped to the NEAREST edge, never to the target.
+  #
+  # Grade C worked example, retail 100.00:
+  #   target 0.40      -> expected  40.00
+  #   tolerance 0.20   -> window    32.00 .. 48.00
+  #   price 13.00      -> too_low   -> 32.00
+  #   price 78.00      -> too_high  -> 48.00
+  #   price 40.00      -> ok        -> unchanged
+  # ---------------------------------------------------------------------------
+
+  # FALLBACK ONLY. The fraction of retail each grade should sell for.
+  #
+  # The VNYX feed supplies the tenant's OWN Grade.priceFactor with every product,
+  # and that always wins — grade codes mean different things per tenant, so these
+  # numbers can only ever be a guess at someone else's ladder. They are used when
+  # a grade has no priceFactor configured, and the assessment then reports
+  # rule="policy_band" plus a PRICE.101 finding so the fallback is never silent.
+  grade_targets:
+    A: 0.70   # As New   -> 30% off
+    B: 0.55   # Good     -> 45% off
+    C: 0.40   # Lived In -> 60% off
+    D: 0.15   # Recycle  -> 85% off
+
+  # Relative tolerance around the target. 0.20 = the window is target +/- 20%
+  # OF THE TARGET (not 20 percentage points of retail).
+  tolerance: 0.20
+
+  # Tolerance applied when the target is the tenant's own Grade.priceFactor.
+  #
+  # Not zero, even though the factor is exact arithmetic, because VNYX only
+  # guarantees price == retail * priceFactor after a MANUAL REGRADE. A product
+  # priced at analyze time takes its price from an eBay used-listing search
+  # instead, so exact equality would flag most of the catalog. This window keeps
+  # an eBay price near the tenant's intent quiet while surfacing one far from it.
+  # Tighten it towards 0 once every product has been through a regrade, or if you
+  # want the eBay-derived prices reported too.
+  factor_tolerance: 0.20
+
+  # Optional per-grade override where a wider or tighter window makes sense.
+  tolerance_overrides:
+    D: 0.35   # salvage pricing is inherently noisier
+
+  condition_to_grade:
+    "as new": A
+    "new": A
+    "excellent": A
+    "good": B
+    "very good": B
+    "lived in": C
+    "fair": C
+    "recycle": D
+    "poor": D
+
+  # Absolute invariant, checked independently of the window above.
+  # No item may ever be priced at or above this fraction of its retail price.
+  hard_max_ratio: 0.95
+
+  # Which side of a bad ratio moves.
+  #   retail     -> the retail price is the anchor; the SELLING PRICE is corrected.
+  #                 This is the behaviour described above.
+  #   provenance -> whichever field has weaker provenance moves. Use only once
+  #                 your price provenance is genuinely trustworthy.
+  anchor: retail
+
+  # exact -> write the clamped boundary as-is (32.00, 48.00)
+  # charm -> round to a .99/.95 ending, always INWARD so the window still holds
+  #          (32.00 becomes 32.95, 48.00 becomes 47.99)
+  round_mode: exact
+  charm_endings: [0.99, 0.95]
+
+  # A correction larger than this % is proposed for review, not applied silently.
+  auto_apply_max_delta_pct: 60
+
+confidence:
+  # Below this, a field is treated as unreliable and routed to evidence gathering.
+  review_threshold: 0.70
+  # LLM verdicts below this can never become an auto-applied patch.
+  llm_apply_threshold: 0.85
+  placeholders: ["unknown", "n/a", "na", "none", "-", "null", "tbd", ""]
+
+guardrails:
+  # Fields the LLM is NEVER allowed to write directly. It may only supply
+  # evidence; the deterministic resolver computes the final value.
+  llm_forbidden_fields:
+    - price
+    - retail_price
+    - inventory
+    - sku
+    - product_code
+    - lpn_code
+    - bin_code
+    - bin_barcode
+  # Fields that are physical ground truth — always escalate, never auto-fix.
+  escalate_only_fields:
+    - bin_code
+    - bin_barcode
+    - lpn_code
+    - sku
+
+taxonomy:
+  Men:
+    Bottoms: [Jeans, Trousers, Shorts, Joggers, Chinos]
+    Tops: [T-Shirts, Shirts, Hoodies, Knitwear, Sweatshirts, Polos]
+    Outerwear: [Jackets, Coats, Blazers, Gilets]
+    Footwear: [Sneakers, Boots, Shoes, Sandals]
+    Accessories: [Belts, Hats, Bags, Scarves]
+  Women:
+    Bottoms: [Jeans, Trousers, Shorts, Skirts, Leggings]
+    Tops: [T-Shirts, Blouses, Shirts, Hoodies, Knitwear]
+    Dresses: [Midi, Maxi, Mini, Jumpsuits]
+    Outerwear: [Jackets, Coats, Blazers]
+    Footwear: [Sneakers, Boots, Heels, Flats, Sandals]
+    Accessories: [Belts, Hats, Bags, Scarves]
+  Unisex:
+    Tops: [T-Shirts, Hoodies, Sweatshirts]
+    Bottoms: [Joggers, Shorts]
+    Accessories: [Hats, Bags]
+
+# Which mannequin rigs are valid for a given gender+category.
+mannequin_map:
+  "Men|Bottoms": ["Men Bottom", "Men Bottoms"]
+  "Men|Tops": ["Men Top", "Men Tops"]
+  "Men|Outerwear": ["Men Top", "Men Outerwear"]
+  "Women|Bottoms": ["Women Bottom", "Women Bottoms"]
+  "Women|Tops": ["Women Top", "Women Tops"]
+  "Women|Dresses": ["Women Dress", "Women Full"]
+  "Women|Outerwear": ["Women Top", "Women Outerwear"]
+
+sizing:
+  eu_tolerance: 1
+  men_bottoms_waist_in_to_eu:
+    28: 44
+    29: 45
+    30: 46
+    31: 47
+    32: 48
+    33: 49
+    34: 50
+    36: 52
+    38: 54
+    40: 56
+  women_bottoms_waist_in_to_eu:
+    24: 32
+    25: 34
+    26: 36
+    27: 38
+    28: 40
+    29: 42
+    30: 44
+    31: 46
+    32: 48
+  # Plausible inseam range for a given waist (men's jeans, inches).
+  length_range_in: [28, 36]
+
+llm:
+  enabled: true
+  model_fast: "gemini-3.6-flash"
+  model_reasoning: "gemini-3.7-flash"
+  max_images: 4
+  timeout_s: 45
+  # Only spend an LLM call when the rule engine actually asked for evidence.
+  evidence_only: true

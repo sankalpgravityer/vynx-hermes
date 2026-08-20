@@ -1,0 +1,64 @@
+{
+  "use_llm": false,
+  "product": {
+    "id": "1a351701-7568-4414-8975-ce07d664ab95",
+    "tenantId": "34c354a5-3415-4513-85b8-d40c2ec3af7e",
+    "sku": "BEV-000325",
+    "productCode": "4314131618",
+    "lpnCode": "STCR-10032801",
+    "binCode": "ZONE A-02-12-3",
+    "binBarcode": "A-04-10-4",
+    "masterCategory": "Men",
+    "category": "Bottoms",
+    "subcategory": "Jeans",
+    "title": "Regular Levi's Jeans in Blue size 32",
+    "description": "Levi Strauss & Co. classic blue jeans with a straight, regular fit - a wardrobe staple crafted in denim and showing authentic lived-in character.",
+    "currency": "EUR",
+    "price": "79.99",
+    "retailPrice": "66.99",
+    "inventory": 1,
+    "gender": "Men",
+    "productSizingGuide": "Men Bottoms",
+    "internationalSize": "32",
+    "euSize": "42",
+    "size": "32",
+    "waist": "W32",
+    "lengthSize": "34",
+    "fit": "Regular",
+    "brand": "Levi Strauss & Co.",
+    "model": "Unknown",
+    "color": "Blue",
+    "material": "Denim",
+    "condition": "Lived In",
+    "grade": "C",
+    "defects": [
+      "Discoloration / fade",
+      "Snag / pull"
+    ],
+    "mannequin": "Women Top",
+    "hanger": "AM17226",
+    "supplier": "Unknown",
+    "confidence": {
+      "gender": 90,
+      "brand": 99,
+      "color": 88,
+      "material": 90,
+      "condition": 95,
+      "eu_size": 90,
+      "fit": 90,
+      "length_size": 90,
+      "model": 0,
+      "supplier": 0,
+      "waist": 90,
+      "size": 90,
+      "international_size": 90
+    },
+    "provenance": {
+      "price": "market",
+      "retail_price": "derived"
+    },
+    "lockedFields": [
+      "price"
+    ]
+  }
+}
