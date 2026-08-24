@@ -231,7 +231,14 @@ class ProductSnapshot(BaseModel):
 class PriceVerdict(str, Enum):
     """Outcome of the deterministic price assessment."""
 
-    OK = "ok"                      # inside the window the tenant's factor implies
+    OK = "ok"                      # inside the window, and already a shelf price
+    # Inside the window, wrong cents. Its own verdict rather than an OK with a
+    # flag set, because the consumers that decide whether to write a price branch
+    # on this field and would treat an "ok" as nothing to do — vnyx-api's
+    # /review-verification/:id/verify gates its write on `verdict !== 'ok'`.
+    # A rounding is not a data defect, so it stays out of the findings list and
+    # leaves `correct` true; this field is where it is reported.
+    ROUND_REQUIRED = "round_required"
     TOO_HIGH = "too_high"
     TOO_LOW = "too_low"
     ABOVE_RETAIL = "above_retail"  # at or above RRP — arithmetically impossible

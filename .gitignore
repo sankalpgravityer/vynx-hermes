@@ -38,6 +38,11 @@ htmlcov/
 logs/*
 !logs/.gitignore
 
+# The spreadsheets scripts/fix_review_prices.py produces. Each one is a list of
+# real product ids and prices for a tenant, so it is customer data, not output
+# worth keeping in the repo.
+reports/
+
 # ── Editors / OS ────────────────────────────────────────────────────────────
 .vscode/
 .idea/

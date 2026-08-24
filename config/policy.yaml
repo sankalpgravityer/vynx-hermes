@@ -76,10 +76,17 @@ pricing:
   #                 your price provenance is genuinely trustworthy.
   anchor: retail
 
-  # exact -> write the clamped boundary as-is (32.00, 48.00)
-  # charm -> round to a .99/.95 ending, always INWARD so the window still holds
-  #          (32.00 becomes 32.95, 48.00 becomes 47.99)
-  round_mode: exact
+  # How a price is rounded once the arithmetic is done.
+  #
+  #   exact    write the figure as-is (32.00, 48.00)
+  #   charm99  keep the whole units, set the cents to .99 — a window of
+  #            15.60-23.40 becomes 15.99-23.99. Rounds UP within the unit, so it
+  #            never quietly discounts; at an upper bound it steps down to the
+  #            highest .99 that still respects hard_max_ratio.
+  #   charm    snap to the NEAREST of charm_endings. Note this crosses unit
+  #            boundaries — 23.40 becomes 22.99, a whole unit lower — which is
+  #            why charm99 exists.
+  round_mode: charm99
   charm_endings: [0.99, 0.95]
 
   # A correction larger than this % is proposed for review, not applied silently.

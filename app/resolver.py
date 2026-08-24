@@ -11,9 +11,10 @@ import logging
 from typing import Any
 
 from app.models import (
-    Action, Evidence, Finding, Patch, PROVENANCE_RANK, Provenance, ProductSnapshot,
+    Action, Evidence, Finding, Patch, PROVENANCE_RANK, PriceVerdict, Provenance,
+    ProductSnapshot,
 )
-from app.rules.pricing import band_for, clamp, grade_of, round_price
+from app.rules.pricing import assess, band_for, clamp, grade_of, round_price
 
 log = logging.getLogger("hermes.resolver")
 
@@ -60,8 +61,23 @@ def resolve_pricing(p: ProductSnapshot, findings: list[Finding],
       3. Snap to the grade's target multiplier and a charm ending.
     """
     ids = {f.rule_id for f in findings}
-    if not ids & {"PRICE.001", "PRICE.002", "PRICE.020", "PRICE.010"}:
-        return []
+    RATIO_RULES = {"PRICE.001", "PRICE.002", "PRICE.020", "PRICE.010"}
+
+    if not ids & RATIO_RULES:
+        # No bad ratio to repair — but the cents may still need normalising, and
+        # that case is keyed on the ASSESSMENT rather than a finding, because it
+        # deliberately raises none (see the note in rules/pricing.check).
+        # Everything below this point is machinery for a bad price/retail ratio,
+        # which this price does not have: it is inside its window, exactly the
+        # condition the in-band early return further down uses to do nothing.
+        a = assess(p, pol)
+        if a.verdict is not PriceVerdict.ROUND_REQUIRED or a.corrected_price is None:
+            return []
+        return [_gate(Patch(
+            field="price", old_value=p.price, new_value=a.corrected_price,
+            action=Action.APPLY, rule_id="PRICE.004", reason=a.explanation,
+            confidence=0.99, provenance=Provenance.DERIVED,
+        ), pol, p)]
 
     patches: list[Patch] = []
     pr = pol["pricing"]

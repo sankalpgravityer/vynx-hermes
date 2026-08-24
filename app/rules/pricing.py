@@ -149,9 +149,54 @@ def charm(x: float, endings: list[float], direction: int = 0) -> float:
     return min(cands, key=lambda c: abs(c - x))
 
 
+def charm99(x: float) -> float:
+    """Keep the whole units, set the cents to .99.
+
+        15.60 -> 15.99      23.40 -> 23.99      19.00 -> 19.99
+
+    Distinct from `charm` above, which snaps to the NEAREST of several endings
+    and will happily cross a unit boundary to do it: charm(23.40) returns 22.99,
+    a whole unit lower. That is wrong for a shop that wants every shelf price to
+    read "<the number you expected>.99".
+
+    Always rounds UP within the unit, so it never quietly discounts. The one
+    place that matters is an upper bound, where going up could breach the
+    retail ceiling — `charm99_at_most` is for those.
+    """
+    if x <= 0:
+        return 0.0
+    return math.floor(x) + 0.99
+
+
+def charm99_at_most(x: float) -> float:
+    """The largest `n.99` that does not exceed `x`.
+
+    Needed wherever a ceiling must hold: charm99(19.00) is 19.99, which on a
+    20.00 retail price would push the maximum above the hard_max_ratio the
+    ABOVE_RETAIL invariant enforces. Returns 0.0 when nothing fits.
+    """
+    if x < 0.99:
+        return 0.0
+    n = math.floor(x)
+    candidate = n + 0.99
+    if candidate <= x + 1e-9:
+        return candidate
+    return max(n - 1 + 0.99, 0.0)
+
+
 def round_price(x: float, pol: dict[str, Any], direction: int = 0) -> float:
     """Apply the configured rounding mode."""
-    if pol["pricing"].get("round_mode", "exact") == "charm":
+    mode = pol["pricing"].get("round_mode", "exact")
+    if mode == "charm99":
+        # `direction` is ignored on purpose. It exists for `charm` mode, where
+        # rounding to the nearest ending can escape a window whose bounds are
+        # raw. Under charm99 the WINDOW ITSELF is charmed (see assess), so
+        # rounding up lands exactly ON the bound rather than past it — and every
+        # caller that has a hard ceiling caps the result immediately after.
+        # Honouring direction here would clamp 78.00 to 47.99 while the
+        # assessment reported a 48.99 maximum: two numbers for one edge.
+        return charm99(x)
+    if mode == "charm":
         return charm(x, pol["pricing"]["charm_endings"], direction)
     return round(x, 2)
 
@@ -195,8 +240,34 @@ def assess(p: ProductSnapshot, pol: dict[str, Any]) -> PriceAssessment:
     # 32.000000000000004 in binary floating point, which would make a price of
     # exactly 32.00 read as too low. Compare against what we would actually write.
     expected = round(retail * w["target"], 2)
-    min_allowed = round(max(retail * w["low"], float(pr["min_price"])), 2)
-    max_allowed = round(retail * w["high"], 2)
+    # The bounds come off the ROUNDED expectation, not from retail x target again.
+    # applyGradePriceFactor in vnyx-api stores `result.toFixed(2)`, so the rounded
+    # figure is the real centre of the window: a 129.99 retail at factor 0.5 gives
+    # the backend 65.00, not 64.995. Re-deriving from the raw product put the two
+    # verifiers a cent apart — harmless while both wrote exact cents, but charm99
+    # rounds a cent into a whole unit (77.99 against 78.99), which is enough for
+    # a Verify click to move a price the analyze worker had just set.
+    min_allowed = round(max(expected * (1 - w["tolerance"]),
+                            float(pr["min_price"])), 2)
+    max_allowed = round(expected * (1 + w["tolerance"]), 2)
+
+    # Charm the WINDOW, not just the corrected figure. A window of 15.60-23.40
+    # with prices ending .99 would report bounds no price can ever sit on, and
+    # clamping to 23.40 would produce a price the shop does not want to display.
+    # Charming both ends means a clamped price lands on a real shelf price.
+    #
+    # `expected` is deliberately left raw: it is the mathematical target used to
+    # explain the verdict, not a figure anyone writes.
+    if pr.get("round_mode") == "charm99":
+        min_allowed = charm99(min_allowed)
+        # The ceiling has to survive rounding up. hard_max_ratio is what the
+        # ABOVE_RETAIL invariant checks, so the top of the window must stay
+        # strictly under it — charm99_at_most picks the highest .99 that does.
+        ceiling99 = charm99_at_most(retail * float(pr["hard_max_ratio"]) - 0.01)
+        max_allowed = min(charm99(max_allowed), ceiling99)
+        # A very cheap item can end up with the floor above the (charmed)
+        # ceiling; the existing min > max branch below reports that as
+        # NO_ANCHOR rather than silently inverting the window.
 
     a.expected_price = expected
     a.min_allowed = min_allowed
@@ -213,7 +284,10 @@ def assess(p: ProductSnapshot, pol: dict[str, Any]) -> PriceAssessment:
 
     if not p.price or p.price <= 0:
         a.verdict = PriceVerdict.NO_PRICE
-        a.corrected_price = round_price(expected, pol)
+        # Clamped into the window: rounding up can push a small target past the
+        # (charmed) ceiling, and the min_price floor can sit above the target on
+        # a cheap item. In exact mode both bounds are no-ops.
+        a.corrected_price = clamp(round_price(expected, pol), min_allowed, max_allowed)
         a.change_required = True
         a.explanation = (
             f"No selling price set. Grade {a.grade} targets {w['target']:.0%} of "
@@ -265,6 +339,28 @@ def assess(p: ProductSnapshot, pol: dict[str, Any]) -> PriceAssessment:
             f"tolerance, so the window is {min_allowed:.2f}-{max_allowed:.2f}. "
             f"Lowered to the maximum, {a.corrected_price:.2f} {currency}. "
             f"It was overpriced by {price - max_allowed:.2f} and unlikely to sell."
+        )
+        return a
+
+    # In range — but under charm99 that is not yet a price the shop wants on a
+    # shelf. 15.60 and 18.40 both sit comfortably inside their window, and they
+    # are exactly the endings this mode exists to remove, so the ratio check
+    # passing is not on its own a reason to leave the cents alone.
+    #
+    # Capped at max_allowed: rounding UP must not carry the price out of the
+    # window it just passed.
+    normalised = round(round_price(price, pol), 2)
+    if pr.get("round_mode") == "charm99":
+        normalised = round(min(normalised, max_allowed), 2)
+
+    if abs(normalised - price) > 0.001:
+        a.verdict = PriceVerdict.ROUND_REQUIRED
+        a.corrected_price = normalised
+        a.change_required = True
+        a.explanation = (
+            f"{price:.2f} is {ratio:.0%} of retail, inside the Grade {a.grade} "
+            f"window {min_allowed:.2f}-{max_allowed:.2f}, so the ratio is right. "
+            f"Rounded to {a.corrected_price:.2f} {currency} for a .99 price ending."
         )
         return a
 
@@ -333,6 +429,13 @@ def check(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
             fields=["price", "retail_price"],
             message=a.explanation, detail=payload, needs_evidence=False,
         ))
+    # ROUND_REQUIRED deliberately emits NO finding. A shelf price of 15.60 is not
+    # a data defect: a finding here would mark most of a correct catalog as
+    # incorrect, and vnyx-api's verify route lists any finding outside its
+    # PRICE_WRITE_RESOLVES set as still outstanding — so a rounding would keep
+    # being reported as unresolved immediately after the write that fixed it.
+    # The verdict and corrected_price on the assessment carry it instead, and
+    # those are what the write is gated on.
 
     out.extend(check_config(p, pol))
     out.extend(check_mirror(p, pol))

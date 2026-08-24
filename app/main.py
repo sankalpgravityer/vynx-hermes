@@ -22,6 +22,7 @@ from app.pipeline import reconcile
 from app.rules import REGISTRY, run_all
 from app.rules.pricing import assess
 from app.vnyx_client import VnyxClient, to_snapshot
+from app import agent_cli
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -169,6 +170,107 @@ async def webhook(request: Request,
             raise HTTPException(401, "Bad signature.")
     payload = json.loads(body)
     return _run(CheckRequest(product=payload.get("product", payload)), apply=True)
+
+
+# --------------------------------------------------------------------------- #
+# Nous Research Hermes AGENT — prompt passthrough
+#
+# A different Hermes from the one this service is. See app/agent_cli.py; the
+# short version is that this service decides nothing with a model, while the
+# agent is an autonomous LLM with shell and filesystem tools. These endpoints
+# only relay a prompt to its CLI and hand back the reply.
+# --------------------------------------------------------------------------- #
+
+class AgentPromptRequest(BaseModel):
+    """One prompt for the agent."""
+
+    prompt: str = Field(..., min_length=1, description="What to ask the agent.")
+    # Per-run overrides. Both are passed straight to the CLI, which applies them
+    # without touching ~/.hermes/config.yaml — so a request cannot change the
+    # machine's default model for everyone else.
+    model: str | None = Field(
+        default=None, description='e.g. "anthropic/claude-sonnet-4.6"'
+    )
+    provider: str | None = Field(
+        default=None, description='e.g. "nous", "openrouter"'
+    )
+    timeout_s: float | None = Field(
+        default=None, gt=0, description="Seconds to wait. Capped server-side."
+    )
+    cwd: str | None = Field(
+        default=None,
+        description=(
+            "Working directory for the run. The agent reads and writes files "
+            "relative to this, so point it at the project you want it to act on."
+        ),
+    )
+
+
+class AgentPromptResponse(BaseModel):
+    response: str
+    duration_ms: int
+    model: str | None = None
+    provider: str | None = None
+    session_id: str | None = None
+    # tokens / estimated_cost_usd / api_calls, from the CLI's own usage report.
+    usage: dict[str, Any] | None = None
+    truncated: bool = False
+    notes: list[str] = Field(default_factory=list)
+
+
+@app.get("/v1/agent/health")
+def agent_health() -> dict[str, Any]:
+    """Is the agent CLI installed and switched on.
+
+    Distinguishes the two failure modes a caller cares about: `installed: false`
+    means go and install it; `enabled: false` means it is there but deliberately
+    gated off.
+    """
+    return agent_cli.status()
+
+
+@app.post("/v1/agent/prompt", response_model=AgentPromptResponse)
+async def agent_prompt(req: AgentPromptRequest) -> AgentPromptResponse:
+    """Send a prompt to the Hermes agent and return its final answer.
+
+    Stateless — a fresh one-shot run per call, with no conversation carried over.
+
+    `async def`, not `def`: the run takes seconds to minutes, and the adapter
+    awaits the subprocess rather than blocking. A sync handler would occupy a
+    threadpool worker for the whole run.
+    """
+    try:
+        run = await agent_cli.run_prompt(
+            req.prompt,
+            model=req.model,
+            provider=req.provider,
+            timeout_s=req.timeout_s,
+            cwd=req.cwd,
+        )
+    except agent_cli.AgentUnavailable as exc:
+        # 503: correctly configured request, service not in a position to serve it.
+        raise HTTPException(503, str(exc)) from exc
+    except agent_cli.AgentTimeout as exc:
+        raise HTTPException(504, str(exc)) from exc
+    except agent_cli.AgentFailed as exc:
+        # 502: the upstream we depend on failed. Its stderr is the only useful
+        # diagnostic, so it is passed through rather than swallowed.
+        raise HTTPException(
+            502, f"{exc} — stderr: {exc.stderr or '(empty)'}"
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    return AgentPromptResponse(
+        response=run.response,
+        duration_ms=run.duration_ms,
+        model=run.model,
+        provider=run.provider,
+        session_id=run.session_id,
+        usage=run.usage,
+        truncated=run.truncated,
+        notes=run.notes,
+    )
 
 
 @app.post("/v1/policy/reload")

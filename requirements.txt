@@ -6,3 +6,11 @@ PyYAML==6.0.2
 python-dotenv==1.0.1
 google-genai>=2.3.0
 pytest==8.3.4
+
+# Validates the reprice script SQL against the real Postgres grammar
+# (libpg_query), so a syntax error surfaces in tests rather than on a database.
+pglast==8.4
+
+# scripts/reprice_review_db.py talks to Postgres directly.
+psycopg[binary]==3.3.4
+openpyxl==3.1.5
