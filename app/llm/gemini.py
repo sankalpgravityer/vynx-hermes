@@ -18,6 +18,7 @@ from google import genai
 from google.genai import types
 
 from app.models import AttributeVerdict, ProductSnapshot, RRPEvidence, VisionAudit
+from app.net import genai_client_args
 
 log = logging.getLogger("hermes.gemini")
 
@@ -63,10 +64,31 @@ _TEXT_SCHEMA = {
     "required": ["verdicts"],
 }
 
+_BACKGROUND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "background": {
+            "type": "string",
+            "enum": ["transparent", "solid_studio", "real_scene"],
+        },
+        "confidence": {"type": "number", "description": "0.0 to 1.0."},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["background", "confidence", "reasoning"],
+}
+
 
 class GeminiEvidence:
     def __init__(self, api_key: str, pol: dict[str, Any]) -> None:
-        self.client = genai.Client(api_key=api_key)
+        # `client_args` rather than a client built here: the SDK constructs its
+        # own httpx client, so a custom transport has to be passed in. Empty
+        # unless HERMES_IMAGE_FETCH_IPV4 is set — see app/net.py for the 64s
+        # IPv6 stall that switch exists for.
+        args = genai_client_args()
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(client_args=args) if args else None,
+        )
         self.pol = pol
         self.cfg = pol["llm"]
         self.calls = 0
@@ -223,6 +245,50 @@ class GeminiEvidence:
         if not raw:
             return []
         return self._strip_forbidden(raw.get("verdicts", []))
+
+    def classify_background(self, image: bytes, mime: str = "image/jpeg",
+                            ) -> tuple[str, float, str]:
+        """Is there still a background behind this garment?
+
+        The tie-breaker for the one case the pixel heuristic genuinely cannot
+        call: a garment photographed against a plain wall produces the same border
+        statistic as one on a studio sweep, and the difference matters — the first
+        needs the segmenter, the second is finished. Only images in that middle
+        band get here, so this costs a call per genuinely doubtful picture rather
+        than one per picture.
+
+        Returns ("unknown", 0.0, reason) on any failure. The caller keeps the
+        pixel verdict in that case, so a Gemini outage degrades the answer's
+        confidence rather than removing it.
+        """
+        parts: list[Any] = [
+            types.Part.from_bytes(data=image, mime_type=mime),
+            "Look ONLY at what is behind the product, not at the product itself.\n"
+            "  transparent  — no background at all: a checkerboard, or the subject "
+            "cut out against nothing.\n"
+            "  solid_studio — a deliberate flat colour, seamless sweep or studio "
+            "backdrop. A plain painted wall with no objects, edges or floor line "
+            "counts as this.\n"
+            "  real_scene   — an actual place: furniture, shelving, a floor, a "
+            "doorway, hangers, clutter, a visible corner where two surfaces meet.\n"
+            "If you can see where the wall meets the floor, that is real_scene. "
+            "Report your confidence honestly; this decides whether an automated "
+            "pipeline reprocesses the image.",
+        ]
+        raw = self._generate(
+            model=self.cfg["model_fast"], contents=parts,
+            schema=_BACKGROUND_SCHEMA,
+            system="You inspect product photography for an e-commerce catalogue "
+                   "and report only what is visibly there.",
+        )
+        if not raw:
+            return "unknown", 0.0, "vision call failed"
+        verdict = str(raw.get("background") or "unknown")
+        try:
+            confidence = float(raw.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        return verdict, confidence, str(raw.get("reasoning") or "")
 
     # ------------------------------------------------------------------ utils
     def _fetch_images(self, urls: list[str]) -> list[types.Part]:

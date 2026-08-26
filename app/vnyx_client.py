@@ -32,7 +32,9 @@ from typing import Any
 import httpx
 
 from app.config import settings
-from app.models import Provenance, ProductSnapshot, TenantCatalog
+from app.models import (
+    ImagerySettings, MediaAsset, Provenance, ProductSnapshot, TenantCatalog,
+)
 
 log = logging.getLogger("hermes.vnyx")
 
@@ -117,7 +119,9 @@ def _nested(raw: dict[str, Any], outer: str, inner: str) -> Any:
 
 
 def to_snapshot(
-    raw: dict[str, Any], catalog: dict[str, Any] | None = None
+    raw: dict[str, Any],
+    catalog: dict[str, Any] | None = None,
+    imagery_settings: dict[str, Any] | None = None,
 ) -> ProductSnapshot:
     """Map a VNYX payload — feed record or raw product — onto the snapshot.
 
@@ -126,6 +130,10 @@ def to_snapshot(
     product, so the caller resolves it by tenant id and passes it in. None means
     the rules fall back to policy.yaml where they can, and stay silent where they
     cannot.
+
+    `imagery_settings` is the tenant's ImageGenerationSettings row, and is the
+    same kind of argument for the same reason: whether a product with no renders
+    is a defect or a configuration choice is tenant state, not a constant.
     """
 
     # Confidence: the feed sends `propertyConfidence` (VNYX's own column name);
@@ -262,6 +270,38 @@ def to_snapshot(
             img if isinstance(img, str) else img.get("url", "")
             for img in (raw.get("images") or [])
         ],
+
+        # The typed ProductMedia rows behind `images` above, when the caller sent
+        # them. Both spellings are accepted for the same reason every other field
+        # here lists candidates: the feed serialises camelCase and the fixtures are
+        # written snake_case.
+        media=[
+            MediaAsset(
+                url=_str(_first(m, "url")) or "",
+                view=_str(_first(m, "view")) or "OTHER",
+                origin=_str(_first(m, "origin")),
+                processing=_str(_first(m, "processing")) or "RAW",
+                media_type=_str(_first(m, "mediaType", "media_type")) or "IMAGE",
+                # Absent means live. A caller that already filtered to the current
+                # gallery sends no flags at all, and defaulting these to False
+                # would make every such row invisible to the imagery rules.
+                is_current=bool(m.get("isCurrent", m.get("is_current", True))),
+                deleted_at=_str(_first(m, "deletedAt", "deleted_at")),
+                position=int(m.get("position") or 0),
+            )
+            for m in (raw.get("media") or raw.get("productMedia") or [])
+            if isinstance(m, dict) and _first(m, "url")
+        ],
+
+        generation_status=_str(_first(raw, "generationStatus", "generation_status")),
+        is_regenerating=bool(
+            raw.get("isRegenerating", raw.get("is_regenerating", False))
+        ),
+        updated_at=_str(_first(raw, "updatedAt", "updated_at")),
+        imagery_settings=(
+            ImagerySettings.model_validate(imagery_settings)
+            if imagery_settings else None
+        ),
 
         confidence=confidence,
         provenance=provenance,

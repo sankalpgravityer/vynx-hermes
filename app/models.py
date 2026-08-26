@@ -100,6 +100,44 @@ class TenantCatalog(BaseModel):
         return None
 
 
+class MediaAsset(BaseModel):
+    """One row of VNYX's `ProductMedia`, the source of truth for a product's assets.
+
+    `ProductSnapshot.images` is a flat list of URLs — VNYX's own denormalized
+    `Product.images` cache — which is enough for the vision layer but says nothing
+    about what any picture IS. Every imagery question needs the typed row instead:
+    a URL cannot tell you whether it is a care label the segmenter must never
+    touch, an AI render, or a raw upload still waiting to be cut out.
+    """
+
+    url: str
+    # FRONT | BACK | LABEL | SIZE_CHART | AI_FRONT | AI_BACK | AI_FRONT_34 |
+    # AI_BACK_34 | AI_CLOSEUP | VIDEO_TURNTABLE | OTHER
+    view: str
+    # DECISION | PHOTOBOOTH | WEB | AI | SIZE_GUIDE | MANUAL
+    origin: str | None = None
+    # RAW | BG_REMOVED | COMPOSITED | GENERATED | TRANSCODED.
+    # Anything other than RAW has already been through the segmenter.
+    processing: str = "RAW"
+    media_type: str = "IMAGE"
+    # "Nothing derives from this row." A RAW upload whose cut-out exists is
+    # superseded, not live — counting it would report every successfully matted
+    # product as still needing work.
+    is_current: bool = True
+    # A human removed it. A DIFFERENT fact from being superseded, and the two have
+    # opposite meanings for whether the asset should ever come back.
+    deleted_at: str | None = None
+    position: int = 0
+
+    @property
+    def live(self) -> bool:
+        return self.is_current and not self.deleted_at
+
+    @property
+    def is_ai(self) -> bool:
+        return self.view.startswith("AI_")
+
+
 class ProductSnapshot(BaseModel):
     """Normalised view of one VNYX product."""
 
@@ -202,6 +240,30 @@ class ProductSnapshot(BaseModel):
     supplier: str | None = None
 
     images: list[str] = Field(default_factory=list)
+
+    # The typed `ProductMedia` rows behind `images` above, when the caller sent
+    # them. `images` is VNYX's own denormalized cache of the same assets and stays
+    # the input to the vision layer, which only needs URLs; the imagery rules need
+    # to know what each picture IS and read this instead.
+    #
+    # Empty is a legitimate state meaning "not supplied" — a raw webhook payload
+    # or a hand-written fixture carries no media rows — so the imagery rules stay
+    # silent rather than reporting a product with pictures as having none.
+    media: list[MediaAsset] = Field(default_factory=list)
+
+    # The generation pipeline's own view of this product.
+    #
+    # IDLE | GENERATING | COMPLETE | FAILED. Reported, never trusted: on the
+    # measured tenant 78 of the 89 products with no renders at all are marked
+    # COMPLETE, which is exactly why nobody had noticed. The media rows decide.
+    generation_status: str | None = None
+    is_regenerating: bool = False
+    # ISO-8601. Only used to tell a live generation from a stranded one.
+    updated_at: str | None = None
+    # This tenant's ImageGenerationSettings row. None means it was not supplied,
+    # and the imagery rules fall back to permissive defaults rather than reporting
+    # a configuration they cannot see.
+    imagery_settings: "ImagerySettings | None" = None
 
     # sidecars
     confidence: dict[str, float] = Field(default_factory=dict)
@@ -414,3 +476,208 @@ class ReviewQueueResponse(BaseModel):
     checked: int = 0
     incorrect: int = 0
     duration_ms: int = 0
+
+
+# --------------------------------------------------------------------------- #
+# Imagery — are the on-model renders there, and are the backgrounds gone?
+# --------------------------------------------------------------------------- #
+
+class ImagerySettings(BaseModel):
+    """The tenant's `ImageGenerationSettings` row.
+
+    Load-bearing, not decoration. `isModelGenerationEnabled` decides whether a
+    product with no renders is a defect or a configuration choice, and getting
+    that backwards is what turns a verification pass into noise — the single
+    largest source of false positives in the pricing validator.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    is_model_generation_enabled: bool = Field(True, alias="isModelGenerationEnabled")
+    is_close_up_enabled: bool = Field(True, alias="isCloseUpEnabled")
+    is_remove_bg_enabled: bool = Field(True, alias="isRemoveBgEnabled")
+    bg_removal_provider: str | None = Field(None, alias="bgRemovalProvider")
+    # "transparent", a #rrggbb, or a /backgrounds/*.png path. When a backdrop is
+    # configured, an opaque uniform background on a cut-out is CORRECT rather than
+    # a failure — the segmenter ran and the tenant's backdrop went on top.
+    background: str | None = None
+    auto_apply_background: bool = Field(False, alias="autoApplyBackground")
+
+    # Model appearance — passed straight through to the prompt builder.
+    gender: str | None = None
+    age: str | None = None
+    ethnicity: str | None = None
+    body_type: str | None = Field(None, alias="bodyType")
+    custom_prompt: str | None = Field(None, alias="customPrompt")
+    brand_color: str | None = Field(None, alias="brandColor")
+    theme: str | None = None
+    aspect_ratio: str | None = Field(None, alias="aspectRatio")
+    resolution: str | None = None
+
+    # Prompt add-ons the regenerate modal offers, applied on top of the
+    # structured description rather than through it.
+    lighting_texture: str | None = Field(None, alias="lightingTexture")
+    realistic_skin_details: bool = Field(False, alias="realisticSkinDetails")
+
+    # --- the tenant's cast of models -----------------------------------------
+    #
+    # A tenant defines named personalities — "Emma Smith, 24, fair, long sleek
+    # dark brown hair" — and the pipeline picks one per product so the catalog
+    # does not look like one person wearing everything. BOAS has 20.
+    #
+    # The traits below are the SELECTED personality's, flattened onto the
+    # settings the prompt builder reads. That mirrors the TypeScript, where
+    # analyze.worker.ts chooses the personality and hands
+    # `generateClothOnModel` a settings object with the traits already resolved.
+    personalities_enabled: bool = Field(False, alias="personalitiesEnabled")
+    personalities: list[dict[str, Any]] = Field(default_factory=list)
+
+    skin_tone: str | None = Field(None, alias="skinTone")
+    hair_color: str | None = Field(None, alias="hairColor")
+    hair_style: str | None = Field(None, alias="hairStyle")
+    tattoos: str | None = None
+    piercings: str | None = None
+    personality_notes: str | None = Field(None, alias="personalityNotes")
+    # Which personality supplied the traits, echoed so the caller can store it
+    # and a later gap-fill can reuse the same face instead of drawing again.
+    personality_name: str | None = Field(None, alias="personalityName")
+
+
+class BackgroundVerdict(str, Enum):
+    """What the pixels say is behind the garment."""
+
+    TRANSPARENT = "transparent"      # alpha channel, cut out
+    BACKDROP = "backdrop"            # opaque but uniform — a studio sweep or the
+                                     # tenant's own configured backdrop
+    SCENE = "scene"                  # a real background is still there
+    UNKNOWN = "unknown"              # could not be fetched or decoded
+
+
+class BackgroundCheck(BaseModel):
+    """One image's background, and what decided it."""
+
+    url: str
+    view: str
+    processing: str
+    verdict: BackgroundVerdict
+    # Which layer produced the verdict. A reviewer disputing a finding needs to
+    # know whether a column, a pixel sample or a model said so.
+    basis: Literal["metadata", "pixels", "vision"] = "metadata"
+    confidence: float = 0.0
+    detail: str = ""
+
+
+class AiViewReport(BaseModel):
+    """Which on-model renders exist, against which ones are required."""
+
+    required: list[str] = Field(default_factory=list)
+    present: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    # The ¾ and close-up views when they are not in `required`. Reported so the UI
+    # can offer to fill them in without calling their absence a defect.
+    advisory_missing: list[str] = Field(default_factory=list)
+    # Rows, not distinct views. A product with five AI rows across ONE view has
+    # its pictures and needs relabelling, not regeneration — see IMG.021.
+    row_count: int = 0
+
+
+class SourceImage(BaseModel):
+    """A garment photograph the generator can be seeded from."""
+
+    url: str
+    view: str
+    processing: str
+
+
+class ImageryVerdict(BaseModel):
+    """Report-only answer to "are this product's pictures finished?"."""
+
+    product_id: str
+    correct: bool
+    status: ReconcileStatus
+    findings: list[Finding] = Field(default_factory=list)
+    advisory_count: int = 0
+    worst_severity: Severity | None = None
+
+    ai_views: AiViewReport = Field(default_factory=AiViewReport)
+    backgrounds: list[BackgroundCheck] = Field(default_factory=list)
+
+    # Garment photographs that genuinely still need the segmenter, ready to act
+    # on. The same set `IMG.010` reports, lifted out of the finding's `detail` so
+    # a caller does not have to parse a message to find the work.
+    #
+    # Excludes the two look-alikes that are NOT work: a size chart mis-filed
+    # under OTHER, and an original whose cut-out exists but was written under the
+    # wrong view (IMG.022) — re-matting either costs a provider call and degrades
+    # the picture.
+    needs_background_removal: list[SourceImage] = Field(default_factory=list)
+
+    # Can the missing renders actually be produced right now? False carries a
+    # reason — footwear, the tenant setting, or no photograph to work from — and
+    # the caller should offer no Generate button when it is.
+    generatable: bool = True
+    not_generatable_reason: str | None = None
+    # The photographs generation would be seeded from, in the order it would use
+    # them. Empty when nothing usable is on the product.
+    source_images: list[SourceImage] = Field(default_factory=list)
+
+    edit_url: str | None = None
+    llm_calls: int = 0
+    duration_ms: int = 0
+
+
+class GeneratedView(BaseModel):
+    """One render, handed back for the caller to store.
+
+    Hermes holds no VNYX or R2 credentials and writes nothing: the bytes come back
+    inline and vnyx-api persists them through its own upload + `addImages` path, so
+    `position`, `isCurrent`, `derivedFromId` and the `Product.images` cache rebuild
+    stay in the one file that owns those invariants.
+    """
+
+    # AI_FRONT | AI_BACK | AI_FRONT_34 | AI_BACK_34 | AI_CLOSEUP — the VNYX
+    # `ProductMediaView` name, so the caller writes the row without a lookup table.
+    view: str
+    # base64, no data: prefix.
+    image_base64: str | None = None
+    mime_type: str = "image/jpeg"
+    bytes: int = 0
+    ok: bool = True
+    # Which model actually produced it. Not always the configured primary: a
+    # garment the primary refuses can still be rendered by a fallback, and the
+    # two do not look identical, so an operator comparing renders needs to know.
+    model: str | None = None
+    # Why this one view failed, while others may have succeeded. Per-view rather
+    # than per-request because a quota rejection on the close-up must not discard
+    # four good renders.
+    error: str | None = None
+
+
+class ImageryGenerateResponse(BaseModel):
+    product_id: str
+    views: list[GeneratedView] = Field(default_factory=list)
+    # Views asked for that produced nothing at all.
+    failed: list[str] = Field(default_factory=list)
+    # True when the back render was inferred from the front because no back
+    # photograph exists. The caller should surface it: the rear of that garment is
+    # the model's invention, not a photograph of the item being sold.
+    back_inferred: bool = False
+    model: str = ""
+    llm_calls: int = 0
+    duration_ms: int = 0
+    notes: list[str] = Field(default_factory=list)
+    # The personality traits these renders were produced with, in the shape
+    # `Product.imageSettings` stores.
+    #
+    # Handed back so the caller can persist them: a later gap-fill has to put the
+    # SAME face beside these images, and a freshly drawn personality would
+    # describe a different one. This is the same record the regenerate worker
+    # keeps for the same reason.
+    image_settings: dict[str, Any] | None = None
+
+
+# `ProductSnapshot.imagery_settings` forward-references a class defined below it.
+# ProductSnapshot has to stay where it is — it is the type every rule signature
+# names — and ImagerySettings reads better next to the rest of the imagery models
+# than wedged in above it, so the reference is resolved here instead.
+ProductSnapshot.model_rebuild()

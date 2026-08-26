@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from app.models import Finding, ProductSnapshot
-from app.rules import catalog, consistency, pricing
+from app.rules import catalog, consistency, imagery, pricing
 
 RuleFn = Callable[[ProductSnapshot, dict[str, Any]], list[Finding]]
 
@@ -20,6 +20,11 @@ REGISTRY: dict[str, RuleFn] = {
     # Brand/colour/material must exist in the tenant's own option lists — the
     # ones the edit screen's dropdowns are built from.
     "catalog": catalog.check_catalog,
+    # On-model renders and background removal. Metadata only, so it costs nothing
+    # to run here; the pixel and vision checks that can catch a row lying about
+    # its own `processing` state are on /v1/imagery/verify instead. Silent unless
+    # the caller sent typed media rows.
+    "imagery": imagery.check_imagery,
 }
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}

@@ -24,8 +24,27 @@ except ImportError:  # python-dotenv is optional
 class Settings:
     def __init__(self) -> None:
         self.policy_path = Path(os.getenv("HERMES_POLICY", ROOT / "config" / "policy.yaml"))
+        # Text and vision reasoning — the evidence layer. NOT image generation.
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         self.llm_enabled = os.getenv("HERMES_LLM_ENABLED", "true").lower() == "true"
+
+        # IMAGE GENERATION runs on its own key, and only on this one.
+        #
+        # Separate from GEMINI_API_KEY because the two have separate quotas and
+        # separate costs: a rules-only deployment needs no image key at all, and
+        # exhausting the image quota must not take the evidence layer down with
+        # it. vnyx-api draws the same line — `GOOGLE_NANO_BANANA_API_KEY` in
+        # utils/rate-limiter.ts, distinct from every other Gemini call it makes.
+        #
+        # COMMA-SEPARATED, rotated round-robin, exactly as that file parses it.
+        # The rotation is load-bearing here rather than decorative: four views
+        # generate concurrently and each retry adds another call, so a single key
+        # meets its per-minute limit quickly.
+        self.nano_banana_keys = [
+            k.strip()
+            for k in os.getenv("GOOGLE_NANO_BANANA_API_KEY", "").split(",")
+            if k.strip()
+        ]
 
         # VNYX write-back.
         #

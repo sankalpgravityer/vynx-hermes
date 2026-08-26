@@ -14,3 +14,8 @@ pglast==8.4
 # scripts/reprice_review_db.py talks to Postgres directly.
 psycopg[binary]==3.3.4
 openpyxl==3.1.5
+
+# The imagery background check reads pixels — app/imaging/background.py samples a
+# border ring to tell a genuine cut-out from a photograph whose row merely claims
+# one. Header-only decode plus one masked statistic, so it stays cheap.
+Pillow==12.3.0

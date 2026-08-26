@@ -181,3 +181,144 @@ llm:
   timeout_s: 45
   # Only spend an LLM call when the rule engine actually asked for evidence.
   evidence_only: true
+
+# --------------------------------------------------------------------------- #
+# Imagery — the on-model renders and background removal.
+# See docs/IMAGERY-VERIFICATION.md for how these numbers were arrived at.
+# --------------------------------------------------------------------------- #
+imagery:
+  # The AI views whose absence is a DEFECT.
+  #
+  # Deliberately not all five. The three-quarter views were added by a later
+  # version of the generation pipeline, so requiring them marks 955 of 2,026
+  # products on the measured tenant as defective for missing something most of
+  # the catalog never had. They are reported as advisory (IMG.005) instead.
+  #
+  # Raising the bar is an edit here plus POST /v1/policy/reload — no code change.
+  # scripts/audit_product_images.py carries the same list; change both together
+  # or the spreadsheet and the Verify button will disagree about a product.
+  required_views: ["AI_FRONT", "AI_BACK"]
+  all_views: ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK", "AI_CLOSEUP"]
+  # Only ever required when the tenant has isCloseUpEnabled. Listed separately
+  # because it is the one advisory view that is tenant-configurable.
+  close_up_view: "AI_CLOSEUP"
+
+  # Views background removal applies to. Care labels and size charts are excluded
+  # because a macro of a wash tag is all fabric: the segmenter has no foreground
+  # to find and mangles it. Matches needsBackgroundRemoval() in vnyx-api.
+  garment_views: ["FRONT", "BACK", "OTHER"]
+
+  # Size charts filed under view OTHER — 904 of them on the measured tenant.
+  # Their URL still gives them away: the size-guide uploader writes under
+  # /size-charts/, garment photography under /products/. Without this the report
+  # claims ~900 size charts need matting, which buries the real findings.
+  size_chart_url_markers: ["/size-charts/", "/size-chart/", "/sizecharts/"]
+
+  # A product "in flight" longer than this is stranded, not working. A real run
+  # takes ~205s; vnyx-api's generation-reaper waits an hour before touching a row
+  # and this matches it, so the two never disagree about which products are stuck.
+  stale_generation_hours: 1
+
+  # --- background detection, layer 2 -----------------------------------------
+  pixels:
+    # Never fetch more than this many images for one product. A product with 12
+    # pictures would otherwise mean 12 downloads per button press.
+    max_images_fetched: 8
+    # Per-image read timeout, and the wall-clock cap on the whole parallel batch.
+    # A public pub-*.r2.dev URL is rate-limited by Cloudflare, so a slow object is
+    # not rare; the deadline is what keeps one of them from holding the button.
+    # Stragglers come back UNKNOWN rather than blocking.
+    fetch_timeout_s: 15
+    fetch_deadline_s: 30
+    # Border band sampled for the background test, as a fraction of the shorter
+    # side. The garment is centred, so the frame edge is background by
+    # construction unless the shot is cropped tight.
+    border_fraction: 0.06
+    # Fraction of border pixels that must be fully transparent to call an image
+    # cut out. Not 1.0: matting leaves feathered edges, and a composited logo or
+    # watermark in a corner is opaque by design.
+    transparent_border_min: 0.85
+    # Mean per-channel deviation across the border band, 0-255, below which the
+    # background reads as a uniform studio sweep rather than a real scene.
+    # Calibrated against the tenant's #ffffff backdrop on one side and phone
+    # photographs of stockroom shelving on the other.
+    uniform_border_max_stddev: 12.0
+    # Between uniform_border_max_stddev and this, the answer is genuinely
+    # ambiguous — a plain wall looks like a sweep. Only this band escalates to the
+    # vision model, and only when use_llm is on.
+    ambiguous_border_max_stddev: 26.0
+
+  # --- generation -------------------------------------------------------------
+  generation:
+    # "Nano Banana Pro". Pinned to the same id services/banana-nano.ts uses:
+    # renders from the two paths land in the same gallery, so a model change on
+    # one side alone makes backfilled products visibly different.
+    model: "gemini-3-pro-image-preview"
+    # Tried, in order, when the primary REFUSES a garment.
+    #
+    # Not a redundancy list — the primary is not down, it has declined. Second-hand
+    # stock is full of prints carrying a real person's likeness (a band tee, a film
+    # shirt, a player's jersey) and `gemini-3-pro-image` will not reproduce those at
+    # all: not on a model, and not even as a person-free ghost-mannequin shot.
+    #
+    # Measured on a Bruce Springsteen tour tee, same prompt and image:
+    #   gemini-3-pro-image-preview      refused
+    #   gemini-3-pro-image              refused
+    #   gemini-3.1-flash-image          refused
+    #   gemini-3.1-flash-lite-image     refused
+    #   gemini-3.1-flash-image-preview  PRODUCED a correct render
+    #   gemini-2.5-flash-image          PRODUCED a correct render
+    #
+    # Both proven names are listed. They cost nothing on the overwhelming
+    # majority of products — the chain is only entered on a refusal — and a
+    # second chance is worth more than the call it costs on the minority that
+    # get that far. Trim the list to cap the worst case.
+    fallback_models: ["gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"]
+
+    # Last resort: a different VENDOR, not another Gemini model.
+    #
+    # Gemini blocks a garment whose print names or shows a real person, on the
+    # REQUEST rather than the response — `prompt_feedback.block_reason` with zero
+    # candidates, back in under four seconds where a real render takes twenty-five.
+    # A classifier reads the request before the generation model does, so no
+    # wording changes the outcome and every Gemini model above gives the same
+    # answer. Measured on a `RODGERS 12` Packers jersey: all three refused,
+    # gpt-image-1 rendered it correctly.
+    #
+    # Reached only when every Gemini model produced nothing, so it costs nothing
+    # on the overwhelming majority of products. Needs OPENAI_API_KEY; silently
+    # skipped without one.
+    openai_fallback: true
+
+    # What to do when NO single model can render every requested view.
+    #
+    # true  — assemble the complete set from whichever models managed each view,
+    #         and flag it loudly. The front and back may not look like the same
+    #         person, but both images exist.
+    # false — keep the best single-model partial instead. The set always matches;
+    #         a view no single model could do alongside the others is reported
+    #         missing even when another model rendered it.
+    #
+    # Measured on a John Cena WWE tee: gemini-2.5-flash rendered the front and
+    # gemini-3.1-flash-image-preview the back, but neither could do both — the
+    # print is a photograph of the wrestler's face, which every model refuses on
+    # one side or the other. With this false the operator is told the front could
+    # not be generated while a perfectly good front sits in memory.
+    #
+    # A CONSISTENT COMPLETE SET IS ALWAYS PREFERRED and tried first; this only
+    # decides the fallback when that is impossible.
+    allow_mixed_models: true
+    # Gemini imageConfig defaults, overridden per tenant where configured.
+    default_resolution: "2K"
+    supported_aspect_ratios:
+      ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"]
+    # Extra garment photos passed as context beyond front and back. The TS worker
+    # caps at 1 to hold memory down; matched here.
+    max_context_images: 1
+    timeout_s: 300
+    # Retries for TRANSIENT faults only — a 504 DEADLINE_EXCEEDED arriving four
+    # seconds into a request that normally takes twenty-five. A content refusal
+    # is never retried: it is a decision, and repeating the identical request
+    # gets the identical answer while doubling the wait.
+    max_retries: 2
+    retry_backoff_s: 3
