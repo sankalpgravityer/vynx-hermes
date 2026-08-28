@@ -1066,12 +1066,29 @@ class NanoBanana:
             if front_reference is not None and view != "front":
                 images.append(front_reference)
             self.calls += 1
+            # THE SHAPE THE PRIMARY WOULD HAVE PRODUCED — which is what this
+            # render has to match, since the two sit side by side in one gallery
+            # and the product page crops whatever does not fit.
+            #
+            # Not the tenant's raw setting: Gemini is given
+            # `resolve_aspect_ratio(...)`, and a 5:7 tenant has no native Gemini
+            # equivalent so it becomes 3:4. Conforming to 5:7 would leave the two
+            # vendors a different shape from each other.
+            #
+            # And not nothing when the tenant says "auto": that is the common
+            # case here, and it means Gemini renders unconstrained at its own
+            # 27:38 while gpt-image lands on 2:3. `auto_portrait_ratio` is that
+            # measured Gemini default.
+            resolved_ratio = resolve_aspect_ratio(
+                ctx.settings.aspect_ratio,
+                self.cfg.get("supported_aspect_ratios") or [],
+            ) or self.cfg.get("auto_portrait_ratio")
             return openai_image.generate(
                 build_prompt(
                     view, ctx, has_front_reference=front_reference is not None
                 ),
                 images,
-                aspect_ratio=ctx.settings.aspect_ratio,
+                aspect_ratio=resolved_ratio,
                 timeout_s=float(self.cfg.get("timeout_s") or 300),
             )
 

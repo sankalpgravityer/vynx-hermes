@@ -514,7 +514,33 @@ def test_undecodable_source_passes_through_untouched():
 # So a model either renders every requested view or the next one gets a turn.
 # --------------------------------------------------------------------------- #
 
-FALLBACKS = policy()["imagery"]["generation"]["fallback_models"]
+# The SHIPPED chain is deliberately empty — one Gemini attempt, then a different
+# vendor (see policy.yaml). The escalation mechanism is unchanged and still has
+# to work, so these tests supply their own fallback list rather than depending on
+# the configured one: they cover the machinery, and
+# `test_shipped_chain_is_one_gemini_then_openai` below covers the configuration.
+FALLBACKS = ["gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"]
+
+
+def chain_policy() -> dict:
+    """`policy()` with a two-model fallback chain, for the mechanism tests."""
+    import copy
+
+    pol = copy.deepcopy(policy())
+    pol["imagery"]["generation"]["fallback_models"] = list(FALLBACKS)
+    return pol
+
+
+def test_shipped_chain_is_one_gemini_then_openai():
+    """What we actually ship. Extra Gemini models each cost a full set of
+    attempts (~25s per view) and rarely disagree with the primary's refusal,
+    which is a policy call about the print — so the escalation that pays is the
+    change of vendor. This also keeps a repair as fast as the analyze worker,
+    which has always used this single model with no chain."""
+    gen = policy()["imagery"]["generation"]
+    assert gen["fallback_models"] == []
+    assert gen["model"] == "gemini-3-pro-image-preview"
+    assert gen.get("openai_fallback") is True
 
 
 def _rig(monkeypatch, behaviour):
@@ -542,7 +568,7 @@ def _models_used(views):
 
 
 def test_one_model_renders_the_whole_set():
-    nb = NanoBanana("k", policy())
+    nb = NanoBanana("k", chain_policy())
     # No stub: every view succeeds on the primary.
     import unittest.mock as mock
 
@@ -559,12 +585,12 @@ def test_a_model_that_cannot_do_every_view_hands_the_whole_set_over(monkeypatch)
     """THE REGRESSION. The primary renders the front but refuses the back, so the
     ENTIRE set moves to the fallback — rather than shipping a primary front next
     to a fallback back."""
-    primary = policy()["imagery"]["generation"]["model"]
+    primary = chain_policy()["imagery"]["generation"]["model"]
     calls = _rig(monkeypatch, {
         (primary, "back"): (None, "FinishReason.IMAGE_OTHER"),
     })
 
-    out = NanoBanana("k", policy()).generate(
+    out = NanoBanana("k", chain_policy()).generate(
         ["AI_FRONT", "AI_BACK"], b"f", b"b", ctx()
     )
     assert all(v.ok for v in out)
@@ -581,7 +607,7 @@ def test_a_front_only_set_recovers_on_the_primary_by_dropping_the_back_photo(
     """The cheap recovery, kept — but now inside one model so it cannot split the
     set. A Raptors front renders once the `DEROZAN` back photo leaves the
     request."""
-    primary = policy()["imagery"]["generation"]["model"]
+    primary = chain_policy()["imagery"]["generation"]["model"]
     calls = _rig(monkeypatch, {})
 
     def fake(self, view, front, back, ctx_, additional, front_reference, model):
@@ -591,7 +617,7 @@ def test_a_front_only_set_recovers_on_the_primary_by_dropping_the_back_photo(
         return b"img", None
 
     monkeypatch.setattr(NanoBanana, "_render", fake)
-    out = NanoBanana("k", policy()).generate(["AI_FRONT"], b"f", b"b", ctx())
+    out = NanoBanana("k", chain_policy()).generate(["AI_FRONT"], b"f", b"b", ctx())
 
     assert [v.ok for v in out] == [True]
     assert _models_used(out) == {primary}, "recovered without changing model"
@@ -605,7 +631,7 @@ def test_a_back_view_never_drops_its_back_photo(monkeypatch):
         (m, "back"): (None, "FinishReason.IMAGE_OTHER")
         for m in [policy()["imagery"]["generation"]["model"], *FALLBACKS]
     })
-    NanoBanana("k", policy()).generate(["AI_BACK"], b"f", b"b", ctx())
+    NanoBanana("k", chain_policy()).generate(["AI_BACK"], b"f", b"b", ctx())
     assert all(c["had_back"] for c in calls if c["view"] == "back")
 
 
@@ -615,7 +641,7 @@ def test_views_are_salvaged_across_models_when_none_can_do_the_whole_set(
     """A John Cena tee: gemini-2.5-flash rendered the front, another model the
     back, and NEITHER could do both. Keeping one partial reported "could not
     generate the front" while a perfectly good front sat in memory."""
-    primary = policy()["imagery"]["generation"]["model"]
+    primary = chain_policy()["imagery"]["generation"]["model"]
     # The primary can do neither; the first fallback only the back; the second
     # only the front.
     _rig(monkeypatch, {
@@ -625,7 +651,7 @@ def test_views_are_salvaged_across_models_when_none_can_do_the_whole_set(
         (FALLBACKS[1], "back"): (None, "FinishReason.IMAGE_OTHER"),
     })
 
-    nb = NanoBanana("k", policy())
+    nb = NanoBanana("k", chain_policy())
     out = nb.generate(["AI_FRONT", "AI_BACK"], b"f", b"b", ctx())
 
     assert all(v.ok for v in out), "both views exist across the two models"
@@ -635,7 +661,7 @@ def test_views_are_salvaged_across_models_when_none_can_do_the_whole_set(
 
 def test_consistency_can_be_chosen_over_completeness(monkeypatch):
     """With allow_mixed_models off, a matching set beats a complete one."""
-    primary = policy()["imagery"]["generation"]["model"]
+    primary = chain_policy()["imagery"]["generation"]["model"]
     _rig(monkeypatch, {
         (primary, "front"): (None, "FinishReason.IMAGE_OTHER"),
         (primary, "back"): (None, "FinishReason.IMAGE_OTHER"),
@@ -643,7 +669,7 @@ def test_consistency_can_be_chosen_over_completeness(monkeypatch):
         (FALLBACKS[1], "back"): (None, "FinishReason.IMAGE_OTHER"),
     })
 
-    nb = NanoBanana("k", policy())
+    nb = NanoBanana("k", chain_policy())
     nb.cfg = {**nb.cfg, "allow_mixed_models": False}
     out = nb.generate(["AI_FRONT", "AI_BACK"], b"f", b"b", ctx())
 
@@ -655,10 +681,10 @@ def test_consistency_can_be_chosen_over_completeness(monkeypatch):
 def test_a_consistent_complete_set_always_wins(monkeypatch):
     """Salvage is the LAST resort — a model that can do everything is preferred
     even when an earlier one covered some views."""
-    primary = policy()["imagery"]["generation"]["model"]
+    primary = chain_policy()["imagery"]["generation"]["model"]
     _rig(monkeypatch, {(primary, "back"): (None, "FinishReason.IMAGE_OTHER")})
 
-    nb = NanoBanana("k", policy())
+    nb = NanoBanana("k", chain_policy())
     out = nb.generate(["AI_FRONT", "AI_BACK"], b"f", b"b", ctx())
     assert {v.model for v in out if v.ok} == {FALLBACKS[0]}
     assert not any("MIXED MODELS" in e for e in nb.errors)
@@ -671,7 +697,7 @@ def test_the_most_complete_attempt_wins_when_nothing_can_do_it_all(monkeypatch):
     _rig(monkeypatch, {(m, "back"): (None, "FinishReason.IMAGE_OTHER")
                        for m in every})
 
-    out = NanoBanana("k", policy()).generate(
+    out = NanoBanana("k", chain_policy()).generate(
         ["AI_FRONT", "AI_BACK"], b"f", b"b", ctx()
     )
     by_view = {v.view: v for v in out}
@@ -683,7 +709,7 @@ def test_the_most_complete_attempt_wins_when_nothing_can_do_it_all(monkeypatch):
 def test_a_preferred_model_is_tried_first(monkeypatch):
     """A gap-fill keeps whatever made the renders already in the gallery."""
     calls = _rig(monkeypatch, {})
-    NanoBanana("k", policy()).generate(
+    NanoBanana("k", chain_policy()).generate(
         ["AI_BACK"], b"f", b"b", ctx(), preferred_model=FALLBACKS[0]
     )
     assert calls[0]["model"] == FALLBACKS[0]
@@ -694,19 +720,19 @@ def test_the_openai_vendor_is_last_and_only_when_configured(monkeypatch):
 
     monkeypatch.setattr(openai_image, "available", lambda: True)
     monkeypatch.setenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
-    chain = NanoBanana("k", policy())._model_chain(None)
+    chain = NanoBanana("k", chain_policy())._model_chain(None)
     assert chain[0] == policy()["imagery"]["generation"]["model"]
     assert chain[-1] == "gpt-image-1"
 
     monkeypatch.setattr(openai_image, "available", lambda: False)
-    assert "gpt-image-1" not in NanoBanana("k", policy())._model_chain(None)
+    assert "gpt-image-1" not in NanoBanana("k", chain_policy())._model_chain(None)
 
 
 def test_the_chain_never_repeats_a_model(monkeypatch):
     from app.imaging import openai_image
 
     monkeypatch.setattr(openai_image, "available", lambda: False)
-    chain = NanoBanana("k", policy())._model_chain(FALLBACKS[0])
+    chain = NanoBanana("k", chain_policy())._model_chain(FALLBACKS[0])
     assert len(chain) == len(set(chain))
     assert chain[0] == FALLBACKS[0]
 
@@ -724,7 +750,7 @@ def test_the_openai_path_receives_the_front_reference(monkeypatch):
         return b"img", None
 
     monkeypatch.setattr(openai_image, "generate", fake_generate)
-    nb = NanoBanana("k", policy())
+    nb = NanoBanana("k", chain_policy())
     data, error = nb._render(
         "back", b"front", b"back", ctx(), [], b"the-front-render", "gpt-image-1"
     )
@@ -770,7 +796,7 @@ def test_a_transient_fault_is_not_treated_as_a_refusal(monkeypatch):
         (policy()["imagery"]["generation"]["model"], "front"):
             (None, "ServerError: 504 DEADLINE_EXCEEDED"),
     })
-    NanoBanana("k", policy()).generate(["AI_FRONT"], b"f", b"b", ctx())
+    NanoBanana("k", chain_policy()).generate(["AI_FRONT"], b"f", b"b", ctx())
     primary_front = [
         c for c in calls
         if c["view"] == "front"
