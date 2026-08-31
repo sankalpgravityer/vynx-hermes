@@ -32,6 +32,18 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("hermes")
 
+# Its own logger, and a name that says what it is: every verify decision is
+# tagged `model-image-verifier` so "did anything check this product's renders,
+# and what did it conclude?" is one grep rather than an inference.
+verifier_log = logging.getLogger("model-image-verifier")
+
+# Its sibling for the generation half: which of the tenant's named models is
+# wearing the garment, and which image model rendered it. Both were only ever
+# returned in `notes` — visible to the caller, invisible in the Hermes log,
+# so "is it using the personalities from settings/image-generation?" could not
+# be answered by looking.
+generator_log = logging.getLogger("model-image-generator")
+
 app = FastAPI(title="Hermes", version="1.0.0",
               description="Deterministic verification agent for AI-generated "
                           "product records.")
@@ -489,6 +501,10 @@ class ImageryVerifyRequest(ImageryRequest):
     # and a studio sweep produce the same border statistic, and this is the only
     # way to tell them apart — at one model call per doubtful image.
     use_llm: bool = False
+    # Should the plan count the ¾ and close-up views as work? Passed here rather
+    # than applied by the caller afterwards, so the decision Hermes returns is
+    # the whole decision and nothing is re-derived downstream.
+    include_advisory: bool = False
 
 
 class ImageryGenerateRequest(ImageryRequest):
@@ -617,6 +633,25 @@ def imagery_verify(req: ImageryVerifyRequest) -> ImageryVerdict:
         else ReconcileStatus.CLEAN
     )
 
+    # ---- the decision, and the line that says what it was ---------------------
+    #
+    # Logged at INFO on every call, one line per product, whichever way it goes.
+    # A verifier that only speaks when it finds something wrong cannot be
+    # distinguished from a verifier that is not running — which is exactly how
+    # this went unnoticed: 265 products marked COMPLETE with no renders, and
+    # nothing in any log either way.
+    plan = imagery_rules.generation_plan(snapshot, pol, req.include_advisory)
+    verifier_log.info(
+        "product=%s present=[%s] missing=[%s] matte=%d -> %s%s (%s)",
+        snapshot.id,
+        ",".join(report.present),
+        ",".join(report.missing),
+        len(plan.matte_first),
+        "GENERATE" if plan.should_generate else "SKIP",
+        f" [{','.join(plan.views)}]" if plan.views else "",
+        plan.reason,
+    )
+
     return ImageryVerdict(
         product_id=snapshot.id,
         correct=not disqualifying,
@@ -626,6 +661,7 @@ def imagery_verify(req: ImageryVerifyRequest) -> ImageryVerdict:
         worst_severity=_worst(findings),
         ai_views=report,
         backgrounds=backgrounds,
+        generation_plan=plan,
         generatable=reason is None,
         not_generatable_reason=reason,
         source_images=imagery_rules.source_images(snapshot, pol),
@@ -765,6 +801,39 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
         if chosen:
             notes.append(f"Model: {chosen.get('name') or 'unnamed personality'}.")
 
+    # Say which person is wearing it and where that choice came from. The three
+    # cases read differently on purpose: a REUSED model is the product's own
+    # stored traits (so a filled-in view matches the renders beside it), a CAST
+    # pick is a fresh draw from the tenant's personalities, and NO CAST means
+    # the tenant has none enabled and the generic settings describe the model.
+    _pool = [
+        p for p in (gen_settings.personalities or [])
+        if isinstance(p, dict) and p.get("enabled") is not False
+    ]
+    if stored.get("personalityName") or any(
+        stored.get(k) for k in ("skinTone", "hairColor", "hairStyle")
+    ):
+        _source = f"REUSED from the product ({stored.get('personalityName') or 'unnamed'})"
+    elif chosen:
+        _source = (
+            f"CAST pick '{chosen.get('name') or 'unnamed'}' "
+            f"from {len(_pool)} enabled personality(ies)"
+        )
+    elif not gen_settings.personalities_enabled:
+        _source = "NO CAST — personalities disabled for this tenant; using the generic settings"
+    else:
+        _source = "NO CAST — no enabled personality matched this product's gender"
+
+    generator_log.info(
+        "product=%s gender=%s model=%s | %s | aspect=%s resolution=%s",
+        snapshot.id,
+        gender or "unspecified",
+        gen_settings.personality_name or "-",
+        _source,
+        gen_settings.aspect_ratio or "auto",
+        gen_settings.resolution or "2K",
+    )
+
     ctx = nanobanana.PromptContext(
         settings=gen_settings,
         category=snapshot.category,
@@ -798,6 +867,15 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
     # regenerate the whole set for consistency, and a silent mismatch is exactly
     # the complaint this flow exists to answer.
     used = next((v.model for v in views if v.ok and v.model), None)
+    generator_log.info(
+        "product=%s rendered %d/%d view(s) with %s%s",
+        snapshot.id,
+        sum(1 for v in views if v.ok),
+        len(views),
+        used or "nothing",
+        f" (wearing {gen_settings.personality_name})"
+        if gen_settings.personality_name else "",
+    )
     if used and preferred_model and used != preferred_model and report.present:
         notes.append(
             f"NOTE: these were produced with {used}, but the renders already on "

@@ -22,9 +22,9 @@ import pytest
 from app.config import policy
 from app.models import ImagerySettings, MediaAsset, ProductSnapshot
 from app.rules.imagery import (
-    check_imagery, garment_photos, is_footwear, is_mislabelled, is_size_chart,
-    needs_segmenter, not_generatable_reason, orphan_cutouts, source_images,
-    unmatted, view_report,
+    check_imagery, garment_photos, generation_plan, is_footwear, is_mislabelled,
+    is_size_chart, needs_matting_for_generation, needs_segmenter,
+    not_generatable_reason, orphan_cutouts, source_images, unmatted, view_report,
 )
 
 
@@ -172,6 +172,27 @@ def test_bootcut_jeans_are_not_footwear(pol):
     assert not is_footwear("Bottoms", "Bootcut Jeans")
     p = product(category="Bottoms", subcategory="Bootcut Jeans", media=MATTED)
     assert "IMG.001" in ids(p, pol)
+
+
+def test_a_footwear_word_in_the_TITLE_does_not_skip_a_garment(pol):
+    """Parity with `isFootwearCategory`, which is given the category fields and
+    NOT the title — and the reason it is given them.
+
+    All three of these are real rows from the live catalogue. DC Shoes is a
+    skate brand that prints its name on t-shirts; "Sandal" in the second is a
+    colourway on a dress. Reading the title made Hermes refuse to generate for
+    garments the analyze worker generates happily, which is exactly the
+    backfill-disagrees-with-the-worker split this module exists to prevent."""
+    for title, cat, sub in [
+        ("Vintage DC Shoes Dark T-Shirt Women M", "T-Shirts & Tops", "T-Shirts"),
+        ("Vintage Closed Black Sandal Dress Women 37", "Dresses", "Dress"),
+        ("Vintage Nike Red Leather Lifestyle Shoe Men", "Sweaters & Hoodies", "Sweaters"),
+    ]:
+        p = product(title=title, category=cat, subcategory=sub, media=MATTED)
+        found = ids(p, pol)
+        assert "IMG.020" not in found, title
+        assert "IMG.001" in found, title
+        assert generation_plan(p, pol).should_generate, title
 
 
 # --------------------------------------------------------------------------- #
@@ -343,3 +364,233 @@ def test_the_real_product_shape(pol):
     assert [s.view for s in source_images(p, pol)] == ["FRONT", "BACK"]
     assert len(garment_photos(p, pol)) == 2
     assert not is_mislabelled(view_report(p, pol), pol)
+
+
+# --------------------------------------------------------------------------- #
+# The decision itself.
+#
+# This is what callers act on, so these tests are the contract: the repair
+# button, the sweep after generation and the backfill script all obey whatever
+# `generation_plan` says, and none of them are allowed a second opinion.
+# --------------------------------------------------------------------------- #
+
+
+def test_plan_asks_for_the_one_missing_view(pol):
+    """The common case, and the one the user described: front render present,
+    back never made, both photographs matted and ready."""
+    p = product(media=[*MATTED, media("AI_FRONT", "GENERATED", position=2)])
+    plan = generation_plan(p, pol)
+    assert plan.should_generate
+    assert plan.views == ["AI_BACK"]
+    assert plan.matte_first == []
+    assert "AI_BACK" in plan.reason
+
+
+def test_plan_declines_a_finished_product(pol):
+    p = product(media=[*MATTED, *FULL_SET])
+    plan = generation_plan(p, pol)
+    assert not plan.should_generate
+    assert plan.views == []
+    # The reason is shown to an operator who pressed a button and got nothing,
+    # so it has to say more than "no".
+    assert plan.reason
+
+
+def test_plan_declines_footwear_and_says_why(pol):
+    p = product(category="Shoes", subcategory="Sneakers",
+                title="Vintage Nike Sneakers Men 9", media=[*MATTED])
+    plan = generation_plan(p, pol)
+    assert not plan.should_generate
+    assert "footwear" in plan.reason
+
+
+def test_plan_declines_when_the_tenant_switched_generation_off(pol):
+    p = product(
+        imagery_settings=ImagerySettings(is_model_generation_enabled=False),
+        media=[*MATTED],
+    )
+    plan = generation_plan(p, pol)
+    assert not plan.should_generate
+    assert "switched off" in plan.reason
+
+
+def test_plan_never_regenerates_a_mislabelled_set(pol):
+    """404 products carry five AI_FRONT rows and nothing else. Treating that as
+    'AI_BACK missing' would spend ~2,000 calls reproducing pictures that exist."""
+    p = product(media=[*MATTED] + [media("AI_FRONT", "GENERATED", position=i)
+                                   for i in range(5)])
+    plan = generation_plan(p, pol)
+    assert not plan.should_generate
+    assert "relabelling" in plan.reason
+
+
+def test_plan_treats_matting_alone_as_work(pol):
+    """Every render present, but an original the segmenter never touched. There
+    is no view to generate and there IS work — which is why callers must test
+    `should_generate` and not `len(views)`."""
+    p = product(media=[
+        media("FRONT", "BG_REMOVED"),
+        media("BACK", "RAW", url="https://r2.dev/products/1-back-original.jpg",
+              position=1),
+        *FULL_SET,
+    ])
+    plan = generation_plan(p, pol)
+    assert plan.should_generate
+    assert plan.views == []
+    assert [m.view for m in plan.matte_first] == ["BACK"]
+
+
+def test_plan_reports_matting_alongside_a_missing_view(pol):
+    p = product(media=[
+        media("FRONT", "BG_REMOVED"),
+        media("BACK", "RAW", url="https://r2.dev/products/1-back-original.jpg",
+              position=1),
+        media("AI_FRONT", "GENERATED", position=2),
+    ])
+    plan = generation_plan(p, pol)
+    assert plan.should_generate
+    assert plan.views == ["AI_BACK"]
+    assert [m.view for m in plan.matte_first] == ["BACK"]
+
+
+def test_advisory_views_are_work_only_when_asked_for(pol):
+    p = product(media=[*MATTED, media("AI_FRONT", "GENERATED", position=2),
+                       media("AI_BACK", "GENERATED", position=3)])
+    assert not generation_plan(p, pol).should_generate
+
+    opted_in = generation_plan(p, pol, include_advisory=True)
+    assert opted_in.should_generate
+    assert set(opted_in.views) == {"AI_FRONT_34", "AI_BACK_34", "AI_CLOSEUP"}
+
+
+def test_plan_declines_with_no_photograph_to_work_from(pol):
+    p = product(media=[media("LABEL", "RAW"), media("SIZE_CHART", "RAW", position=1)])
+    plan = generation_plan(p, pol)
+    assert not plan.should_generate
+    assert "no garment photograph" in plan.reason
+
+
+def test_plan_on_the_real_product_shape(pol):
+    """2b40ac19 again: matte the RAW back first, then make both renders."""
+    p = product(
+        id="2b40ac19-4dfe-4a6b-b0ee-916e8732f33d",
+        media=[
+            media("FRONT", "BG_REMOVED", url="https://r2.dev/products/1-0-processed.png"),
+            media("BACK", "RAW", url="https://r2.dev/products/1-back-original.jpg",
+                  position=1),
+            media("LABEL", "RAW", position=2),
+            media("SIZE_CHART", "RAW", position=3),
+        ],
+    )
+    plan = generation_plan(p, pol)
+    assert plan.should_generate
+    assert plan.views == ["AI_FRONT", "AI_BACK"]
+    # The size chart is NOT matting work, however RAW it looks.
+    assert [m.view for m in plan.matte_first] == ["BACK"]
+
+
+def test_close_up_is_not_advisory_when_the_tenant_switched_it_off(pol):
+    """A tenant with isCloseUpEnabled=false does not want close-ups, and the
+    analyze worker never makes one. Listing it as advisory was harmless while
+    advisory views were never generated; now that a repair fills them in, it
+    would spend a call on a view the tenant switched off."""
+    off = product(
+        imagery_settings=ImagerySettings(is_close_up_enabled=False),
+        media=[*MATTED, media("AI_FRONT", "GENERATED", position=2),
+               media("AI_BACK", "GENERATED", position=3)],
+    )
+    off_plan = generation_plan(off, pol, include_advisory=True)
+    assert "AI_CLOSEUP" not in view_report(off, pol).advisory_missing
+    assert "AI_CLOSEUP" not in off_plan.views
+    # The ¾ views are NOT tenant-gated, so they are still proposed.
+    assert set(off_plan.views) == {"AI_FRONT_34", "AI_BACK_34"}
+
+    on = product(
+        imagery_settings=ImagerySettings(is_close_up_enabled=True),
+        media=[*MATTED, media("AI_FRONT", "GENERATED", position=2),
+               media("AI_BACK", "GENERATED", position=3)],
+    )
+    assert "AI_CLOSEUP" in view_report(on, pol).advisory_missing
+    assert "AI_CLOSEUP" in generation_plan(on, pol, include_advisory=True).views
+
+
+def test_advisory_plan_covers_the_three_quarter_views(pol):
+    """The worker attempts all five; a repair asked for advisory must fill the
+    same set, not just the required pair."""
+    p = product(media=[*MATTED, media("AI_FRONT", "GENERATED", position=2)])
+    plan = generation_plan(p, pol, include_advisory=True)
+    assert set(plan.views) == {
+        "AI_BACK", "AI_FRONT_34", "AI_BACK_34", "AI_CLOSEUP"
+    }
+
+
+# --------------------------------------------------------------------------- #
+# What a repair pays to matte.
+#
+# Generation seeds from FRONT and BACK. Matting the extra angles costs a
+# provider call each and changes nothing about the render.
+# --------------------------------------------------------------------------- #
+
+def test_only_front_and_back_are_matted_not_every_angle(pol):
+    p = product(media=[
+        media("FRONT", "RAW"),
+        media("BACK", "RAW", position=1),
+        media("OTHER", "RAW", position=2),
+        media("OTHER", "RAW", position=3),
+        media("LABEL", "RAW", position=4),
+    ])
+    plan = generation_plan(p, pol)
+    # Two calls, not four — and never the care label.
+    assert sorted(m.view for m in plan.matte_first) == ["BACK", "FRONT"]
+
+
+def test_a_view_that_already_has_a_cutout_is_not_re_matted(pol):
+    """Screenshot 2 / 21ebf282: FRONT and BACK are already BG_REMOVED, with the
+    superseded RAW uploads still on the row. Use what exists; never pay to make
+    a second cut-out of the same view."""
+    p = product(media=[
+        media("FRONT", "BG_REMOVED"),
+        media("BACK", "BG_REMOVED", position=1),
+        media("FRONT", "RAW", position=2),
+        media("BACK", "RAW", position=3),
+        media("AI_FRONT", "GENERATED", position=4),
+        media("AI_BACK", "GENERATED", position=5),
+    ])
+    assert generation_plan(p, pol).matte_first == []
+
+
+def test_mis_filed_cutouts_do_not_exempt_front_and_back_from_matting(pol):
+    """THE d29c474f CASE. Two cut-outs filed under OTHER, FRONT and BACK both
+    RAW. `needs_segmenter` exempts the product — right for a catalog report,
+    since re-matting 5,889 such products would be pointless — but generation
+    cannot seed from a cut-out it cannot identify as the front, so it fell back
+    to the RAW originals and rendered a garment on a stockroom wall.
+
+    A repair therefore mattes FRONT and BACK regardless of what sits under
+    OTHER."""
+    p = product(media=[
+        media("FRONT", "RAW"),
+        media("BACK", "RAW", position=1),
+        media("OTHER", "BG_REMOVED", position=2),
+        media("OTHER", "BG_REMOVED", position=3),
+    ])
+    # The report still exempts it...
+    assert needs_segmenter(p, pol) == []
+    # ...and the repair still fixes the two views it actually generates from.
+    assert sorted(m.view for m in generation_plan(p, pol).matte_first) == [
+        "BACK", "FRONT",
+    ]
+
+
+def test_matting_only_front_and_back_is_still_work_worth_a_job(pol):
+    """Every render present, FRONT still RAW: `should_generate` stays true with
+    an empty `views`, so callers must not test `len(views)`."""
+    p = product(media=[
+        media("FRONT", "RAW"),
+        media("BACK", "BG_REMOVED", position=1),
+        *FULL_SET,
+    ])
+    plan = generation_plan(p, pol)
+    assert plan.should_generate
+    assert plan.views == []
+    assert [m.view for m in plan.matte_first] == ["FRONT"]

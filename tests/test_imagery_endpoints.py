@@ -406,3 +406,164 @@ def test_generate_fails_loudly_when_the_front_cannot_be_downloaded(
     })
     assert r.status_code == 502
     assert "front photograph" in r.json()["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# The plan, over the wire.
+#
+# The rules are unit-tested; these assert the endpoint actually SERVES the
+# decision and logs it. A plan computed and then dropped on the floor would pass
+# every test in test_imagery_rules.py.
+# --------------------------------------------------------------------------- #
+
+def test_verify_serves_the_generation_plan(client: TestClient):
+    r = client.post("/v1/imagery/verify", json={
+        "product": PRODUCT, "media": MEDIA, "settings": SETTINGS,
+        "check_pixels": False,
+    })
+    assert r.status_code == 200
+    plan = r.json()["generation_plan"]
+    assert plan["should_generate"] is True
+    assert plan["views"] == ["AI_FRONT", "AI_BACK"]
+    # Both originals are RAW, so they are matted before anything is generated.
+    assert [m["view"] for m in plan["matte_first"]] == ["FRONT", "BACK"]
+    assert plan["reason"]
+
+
+def test_verify_plan_declines_a_finished_product(client: TestClient):
+    done = MEDIA + [
+        {"url": f"https://r2.dev/products/a-{v}.jpg", "view": v,
+         "processing": "GENERATED", "mediaType": "IMAGE", "isCurrent": True,
+         "position": 5 + i}
+        for i, v in enumerate(("AI_FRONT", "AI_BACK"))
+    ]
+    r = client.post("/v1/imagery/verify", json={
+        "product": PRODUCT, "media": done, "settings": SETTINGS,
+        "check_pixels": False,
+    })
+    plan = r.json()["generation_plan"]
+    # Renders are done; the RAW originals are still work, so the plan says so
+    # rather than reporting the product finished.
+    assert plan["views"] == []
+    assert plan["should_generate"] is True
+    assert [m["view"] for m in plan["matte_first"]] == ["FRONT", "BACK"]
+
+
+def test_verify_plan_honours_include_advisory(client: TestClient):
+    complete = [
+        {"url": "https://r2.dev/products/a-front.png", "view": "FRONT",
+         "processing": "BG_REMOVED", "mediaType": "IMAGE", "isCurrent": True,
+         "position": 0},
+        {"url": "https://r2.dev/products/a-back.png", "view": "BACK",
+         "processing": "BG_REMOVED", "mediaType": "IMAGE", "isCurrent": True,
+         "position": 1},
+    ] + [
+        {"url": f"https://r2.dev/products/a-{v}.jpg", "view": v,
+         "processing": "GENERATED", "mediaType": "IMAGE", "isCurrent": True,
+         "position": 5 + i}
+        for i, v in enumerate(("AI_FRONT", "AI_BACK"))
+    ]
+    body = {"product": PRODUCT, "media": complete, "settings": SETTINGS,
+            "check_pixels": False}
+
+    assert client.post("/v1/imagery/verify", json=body
+                       ).json()["generation_plan"]["should_generate"] is False
+
+    opted = client.post("/v1/imagery/verify",
+                        json={**body, "include_advisory": True}).json()
+    assert opted["generation_plan"]["should_generate"] is True
+    assert set(opted["generation_plan"]["views"]) == {
+        "AI_FRONT_34", "AI_BACK_34", "AI_CLOSEUP"
+    }
+
+
+def test_verify_logs_the_decision_under_model_image_verifier(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+):
+    """A verifier that only speaks when something is wrong cannot be told apart
+    from one that is not running. Both outcomes log, at INFO, under a name that
+    says what it is."""
+    with caplog.at_level("INFO", logger="model-image-verifier"):
+        client.post("/v1/imagery/verify", json={
+            "product": PRODUCT, "media": MEDIA, "settings": SETTINGS,
+            "check_pixels": False,
+        })
+
+    lines = [r for r in caplog.records if r.name == "model-image-verifier"]
+    assert len(lines) == 1
+    msg = lines[0].getMessage()
+    assert PRODUCT["id"] in msg
+    assert "GENERATE" in msg
+    assert "AI_FRONT,AI_BACK" in msg
+
+
+# --------------------------------------------------------------------------- #
+# The cast, in the log.
+#
+# "Is it using the models from settings/image-generation?" was unanswerable by
+# looking: the name went into `notes` for the caller and nowhere else.
+# --------------------------------------------------------------------------- #
+
+def test_generate_logs_which_cast_member_is_wearing_it(
+    client: TestClient, stub_generation, caplog: pytest.LogCaptureFixture
+):
+    with caplog.at_level("INFO", logger="model-image-generator"):
+        r = client.post("/v1/imagery/generate", json={
+            "product": PRODUCT, "media": MEDIA, "settings": SETTINGS,
+            "views": ["AI_FRONT"],
+        })
+    assert r.status_code == 200
+
+    lines = [x.getMessage() for x in caplog.records
+             if x.name == "model-image-generator"]
+    assert len(lines) == 2, lines
+
+    # The tenant's cast is female-only for this product's gender resolution;
+    # either way the NAME has to appear, and it must be one of SETTINGS' cast.
+    picked = r.json()["image_settings"]["personalityName"]
+    assert picked in {p["name"] for p in CAST}
+    assert picked in lines[0]
+    assert "CAST pick" in lines[0]
+    assert f"from {len(CAST)} enabled personality(ies)" in lines[0]
+
+    # …and the second line names the image model that actually rendered.
+    assert "rendered 1/1 view(s)" in lines[1]
+    assert picked in lines[1]
+
+
+def test_generate_logs_a_reused_model_as_reused(
+    client: TestClient, stub_generation, caplog: pytest.LogCaptureFixture
+):
+    """Filling a view beside an existing render must show the SAME face, so the
+    product's stored traits win over a fresh draw — and the log says so."""
+    with caplog.at_level("INFO", logger="model-image-generator"):
+        client.post("/v1/imagery/generate", json={
+            "product": {
+                **PRODUCT,
+                "imageSettings": {
+                    "personalityName": "Emma Smith",
+                    "skinTone": "fair",
+                    "hairColor": "dark brown",
+                    "hairStyle": "long sleek straight hair",
+                },
+            },
+            "media": MEDIA, "settings": SETTINGS, "views": ["AI_BACK"],
+        })
+    first = [x.getMessage() for x in caplog.records
+             if x.name == "model-image-generator"][0]
+    assert "REUSED from the product (Emma Smith)" in first
+
+
+def test_generate_says_so_when_the_tenant_has_no_cast(
+    client: TestClient, stub_generation, caplog: pytest.LogCaptureFixture
+):
+    with caplog.at_level("INFO", logger="model-image-generator"):
+        client.post("/v1/imagery/generate", json={
+            "product": PRODUCT,
+            "media": MEDIA,
+            "settings": {**SETTINGS, "personalitiesEnabled": False},
+            "views": ["AI_FRONT"],
+        })
+    first = [x.getMessage() for x in caplog.records
+             if x.name == "model-image-generator"][0]
+    assert "NO CAST" in first and "personalities disabled" in first

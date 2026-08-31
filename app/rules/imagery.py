@@ -48,7 +48,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.models import (
-    AiViewReport, Finding, MediaAsset, ProductSnapshot, Severity, SourceImage,
+    AiViewReport, Finding, GenerationPlan, MediaAsset, ProductSnapshot, Severity,
+    SourceImage,
 )
 
 # Footwear never gets an on-model render: every MannequinType frames the item as
@@ -164,6 +165,48 @@ def orphan_cutouts(p: ProductSnapshot, pol: dict[str, Any]) -> list[MediaAsset]:
     ]
 
 
+def needs_matting_for_generation(
+    p: ProductSnapshot, pol: dict[str, Any]
+) -> list[MediaAsset]:
+    """The originals a REPAIR should matte — only what generation seeds from.
+
+    Narrower than `needs_segmenter` on purpose. That function answers "which
+    garment photographs are un-matted?", and IMG.010 reports all of them because
+    an un-matted extra angle is a real defect in the gallery.
+
+    This answers the different question a repair asks: what is worth a provider
+    call *before generating*. `source_images` seeds the model from FRONT and
+    BACK, so matting the extra OTHER angles buys nothing for the render — on one
+    product that was four segmenter calls to produce two useful cut-outs.
+
+    Deliberately does NOT inherit `needs_segmenter`'s orphan-cutout exemption.
+    That exemption answers "has the segmenter been over this product at all?",
+    and for a catalog-quality report it is right — 5,889 products have their
+    cut-outs mis-filed under OTHER, and re-matting all of them would be twelve
+    thousand pointless provider calls.
+
+    But generation asks something narrower: is there a clean cut-out OF THE
+    FRONT and OF THE BACK to seed from? A cut-out filed under OTHER cannot
+    answer that — there is no derivation edge and no way to tell which of them
+    is the front — so `source_images` falls back to the RAW originals and the
+    model gets a garment photographed on a stockroom wall. Observed on
+    d29c474f: two OTHER cut-outs, exempt from matting, and both renders seeded
+    from un-matted originals.
+
+    So the test here is per-view and literal: a FRONT or BACK that is RAW and
+    has no background-removed sibling OF ITS OWN VIEW is matted. One that
+    already has one is left alone — use the existing cut-out, never pay to make
+    a second.
+    """
+    views = set(_cfg(pol).get("matte_views") or ["FRONT", "BACK"])
+    photos = [m for m in garment_photos(p, pol) if m.view in views]
+    matted_views = {m.view for m in photos if m.processing != "RAW"}
+    return [
+        m for m in photos
+        if m.processing == "RAW" and m.view not in matted_views
+    ]
+
+
 def needs_segmenter(p: ProductSnapshot, pol: dict[str, Any]) -> list[MediaAsset]:
     """Garment photographs whose background genuinely has not been removed.
 
@@ -196,9 +239,24 @@ def view_report(p: ProductSnapshot, pol: dict[str, Any]) -> AiViewReport:
     rows = ai_renders(p)
     present = sorted({m.view for m in rows})
     req = required_views(p, pol)
+    cfg = _cfg(pol)
+
+    # A tenant with `isCloseUpEnabled = false` does not want close-ups, and the
+    # analyze worker honours that (`wantCloseUp` in banana-nano.ts) — so it is
+    # absent by choice, not missing. `required_views` already drops it from the
+    # required set for the same reason; leaving it in ADVISORY was harmless only
+    # while advisory views were never generated. Now that a repair fills them in,
+    # keeping it here would spend a call producing a view the tenant switched off
+    # and that the worker would never have made.
+    settings = p.imagery_settings
+    close_up = cfg.get("close_up_view")
+    wants_close_up = not settings or settings.is_close_up_enabled
+
     advisory = [
-        v for v in (_cfg(pol).get("all_views") or [])
-        if v not in req and v not in present
+        v for v in (cfg.get("all_views") or [])
+        if v not in req
+        and v not in present
+        and not (v == close_up and not wants_close_up)
     ]
     return AiViewReport(
         required=req,
@@ -232,7 +290,23 @@ def not_generatable_reason(p: ProductSnapshot, pol: dict[str, Any]) -> str | Non
     settings = p.imagery_settings
     if settings and not settings.is_model_generation_enabled:
         return "this tenant has model generation switched off"
-    if is_footwear(p.category, p.subcategory, p.title):
+    # CATEGORY FIELDS ONLY — deliberately NOT the title, which is what
+    # `isFootwearCategory` is given in analyze.worker.ts.
+    #
+    # The title is a brand-name minefield. Measured on 11,818 live products,
+    # including it made Hermes refuse three garments the worker generates:
+    # "Vintage DC Shoes Dark T-Shirt" (cat T-Shirts), "Vintage Closed Black
+    # Sandal Dress" (cat Dresses) and a Nike "Lifestyle Shoe" filed under
+    # Sweaters. DC Shoes is a skate brand that puts its name on t-shirts;
+    # "Sandal" there is a colourway. A backfill and the analyze worker
+    # disagreeing about the same product is the failure this whole module
+    # exists to prevent, and the divergence is silent — the product simply
+    # never gets model images, and the reason reads as a deliberate policy.
+    #
+    # masterCategory is passed for exact parity with the worker. It carries no
+    # footwear rows today (it holds Men/Women/Kids), so it changes nothing now
+    # and keeps the two in step if that ever changes.
+    if is_footwear(p.master_category, p.category, p.subcategory):
         return (
             "footwear — every mannequin type frames the item as apparel worn on "
             "a torso, so the analyze pipeline skips it too"
@@ -240,6 +314,88 @@ def not_generatable_reason(p: ProductSnapshot, pol: dict[str, Any]) -> str | Non
     if not garment_photos(p, pol):
         return "no garment photograph to generate from"
     return None
+
+
+def generation_plan(
+    p: ProductSnapshot,
+    pol: dict[str, Any],
+    include_advisory: bool = False,
+) -> GenerationPlan:
+    """Decide whether to generate, and what.
+
+    THE decision, made here rather than by whoever called. It used to be derived
+    by each caller from `ai_views.missing` and `needs_background_removal`, which
+    meant the repair button and the post-generation sweep each carried their own
+    copy of the same arithmetic — free to drift on the questions that are not
+    obvious: does a mislabelled set count as missing (no), is matting alone worth
+    a job (yes), does an advisory ¾ view justify spending a call (only if asked).
+
+    Order matters. `not_generatable` is settled first, because "no model images"
+    is only a defect when model images were supposed to exist — a footwear
+    product is finished, not broken. Then mislabelling, because a product with
+    five renders under one view HAS its pictures and needs a relabel, and
+    regenerating it would spend real money reproducing what is already there.
+    """
+    reason = not_generatable_reason(p, pol)
+    if reason is not None:
+        return GenerationPlan(should_generate=False, reason=reason)
+
+    report = view_report(p, pol)
+    # Only FRONT/BACK — see needs_matting_for_generation. The wider un-matted
+    # set is still reported by IMG.010; it is just not work this repair pays for.
+    matte = [
+        SourceImage(url=m.url, view=m.view, processing=m.processing)
+        for m in needs_matting_for_generation(p, pol)
+    ]
+
+    if is_mislabelled(report, pol):
+        # IMG.021. Renders exist; the `view` column is what is wrong.
+        return GenerationPlan(
+            should_generate=False,
+            matte_first=matte,
+            reason=(
+                f"{report.row_count} renders already exist, all filed under "
+                f"{report.present[0]} — this needs relabelling, not regenerating"
+            ),
+        )
+
+    views = list(report.missing)
+    if include_advisory:
+        views += [v for v in report.advisory_missing if v not in views]
+
+    if not views and not matte:
+        return GenerationPlan(
+            should_generate=False,
+            reason=(
+                f"every required view is present ({', '.join(report.present) or 'none required'}) "
+                "and every garment original already has a cut-out"
+            ),
+        )
+
+    # Matting alone is still work, and still worth a job: an original without a
+    # cut-out is a visible defect in the gallery whether or not a render is also
+    # missing. Hence `should_generate` is true here with an empty `views`, and
+    # why callers must not test `len(views)` to decide.
+    if not views:
+        return GenerationPlan(
+            should_generate=True,
+            views=[],
+            matte_first=matte,
+            reason=(
+                f"every required view is present, but {len(matte)} garment "
+                f"original(s) still need background removal"
+            ),
+        )
+
+    return GenerationPlan(
+        should_generate=True,
+        views=views,
+        matte_first=matte,
+        reason=(
+            f"missing {', '.join(views)}"
+            + (f"; {len(matte)} original(s) need matting first" if matte else "")
+        ),
+    )
 
 
 def source_images(p: ProductSnapshot, pol: dict[str, Any]) -> list[SourceImage]:

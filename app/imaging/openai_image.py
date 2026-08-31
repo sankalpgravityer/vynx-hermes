@@ -24,6 +24,7 @@ produced nothing.
 from __future__ import annotations
 
 import base64
+import io
 import logging
 import os
 from typing import Any
@@ -40,6 +41,75 @@ _ENDPOINT = "https://api.openai.com/v1/images/edits"
 # tenant's aspect ratio maps onto the nearest of them; BOAS's 5:7 is portrait, so
 # it lands on 1024x1536.
 _PORTRAIT, _LANDSCAPE, _SQUARE = "1024x1536", "1536x1024", "1024x1024"
+
+
+def _target_ratio(aspect_ratio: str | None) -> float | None:
+    """`w:h` as a number, or None when no shape was asked for."""
+    if not aspect_ratio or aspect_ratio == "auto":
+        return None
+    try:
+        width, height = (float(n) for n in aspect_ratio.split(":", 1))
+    except (ValueError, AttributeError):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width / height
+
+
+def conform_to_ratio(data: bytes, aspect_ratio: str | None) -> bytes:
+    """Centre-crop a render to the tenant's aspect ratio.
+
+    WHY THIS EXISTS. Gemini takes an `aspect_ratio` and returns that shape;
+    gpt-image only offers three fixed canvases, so the same product came back
+    1024x1536 (2:3) from the fallback where Gemini had produced 3:4. Two shapes
+    in one gallery, and the taller one is cropped by the product page — which
+    cuts off the bottom-right corner, where the vnyx.ai watermark is applied.
+    A missing watermark was the visible symptom; a mismatched gallery was the
+    actual defect.
+
+    Cropped, not scaled: squashing a person to fit a ratio is worse than losing
+    a little headroom, and the crop is centred so the garment — which the prompt
+    puts in the middle of the frame — survives it.
+
+    Best-effort. A crop that fails returns the original bytes; a wrongly-shaped
+    render still beats no render, which is the whole point of this fallback.
+    """
+    target = _target_ratio(aspect_ratio)
+    if target is None:
+        return data
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+            if not width or not height:
+                return data
+            current = width / height
+            # Already within a pixel-rounding of the target.
+            if abs(current - target) < 0.01:
+                return data
+
+            if current > target:
+                # Too wide — trim the sides.
+                new_width = max(1, round(height * target))
+                left = (width - new_width) // 2
+                box = (left, 0, left + new_width, height)
+            else:
+                # Too tall — trim top and bottom.
+                new_height = max(1, round(width / target))
+                top = (height - new_height) // 2
+                box = (0, top, width, top + new_height)
+
+            out = io.BytesIO()
+            img.crop(box).save(out, format="PNG")
+            log.info(
+                "conformed gpt-image render %dx%d -> %dx%d for aspect %s",
+                width, height, box[2] - box[0], box[3] - box[1], aspect_ratio,
+            )
+            return out.getvalue()
+    except Exception as exc:  # noqa: BLE001 — a wrong shape beats no image
+        log.warning("could not conform render to %s: %s", aspect_ratio, exc)
+        return data
 
 
 def resolve_size(aspect_ratio: str | None) -> str:
@@ -70,6 +140,7 @@ def generate(
     images: list[bytes],
     aspect_ratio: str | None = None,
     timeout_s: float = 180.0,
+    quality: str | None = None,
 ) -> tuple[bytes | None, str | None]:
     """One render. Returns (png_bytes, error) — exactly one is set.
 
@@ -85,6 +156,13 @@ def generate(
 
     model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
     size = resolve_size(aspect_ratio)
+
+    # Send `quality` explicitly. Omitting it means "auto", and auto resolves
+    # towards the top tier — roughly 15x the output tokens of `low` and 4x
+    # `medium` for the same picture. This is a fallback for views the primary
+    # refused, priced per output token, so the tier is a budget decision and
+    # belongs in policy rather than in a vendor default we never see.
+    quality = (quality or os.getenv("OPENAI_IMAGE_QUALITY") or "medium").lower()
 
     # `image[]` for more than one reference, which is how the edits endpoint
     # takes a set; a single reference uses the scalar field.
@@ -107,7 +185,13 @@ def generate(
                 _ENDPOINT,
                 headers={"Authorization": f"Bearer {key}"},
                 files=files,
-                data={"model": model, "prompt": prompt, "size": size, "n": "1"},
+                data={
+                    "model": model,
+                    "prompt": prompt,
+                    "size": size,
+                    "n": "1",
+                    "quality": quality,
+                },
             )
     except Exception as exc:  # noqa: BLE001
         return None, f"{type(exc).__name__}: {exc}"
@@ -132,5 +216,19 @@ def generate(
     if not b64:
         return None, "openai returned no image"
 
-    log.info("gpt-image rendered a view Gemini would not (%s, %s)", model, size)
-    return base64.b64decode(b64), None
+    # Output tokens are what the render is billed on, so log them. Over a
+    # backfill these lines are the only per-view record of what the fallback
+    # actually cost — the dashboard reports a daily total, far too late to
+    # change the tier on a run that is already halfway through the catalogue.
+    usage = payload.get("usage") or {}
+    log.info(
+        "gpt-image rendered a view Gemini would not (%s, %s, quality=%s, "
+        "out_tokens=%s)",
+        model,
+        size,
+        quality,
+        usage.get("output_tokens", "?"),
+    )
+    # Conform to the tenant's ratio before returning: the caller stores this
+    # beside Gemini renders of the same product, and they have to be one shape.
+    return conform_to_ratio(base64.b64decode(b64), aspect_ratio), None

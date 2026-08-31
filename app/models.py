@@ -589,6 +589,32 @@ class SourceImage(BaseModel):
     processing: str
 
 
+class GenerationPlan(BaseModel):
+    """THE DECISION: generate, or leave it alone.
+
+    Hermes owns this, not the caller. The verdict used to report only facts —
+    which views are missing, which originals need the segmenter — and every
+    caller then re-derived "so should I generate?" from them. Two callers had
+    already written that arithmetic twice (the repair button and the sweep after
+    generation), which is two chances to disagree about whether an advisory ¾
+    view counts, or whether matting alone is worth a job. The rules live in one
+    place and speak once; the caller obeys.
+
+    `should_generate` is the whole answer. `views` is what to generate when it is
+    true, and is empty when the only outstanding work is background removal —
+    so a caller must check `should_generate`, never `len(views)`.
+    """
+
+    should_generate: bool = False
+    # AI views to render, as VNYX ProductMediaView names.
+    views: list[str] = Field(default_factory=list)
+    # Garment originals to matte FIRST. Generating from an un-matted photograph
+    # seeds the model with a stockroom wall, so this happens before `views`.
+    matte_first: list[SourceImage] = Field(default_factory=list)
+    # Why, in words, for the log line and the operator. Always set.
+    reason: str = ""
+
+
 class ImageryVerdict(BaseModel):
     """Report-only answer to "are this product's pictures finished?"."""
 
@@ -611,6 +637,10 @@ class ImageryVerdict(BaseModel):
     # wrong view (IMG.022) — re-matting either costs a provider call and degrades
     # the picture.
     needs_background_removal: list[SourceImage] = Field(default_factory=list)
+
+    # What to DO about all of the above. See GenerationPlan: this is the field a
+    # caller acts on, and the rest of the verdict is the evidence behind it.
+    generation_plan: GenerationPlan = Field(default_factory=GenerationPlan)
 
     # Can the missing renders actually be produced right now? False carries a
     # reason — footwear, the tenant setting, or no photograph to work from — and

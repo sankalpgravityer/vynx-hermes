@@ -645,8 +645,28 @@ class NanoBanana:
         # short — and on a host that stalls on IPv6, `client_args` is the only way
         # in: the SDK builds its own httpx client, so the transport has to be
         # handed to it rather than configured around it.
-        self._http_options = types.HttpOptions(
-            timeout=int(float(self.cfg.get("timeout_s") or 300) * 1000),
+        self._timeout_ms = int(float(self.cfg.get("timeout_s") or 300) * 1000)
+
+    def _http_options(self):
+        """FRESH HttpOptions — and a fresh transport — for every call.
+
+        Built per call, not once in __init__, and that is the whole point.
+        `genai_client_args()` returns an `httpx.HTTPTransport`, which owns a
+        connection pool. Cached on the instance, every per-thread `genai.Client`
+        got the SAME transport: the four views that run concurrently shared one
+        pool, and the moment the first client finished and closed it, the others
+        lost their sockets mid-read.
+
+        The symptom was three simultaneous
+        `ReadError: [WinError 10038] An operation was attempted on something
+        that is not a socket` in the same second one view succeeded — reported
+        as three failed views, and indistinguishable in the logs from a model
+        refusing the garment.
+        """
+        from google.genai import types
+
+        return types.HttpOptions(
+            timeout=self._timeout_ms,
             client_args=genai_client_args() or None,
         )
 
@@ -740,11 +760,42 @@ class NanoBanana:
         # `makeClient()`-per-view rotation banana-nano.ts does.
         client = self.genai.Client(
             api_key=self._next_key(),
-            http_options=self._http_options,
+            http_options=self._http_options(),
         )
+        # EXPLICIT SAFETY THRESHOLDS.
+        #
+        # Left unset, the developer API applies BLOCK_MEDIUM_AND_ABOVE — stricter
+        # than Google's own consumer surface, which renders a player-name jersey
+        # on a model (back view included) while the identical garment through
+        # this API returns IMAGE_OTHER. These are a documented request parameter
+        # for exactly this: tuning the threshold to the domain. Second-hand
+        # clothing shot for resale is a benign one.
+        #
+        # A threshold move, not a way around a decision — and it may not help at
+        # all, because an image refusal can originate in an output-side filter
+        # these do not reach. `safety_relaxed: false` restores the defaults.
+        safety = None
+        if self.cfg.get("safety_relaxed"):
+            try:
+                low = types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+                safety = [
+                    types.SafetySetting(category=c, threshold=low)
+                    for c in (
+                        types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+                        types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+                        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+                        types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+                    )
+                ]
+            except AttributeError as exc:
+                # An SDK that names these differently must not take generation
+                # down with it — fall back to the API defaults.
+                log.warning("safety settings unavailable in this SDK: %s", exc)
+
         config = types.GenerateContentConfig(
             response_modalities=["IMAGE", "TEXT"],
             image_config=types.ImageConfig(**image_config),
+            **({"safety_settings": safety} if safety else {}),
         )
         contents = [types.Content(role="user", parts=parts)]
 
@@ -1066,13 +1117,31 @@ class NanoBanana:
             if front_reference is not None and view != "front":
                 images.append(front_reference)
             self.calls += 1
+            # THE SHAPE THE PRIMARY WOULD HAVE PRODUCED — which is what this
+            # render has to match, since the two sit side by side in one gallery
+            # and the product page crops whatever does not fit.
+            #
+            # Not the tenant's raw setting: Gemini is given
+            # `resolve_aspect_ratio(...)`, and a 5:7 tenant has no native Gemini
+            # equivalent so it becomes 3:4. Conforming to 5:7 would leave the two
+            # vendors a different shape from each other.
+            #
+            # And not nothing when the tenant says "auto": that is the common
+            # case here, and it means Gemini renders unconstrained at its own
+            # 27:38 while gpt-image lands on 2:3. `auto_portrait_ratio` is that
+            # measured Gemini default.
+            resolved_ratio = resolve_aspect_ratio(
+                ctx.settings.aspect_ratio,
+                self.cfg.get("supported_aspect_ratios") or [],
+            ) or self.cfg.get("auto_portrait_ratio")
             return openai_image.generate(
                 build_prompt(
                     view, ctx, has_front_reference=front_reference is not None
                 ),
                 images,
-                aspect_ratio=ctx.settings.aspect_ratio,
+                aspect_ratio=resolved_ratio,
                 timeout_s=float(self.cfg.get("timeout_s") or 300),
+                quality=self.cfg.get("openai_quality"),
             )
 
         return self._one(
@@ -1104,6 +1173,18 @@ _TRANSIENT_MARKERS = (
     "429", "500", "502", "503", "504",
     "DEADLINE_EXCEEDED", "UNAVAILABLE", "INTERNAL", "RESOURCE_EXHAUSTED",
     "CONNECTERROR", "READTIMEOUT", "REMOTEPROTOCOLERROR", "TIMEOUT",
+    # The httpx transport family. `READTIMEOUT` was here but `READERROR` was
+    # not, and they are different exceptions: a socket that DIES mid-read raises
+    # ReadError, which matched nothing and was therefore classified as a
+    # REFUSAL — so a broken connection was reported as "the model declined this
+    # garment", and the caller stopped instead of retrying.
+    #
+    # Seen as `ReadError: [WinError 10038] An operation was attempted on
+    # something that is not a socket`, three views at once.
+    "READERROR", "WRITEERROR", "POOLTIMEOUT", "PROXYERROR",
+    "LOCALPROTOCOLERROR", "SSLERROR", "CLOSEDRESOURCEERROR",
+    # Windows socket errnos, which arrive wrapped rather than named.
+    "WINERROR",
 )
 
 

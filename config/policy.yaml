@@ -208,6 +208,22 @@ imagery:
   # to find and mangles it. Matches needsBackgroundRemoval() in vnyx-api.
   garment_views: ["FRONT", "BACK", "OTHER"]
 
+  # Views a REPAIR will actually run the segmenter over, which is narrower than
+  # the list above.
+  #
+  # `garment_views` is what background removal APPLIES to — it answers "is this
+  # photograph un-matted?", and IMG.010 reports the whole set because an
+  # un-matted extra angle is still a defect in the gallery.
+  #
+  # This is the different question of what a repair should PAY to matte before
+  # generating, and the answer is only what generation reads: `source_images`
+  # seeds the model from FRONT and BACK. Matting the extra angles cost a
+  # provider call each and changed nothing about the render — on one product
+  # that was four calls to produce two useful cut-outs.
+  #
+  # Widen this to `garment_views` to go back to matting everything.
+  matte_views: ["FRONT", "BACK"]
+
   # Size charts filed under view OTHER — 904 of them on the measured tenant.
   # Their URL still gives them away: the size-guide uploader writes under
   # /size-charts/, garment photography under /products/. Without this the report
@@ -254,26 +270,45 @@ imagery:
     # renders from the two paths land in the same gallery, so a model change on
     # one side alone makes backfilled products visibly different.
     model: "gemini-3-pro-image-preview"
-    # Tried, in order, when the primary REFUSES a garment.
+    # EMPTY ON PURPOSE: one Gemini attempt, then a different vendor.
     #
-    # Not a redundancy list — the primary is not down, it has declined. Second-hand
-    # stock is full of prints carrying a real person's likeness (a band tee, a film
-    # shirt, a player's jersey) and `gemini-3-pro-image` will not reproduce those at
-    # all: not on a model, and not even as a person-free ghost-mannequin shot.
+    # These other Gemini names DO sometimes render a garment the primary refuses —
+    # measured on a Bruce Springsteen tour tee, `gemini-3.1-flash-image-preview`
+    # and `gemini-2.5-flash-image` both produced a correct render where
+    # `gemini-3-pro-image-preview` declined. They were listed for that reason.
     #
-    # Measured on a Bruce Springsteen tour tee, same prompt and image:
-    #   gemini-3-pro-image-preview      refused
-    #   gemini-3-pro-image              refused
-    #   gemini-3.1-flash-image          refused
-    #   gemini-3.1-flash-lite-image     refused
-    #   gemini-3.1-flash-image-preview  PRODUCED a correct render
-    #   gemini-2.5-flash-image          PRODUCED a correct render
+    # They are not listed any more because of what the chain costs when it does
+    # NOT work, which is the common case: each extra model is a full set of
+    # attempts at ~25s per view, and on a refused two-view product the walk from
+    # primary through both fallbacks to gpt-image took 265-295s of which ~200s
+    # was Gemini models declining in sequence. The analyze worker has always used
+    # this single model with no chain, and matching it keeps a repair as fast as
+    # a first-pass generation.
     #
-    # Both proven names are listed. They cost nothing on the overwhelming
-    # majority of products — the chain is only entered on a refusal — and a
-    # second chance is worth more than the call it costs on the minority that
-    # get that far. Trim the list to cap the worst case.
-    fallback_models: ["gemini-3.1-flash-image-preview", "gemini-2.5-flash-image"]
+    # The refusal is a POLICY decision about the garment's print, so a second
+    # Gemini rarely disagrees; a different vendor is the escalation that actually
+    # pays. Re-add a name here if a class of garment turns up that gpt-image also
+    # refuses — the mechanism is unchanged, only the list is empty.
+    fallback_models: []
+
+    # The shape gpt-image is cropped to when the tenant's aspectRatio is "auto".
+    #
+    # On "auto" Gemini is given no constraint and returns its own natural 2K
+    # portrait: measured at exactly 1728x2432 across every unconstrained render
+    # on the dev tenant, which reduces to 27:38 (0.7105). gpt-image has no
+    # equivalent — it picks from three fixed canvases and lands on 1024x1536
+    # (2:3, 0.6667), visibly taller and narrower.
+    #
+    # Left uncorrected that put two shapes in one gallery. The product page
+    # crops to fit, and on the taller gpt-image render what it cropped was the
+    # bottom: the model's feet, and the vnyx.ai watermark in the corner. A
+    # missing watermark was how it was noticed.
+    #
+    # Gemini is deliberately NOT constrained to this instead — that would change
+    # the shape of every future Gemini render and leave them mismatched against
+    # the existing catalog. The fallback conforms to the primary, not the
+    # reverse.
+    auto_portrait_ratio: "27:38"
 
     # Last resort: a different VENDOR, not another Gemini model.
     #
@@ -288,7 +323,41 @@ imagery:
     # Reached only when every Gemini model produced nothing, so it costs nothing
     # on the overwhelming majority of products. Needs OPENAI_API_KEY; silently
     # skipped without one.
+    # ON: the account is funded again. Note that `available()` only checks the
+    # key EXISTS, never that it has credit — when the balance next runs out,
+    # every refused garment will walk the whole chain and then pay a
+    # guaranteed-402 round trip to finish with nothing. Set this false the day
+    # that happens rather than waiting for the timeouts to explain it.
     openai_fallback: true
+
+    # The billed tier. gpt-image prices per OUTPUT TOKEN, and the token count is
+    # a function of size and quality alone — at 1024x1536, roughly 400 tokens at
+    # `low`, 1.6k at `medium`, 6.2k at `high`. So `high` costs about 15x `low`
+    # for the same view, and leaving this unset is NOT free: unset means "auto",
+    # which resolves towards the top.
+    #
+    # `medium` because these are catalogue renders shown at ~1024px wide, where
+    # the extra detail `high` buys is not visible, and because this is the
+    # fallback path — reached only for garments the primary refused, on a budget
+    # that has to cover the whole catalogue rather than a few hundred views.
+    openai_quality: "medium"
+
+    # SAFETY THRESHOLDS, set explicitly rather than left to the API default.
+    #
+    # These are a documented request parameter. Unset, the developer API applies
+    # BLOCK_MEDIUM_AND_ABOVE, which is stricter than the thresholds Google runs
+    # on its own consumer surface — the Gemini app renders a player-name jersey
+    # on a model, back view included, while the same content through this API
+    # comes back IMAGE_OTHER.
+    #
+    # Second-hand clothing photographed for resale is exactly the benign domain
+    # the parameter exists to tune for. BLOCK_ONLY_HIGH is a threshold move
+    # inside what Google permits, not a way around a decision.
+    #
+    # HONESTLY UNCERTAIN whether it helps: an image refusal can come from an
+    # output-side filter these thresholds do not reach. Cheap to try, and the
+    # test command tells us. Set safety_relaxed: false to go back to defaults.
+    safety_relaxed: true
 
     # What to do when NO single model can render every requested view.
     #

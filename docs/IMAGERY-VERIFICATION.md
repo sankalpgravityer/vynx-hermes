@@ -222,13 +222,20 @@ what judged it.
   "settings": { "isModelGenerationEnabled", "isCloseUpEnabled", "isRemoveBgEnabled",
                 "bgRemovalProvider", "background", "autoApplyBackground" },
   "use_llm": false,
-  "check_pixels": true
+  "check_pixels": true,
+  "include_advisory": false        // count the 3/4 and close-up views as work
 }
 
 // response
 {
   "product_id", "correct", "status",           // clean | needs_review | blocked
   "findings": [ Finding ],                      // the shape hermes-client.ts already types
+  "generation_plan": {                          // THE DECISION — act on this
+    "should_generate": true,
+    "views": ["AI_BACK"],                       // empty when only matting is due
+    "matte_first": [ { "url", "view", "processing" } ],
+    "reason": "missing AI_BACK"                 // always set, both ways
+  },
   "ai_views":    { "required": [], "present": [], "missing": [], "advisory_missing": [] },
   "backgrounds": [ { "url", "view", "processing", "verdict", "basis", "confidence" } ],
   "generatable", "not_generatable_reason", "source_images": [],
@@ -238,6 +245,47 @@ what judged it.
 
 `Finding` and `Severity` are reused verbatim from `app/models.py`, so `HermesFinding`
 in the TS client and anything already rendering findings work unchanged.
+
+### Hermes decides; callers obey
+
+`generation_plan` is the field a caller acts on. Everything else in the verdict is
+the evidence behind it.
+
+This was not the original shape. The verdict used to report only facts —
+`ai_views.missing`, `needs_background_removal` — and each caller then worked out
+"so should I generate?" for itself. Three of them did: the Model images button,
+the sweep after generation, and `scripts/backfill-imagery.ts`. That is three
+copies of one rule set, free to disagree on the questions that are not obvious:
+
+  * does a mislabelled set (five `AI_FRONT` rows) count as missing? **No** — it
+    needs relabelling, and regenerating it would spend ~2,000 calls reproducing
+    pictures that already exist.
+  * is matting alone worth a job? **Yes** — an original with no cut-out is a
+    visible defect whether or not a render is also absent.
+  * does an advisory ¾ view justify a call? **Only when asked for**, which is why
+    `include_advisory` is a request field rather than something applied to the
+    answer afterwards.
+
+A backfill that quietly disagreed with the button would be discovered as a bill.
+So the rules answer once, in `app/rules/imagery.py::generation_plan`, and the
+callers obey.
+
+**Check `should_generate`, never `len(views)`.** A product whose renders are all
+present but whose originals were never matted has real work and an empty `views`.
+
+### The log line
+
+Every verify call logs one line, at INFO, under the logger `model-image-verifier`:
+
+```
+2026-08-27 11:10:53,765 INFO model-image-verifier product=37263600-… present=[AI_FRONT] missing=[AI_BACK] matte=0 -> GENERATE [AI_BACK] (missing AI_BACK)
+2026-08-27 11:11:02,118 INFO model-image-verifier product=68117fe3-… present=[AI_FRONT,AI_BACK] missing=[] matte=0 -> SKIP (every required view is present …)
+```
+
+Both outcomes log, deliberately. A verifier that only speaks when it finds
+something wrong cannot be told apart from one that is not running — which is
+precisely how 265 products came to sit at `generationStatus = COMPLETE` with no
+renders and nothing in any log either way.
 
 ### How the Model images button reaches it
 
@@ -603,6 +651,68 @@ nothing about the garment.
 filled in months later is made by the same model as the ones beside it. If that
 model can no longer do the job, the response says so explicitly rather than
 quietly shipping a mismatch.
+
+### A repair mattes FRONT and BACK, and nothing else
+
+Two different questions, deliberately answered by two functions:
+
+| | `needs_segmenter` (IMG.010) | `needs_matting_for_generation` (`matte_first`) |
+|---|---|---|
+| asks | which garment photographs are un-matted? | what is worth a provider call before generating? |
+| views | `garment_views` — FRONT, BACK, **OTHER** | `matte_views` — FRONT, BACK |
+| mis-filed cut-outs | exempt the product | do **not** exempt it |
+
+Generation seeds from FRONT and BACK (`source_images`), so matting the extra
+OTHER angles buys nothing for the render — on one product that was four
+segmenter calls to produce two useful cut-outs.
+
+The second row matters more. `needs_segmenter` exempts a product when it has at
+least as many orphan cut-outs as RAW originals: 5,889 products have their
+cut-outs filed under OTHER, and re-matting them all would be twelve thousand
+pointless calls. Correct for a catalog report — wrong for generation, because a
+cut-out under OTHER cannot be identified as *the front*. On `d29c474f` that
+exemption meant both renders seeded from un-matted originals: a garment
+photographed on a stockroom wall.
+
+So the repair's test is per-view and literal — **a FRONT or BACK that is RAW and
+has no background-removed sibling of its own view gets matted; one that already
+has a cut-out is left alone and the existing one is used.** IMG.010 keeps
+reporting the wider set; it is simply not work this repair pays for.
+
+### The chain is deliberately short: one Gemini, then a different vendor
+
+`fallback_models` ships **empty**. The escalation order is
+`gemini-3-pro-image-preview` → `gpt-image-1.5`, matching what
+`services/banana-nano.ts` has always done: one model, no chain.
+
+Other Gemini names genuinely do sometimes render a garment the primary refuses
+— the measurements below are real. They are no longer listed because of what
+the chain costs when it does **not** work, which is the common case. Each extra
+model is a full set of attempts at ~25s per view; on a refused two-view product
+the walk from primary through both fallbacks to gpt-image took **265–295s**, of
+which ~200s was Gemini models declining in sequence. A refusal is a policy
+decision about the print, so a second Gemini rarely disagrees; the change of
+vendor is the escalation that actually pays.
+
+Re-add a name to `fallback_models` if a class of garment turns up that
+gpt-image also refuses — the mechanism is unchanged, only the list is empty.
+
+### gpt-image renders are conformed to the tenant's shape
+
+Gemini accepts an `aspect_ratio` and returns that shape. gpt-image offers three
+fixed canvases (1024×1536, 1536×1024, 1024×1024), so a 5:7 tenant — whose
+Gemini renders come back **3:4** — got **2:3** from the fallback. Two shapes in
+one gallery, and the product page crops the taller one, cutting off the
+bottom-right corner where the `vnyx.ai` watermark is applied. The missing
+watermark was the symptom; the mismatched gallery was the defect.
+
+`openai_image.conform_to_ratio` centre-crops the render to the **resolved**
+ratio — the same 3:4 Gemini was given, not the raw 5:7 — so both vendors'
+views are identical in shape. Cropped rather than scaled: squashing a person to
+fit a ratio is worse than losing a little headroom, and the prompt puts the
+garment mid-frame so a centred crop keeps it. Best-effort — an unreadable or
+un-croppable render is returned as-is, because a wrongly-shaped render still
+beats no render at the end of an escalation chain.
 
 ### When no single model can do the set
 
