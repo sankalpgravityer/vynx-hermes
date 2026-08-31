@@ -531,16 +531,57 @@ def chain_policy() -> dict:
     return pol
 
 
-def test_shipped_chain_is_one_gemini_then_openai():
-    """What we actually ship. Extra Gemini models each cost a full set of
-    attempts (~25s per view) and rarely disagree with the primary's refusal,
-    which is a policy call about the print — so the escalation that pays is the
-    change of vendor. This also keeps a repair as fast as the analyze worker,
-    which has always used this single model with no chain."""
+def test_shipped_chain_is_one_gemini_then_gpt_image():
+    """What we actually ship: ONE Gemini model, then gpt-image for its refusals.
+
+    No intermediate Gemini fallbacks — a refusal is a decision the classifier
+    makes about the REQUEST, so every Gemini model gives the same answer and
+    trying a second one only spends wall-clock. Changing vendor is the only
+    escalation that changes the outcome.
+
+    Safety thresholds are set explicitly instead of left to the API default,
+    which is stricter than Google's own consumer surface on exactly the
+    garments this catalogue is full of."""
     gen = policy()["imagery"]["generation"]
-    assert gen["fallback_models"] == []
     assert gen["model"] == "gemini-3-pro-image-preview"
+    assert gen["fallback_models"] == []
     assert gen.get("openai_fallback") is True
+    assert gen.get("safety_relaxed") is True
+
+
+def test_shipped_chain_escalates_to_openai_only_with_a_key(monkeypatch):
+    """`available()` checks the key exists, so the chain length follows it.
+
+    Without a key the run must stay Gemini-only rather than appending a step
+    that can only fail — the deployment that has no OPENAI_API_KEY is a valid
+    one, not a misconfiguration to be papered over.
+    """
+    from app.imaging import openai_image
+
+    monkeypatch.setenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
+
+    # Overriding the suite-wide `available -> False` guard, per its docstring.
+    monkeypatch.setattr(openai_image, "available", lambda: True)
+    assert NanoBanana("k", policy())._model_chain(None) == [
+        "gemini-3-pro-image-preview",
+        "gpt-image-1.5",
+    ]
+
+    monkeypatch.setattr(openai_image, "available", lambda: False)
+    assert NanoBanana("k", policy())._model_chain(None) == [
+        "gemini-3-pro-image-preview"
+    ]
+
+
+def test_shipped_openai_quality_is_set_explicitly():
+    """Unset means "auto", and auto resolves towards the top tier.
+
+    At 1024x1536 that is ~6.2k output tokens a view against ~1.6k for `medium`,
+    on the path taken by every garment the primary refused. The tier is a
+    budget decision, so it is stated rather than inherited."""
+    gen = policy()["imagery"]["generation"]
+    assert gen.get("openai_quality") in {"low", "medium", "high"}
+
 
 
 def _rig(monkeypatch, behaviour):
@@ -720,12 +761,14 @@ def test_the_openai_vendor_is_last_and_only_when_configured(monkeypatch):
 
     monkeypatch.setattr(openai_image, "available", lambda: True)
     monkeypatch.setenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
-    chain = NanoBanana("k", chain_policy())._model_chain(None)
+    pol = chain_policy()
+    pol["imagery"]["generation"]["openai_fallback"] = True
+    chain = NanoBanana("k", pol)._model_chain(None)
     assert chain[0] == policy()["imagery"]["generation"]["model"]
     assert chain[-1] == "gpt-image-1"
 
     monkeypatch.setattr(openai_image, "available", lambda: False)
-    assert "gpt-image-1" not in NanoBanana("k", chain_policy())._model_chain(None)
+    assert "gpt-image-1" not in NanoBanana("k", pol)._model_chain(None)
 
 
 def test_the_chain_never_repeats_a_model(monkeypatch):
@@ -744,7 +787,7 @@ def test_the_openai_path_receives_the_front_reference(monkeypatch):
 
     seen = {}
 
-    def fake_generate(prompt, images, aspect_ratio=None, timeout_s=0):
+    def fake_generate(prompt, images, aspect_ratio=None, timeout_s=0, quality=None):
         seen["images"] = len(images)
         seen["prompt"] = prompt
         return b"img", None
@@ -803,3 +846,48 @@ def test_a_transient_fault_is_not_treated_as_a_refusal(monkeypatch):
         and c["model"] == policy()["imagery"]["generation"]["model"]
     ]
     assert len(primary_front) == 1, "no back-photo retry on a transient fault"
+
+
+# --------------------------------------------------------------------------- #
+# A dead socket is not a refusal.
+# --------------------------------------------------------------------------- #
+
+def test_a_transport_fault_is_transient_not_a_refusal():
+    """THE 10038 BUG, both halves.
+
+    Four views run concurrently. They shared one `httpx.HTTPTransport` — cached
+    on the instance instead of built per call — so when the first client closed
+    it, the other three lost their sockets and raised
+
+        ReadError: [WinError 10038] An operation was attempted on something
+        that is not a socket
+
+    `READTIMEOUT` was in the marker list but `READERROR` was not, so those three
+    were classified as REFUSALS. A broken connection therefore read as "the
+    model declined this garment", and the caller stopped rather than retrying.
+    """
+    from app.imaging.nanobanana import _is_transient
+
+    dead_socket = ("ReadError: [WinError 10038] An operation was attempted on "
+                   "something that is not a socket")
+    assert _is_transient(dead_socket)
+    for fault in ("WriteError: connection lost", "PoolTimeout",
+                  "ConnectError: refused", "ReadTimeout", "429 RESOURCE_EXHAUSTED"):
+        assert _is_transient(fault), fault
+
+    # …and the genuine refusals must NOT become retryable in the process.
+    for refusal in ("FinishReason.IMAGE_OTHER", "prompt blocked: BlockedReason.OTHER",
+                    "FinishReason.IMAGE_SAFETY"):
+        assert not _is_transient(refusal), refusal
+
+
+def test_every_call_gets_its_own_transport():
+    """The fix. A cached HttpOptions handed the same connection pool to every
+    concurrent client; the pool closed under whichever threads were still
+    reading."""
+    nb = NanoBanana("k", policy())
+    a, b = nb._http_options(), nb._http_options()
+    assert a is not b, "HttpOptions must be built per call, not cached"
+    ca, cb = (a.client_args or {}), (b.client_args or {})
+    if "transport" in ca:          # only when HERMES_IMAGE_FETCH_IPV4 is on
+        assert ca["transport"] is not cb["transport"], "transport must not be shared"

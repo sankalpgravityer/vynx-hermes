@@ -104,3 +104,82 @@ def test_gemini_is_not_constrained_to_the_auto_ratio():
     supported = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9"]
     assert resolve_aspect_ratio("auto", supported) is None
     assert resolve_aspect_ratio(None, supported) is None
+
+
+# ---------------------------------------------------------------------------
+# The billed tier.
+#
+# gpt-image prices per OUTPUT TOKEN, and the token count is decided by size and
+# quality alone. At 1024x1536 that is roughly 400 tokens at `low`, 1.6k at
+# `medium` and 6.2k at `high` — a 15x spread for the same view. Omitting the
+# parameter is not neutral: it means "auto", which resolves towards the top.
+#
+# So the tier has to be on the wire, and it has to come from policy. These
+# tests exist because the omission was invisible — the renders looked correct
+# and the bill arrived a day later.
+# ---------------------------------------------------------------------------
+
+import base64
+
+import httpx
+
+from app.imaging import openai_image
+
+
+def _capture(monkeypatch, body: dict | None = None):
+    """Stub the transport, return the form fields the request carried."""
+    sent: dict[str, str] = {}
+    payload = body or {
+        "data": [{"b64_json": base64.b64encode(png(1024, 1536)).decode()}],
+        "usage": {"output_tokens": 1584},
+    }
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, headers=None, files=None, data=None):
+            sent.update(data or {})
+            return httpx.Response(200, json=payload)
+
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(openai_image.httpx, "Client", FakeClient)
+    return sent
+
+
+def test_the_quality_tier_reaches_the_wire(monkeypatch):
+    sent = _capture(monkeypatch)
+    data, err = openai_image.generate("p", [b"src"], quality="low")
+    assert err is None and data
+    assert sent["quality"] == "low"
+
+
+def test_quality_is_never_omitted_even_when_the_caller_says_nothing(monkeypatch):
+    """The default has to be OURS, not the vendor's — the vendor's is the
+    expensive one, and it is applied silently."""
+    sent = _capture(monkeypatch)
+    monkeypatch.delenv("OPENAI_IMAGE_QUALITY", raising=False)
+    openai_image.generate("p", [b"src"])
+    assert sent["quality"] == "medium"
+
+
+def test_an_explicit_tier_beats_the_environment(monkeypatch):
+    sent = _capture(monkeypatch)
+    monkeypatch.setenv("OPENAI_IMAGE_QUALITY", "high")
+    openai_image.generate("p", [b"src"], quality="low")
+    assert sent["quality"] == "low"
+
+
+def test_the_environment_is_used_when_policy_carries_no_tier(monkeypatch):
+    """`self.cfg.get("openai_quality")` is None on a policy that predates the
+    setting, and that must not silently become the vendor default."""
+    sent = _capture(monkeypatch)
+    monkeypatch.setenv("OPENAI_IMAGE_QUALITY", "high")
+    openai_image.generate("p", [b"src"], quality=None)
+    assert sent["quality"] == "high"

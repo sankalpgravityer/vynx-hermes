@@ -140,6 +140,7 @@ def generate(
     images: list[bytes],
     aspect_ratio: str | None = None,
     timeout_s: float = 180.0,
+    quality: str | None = None,
 ) -> tuple[bytes | None, str | None]:
     """One render. Returns (png_bytes, error) — exactly one is set.
 
@@ -155,6 +156,13 @@ def generate(
 
     model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
     size = resolve_size(aspect_ratio)
+
+    # Send `quality` explicitly. Omitting it means "auto", and auto resolves
+    # towards the top tier — roughly 15x the output tokens of `low` and 4x
+    # `medium` for the same picture. This is a fallback for views the primary
+    # refused, priced per output token, so the tier is a budget decision and
+    # belongs in policy rather than in a vendor default we never see.
+    quality = (quality or os.getenv("OPENAI_IMAGE_QUALITY") or "medium").lower()
 
     # `image[]` for more than one reference, which is how the edits endpoint
     # takes a set; a single reference uses the scalar field.
@@ -177,7 +185,13 @@ def generate(
                 _ENDPOINT,
                 headers={"Authorization": f"Bearer {key}"},
                 files=files,
-                data={"model": model, "prompt": prompt, "size": size, "n": "1"},
+                data={
+                    "model": model,
+                    "prompt": prompt,
+                    "size": size,
+                    "n": "1",
+                    "quality": quality,
+                },
             )
     except Exception as exc:  # noqa: BLE001
         return None, f"{type(exc).__name__}: {exc}"
@@ -202,7 +216,19 @@ def generate(
     if not b64:
         return None, "openai returned no image"
 
-    log.info("gpt-image rendered a view Gemini would not (%s, %s)", model, size)
+    # Output tokens are what the render is billed on, so log them. Over a
+    # backfill these lines are the only per-view record of what the fallback
+    # actually cost — the dashboard reports a daily total, far too late to
+    # change the tier on a run that is already halfway through the catalogue.
+    usage = payload.get("usage") or {}
+    log.info(
+        "gpt-image rendered a view Gemini would not (%s, %s, quality=%s, "
+        "out_tokens=%s)",
+        model,
+        size,
+        quality,
+        usage.get("output_tokens", "?"),
+    )
     # Conform to the tenant's ratio before returning: the caller stores this
     # beside Gemini renders of the same product, and they have to be one shape.
     return conform_to_ratio(base64.b64decode(b64), aspect_ratio), None

@@ -290,7 +290,23 @@ def not_generatable_reason(p: ProductSnapshot, pol: dict[str, Any]) -> str | Non
     settings = p.imagery_settings
     if settings and not settings.is_model_generation_enabled:
         return "this tenant has model generation switched off"
-    if is_footwear(p.category, p.subcategory, p.title):
+    # CATEGORY FIELDS ONLY — deliberately NOT the title, which is what
+    # `isFootwearCategory` is given in analyze.worker.ts.
+    #
+    # The title is a brand-name minefield. Measured on 11,818 live products,
+    # including it made Hermes refuse three garments the worker generates:
+    # "Vintage DC Shoes Dark T-Shirt" (cat T-Shirts), "Vintage Closed Black
+    # Sandal Dress" (cat Dresses) and a Nike "Lifestyle Shoe" filed under
+    # Sweaters. DC Shoes is a skate brand that puts its name on t-shirts;
+    # "Sandal" there is a colourway. A backfill and the analyze worker
+    # disagreeing about the same product is the failure this whole module
+    # exists to prevent, and the divergence is silent — the product simply
+    # never gets model images, and the reason reads as a deliberate policy.
+    #
+    # masterCategory is passed for exact parity with the worker. It carries no
+    # footwear rows today (it holds Men/Women/Kids), so it changes nothing now
+    # and keeps the two in step if that ever changes.
+    if is_footwear(p.master_category, p.category, p.subcategory):
         return (
             "footwear — every mannequin type frames the item as apparel worn on "
             "a torso, so the analyze pipeline skips it too"

@@ -174,6 +174,27 @@ def test_bootcut_jeans_are_not_footwear(pol):
     assert "IMG.001" in ids(p, pol)
 
 
+def test_a_footwear_word_in_the_TITLE_does_not_skip_a_garment(pol):
+    """Parity with `isFootwearCategory`, which is given the category fields and
+    NOT the title — and the reason it is given them.
+
+    All three of these are real rows from the live catalogue. DC Shoes is a
+    skate brand that prints its name on t-shirts; "Sandal" in the second is a
+    colourway on a dress. Reading the title made Hermes refuse to generate for
+    garments the analyze worker generates happily, which is exactly the
+    backfill-disagrees-with-the-worker split this module exists to prevent."""
+    for title, cat, sub in [
+        ("Vintage DC Shoes Dark T-Shirt Women M", "T-Shirts & Tops", "T-Shirts"),
+        ("Vintage Closed Black Sandal Dress Women 37", "Dresses", "Dress"),
+        ("Vintage Nike Red Leather Lifestyle Shoe Men", "Sweaters & Hoodies", "Sweaters"),
+    ]:
+        p = product(title=title, category=cat, subcategory=sub, media=MATTED)
+        found = ids(p, pol)
+        assert "IMG.020" not in found, title
+        assert "IMG.001" in found, title
+        assert generation_plan(p, pol).should_generate, title
+
+
 # --------------------------------------------------------------------------- #
 # The findings
 # --------------------------------------------------------------------------- #

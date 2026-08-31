@@ -323,7 +323,41 @@ imagery:
     # Reached only when every Gemini model produced nothing, so it costs nothing
     # on the overwhelming majority of products. Needs OPENAI_API_KEY; silently
     # skipped without one.
+    # ON: the account is funded again. Note that `available()` only checks the
+    # key EXISTS, never that it has credit — when the balance next runs out,
+    # every refused garment will walk the whole chain and then pay a
+    # guaranteed-402 round trip to finish with nothing. Set this false the day
+    # that happens rather than waiting for the timeouts to explain it.
     openai_fallback: true
+
+    # The billed tier. gpt-image prices per OUTPUT TOKEN, and the token count is
+    # a function of size and quality alone — at 1024x1536, roughly 400 tokens at
+    # `low`, 1.6k at `medium`, 6.2k at `high`. So `high` costs about 15x `low`
+    # for the same view, and leaving this unset is NOT free: unset means "auto",
+    # which resolves towards the top.
+    #
+    # `medium` because these are catalogue renders shown at ~1024px wide, where
+    # the extra detail `high` buys is not visible, and because this is the
+    # fallback path — reached only for garments the primary refused, on a budget
+    # that has to cover the whole catalogue rather than a few hundred views.
+    openai_quality: "medium"
+
+    # SAFETY THRESHOLDS, set explicitly rather than left to the API default.
+    #
+    # These are a documented request parameter. Unset, the developer API applies
+    # BLOCK_MEDIUM_AND_ABOVE, which is stricter than the thresholds Google runs
+    # on its own consumer surface — the Gemini app renders a player-name jersey
+    # on a model, back view included, while the same content through this API
+    # comes back IMAGE_OTHER.
+    #
+    # Second-hand clothing photographed for resale is exactly the benign domain
+    # the parameter exists to tune for. BLOCK_ONLY_HIGH is a threshold move
+    # inside what Google permits, not a way around a decision.
+    #
+    # HONESTLY UNCERTAIN whether it helps: an image refusal can come from an
+    # output-side filter these thresholds do not reach. Cheap to try, and the
+    # test command tells us. Set safety_relaxed: false to go back to defaults.
+    safety_relaxed: true
 
     # What to do when NO single model can render every requested view.
     #
