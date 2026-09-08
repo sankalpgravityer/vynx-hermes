@@ -38,6 +38,7 @@ import concurrent.futures
 import io
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -260,14 +261,71 @@ def is_bottom_garment(category: str | None, sub_category: str | None) -> bool:
     return any(k in cat or k in sub for k in BOTTOM_GARMENT_KEYWORDS)
 
 
+# WORD-BOUNDARY for these two, unlike the top/bottom lists above, which match on
+# substrings. A substring "cap" classifies CAPRI TROUSERS as headwear and a
+# substring "boot" classifies BOOTCUT JEANS as footwear — both real categories,
+# and both would be framed as something the customer is not buying.
+_FOOTWEAR_RE = re.compile(
+    r"\b(footwear|shoes?|sneakers?|trainers?|boots?|sandals?|heels?|loafers?"
+    r"|pumps?|mules?|clogs?|espadrilles?|slippers?)\b",
+    re.IGNORECASE,
+)
+
+# Worn, but not on the torso or the legs — so neither the top framing nor the
+# bottom framing puts the product anywhere near the middle of the frame.
+_ACCESSORY_RE = re.compile(
+    r"\b(accessor(?:y|ies)|bags?|backpacks?|rucksacks?|handbags?|totes?|purses?"
+    r"|satchels?|clutch(?:es)?|caps?|hats?|beanies?|belts?|scar(?:f|ves)"
+    r"|gloves?|wallets?|sunglasses|watch(?:es)?|jewell?ery|ties?)\b",
+    re.IGNORECASE,
+)
+
+
+def is_footwear_garment(category: str | None, sub_category: str | None) -> bool:
+    return any(_FOOTWEAR_RE.search(v or "") for v in (category, sub_category))
+
+
+def is_accessory_garment(category: str | None, sub_category: str | None) -> bool:
+    return any(_ACCESSORY_RE.search(v or "") for v in (category, sub_category))
+
+
+def accessory_region(category: str | None, sub_category: str | None) -> str:
+    """Where on the body an accessory actually sits.
+
+    One class, but the crop has to follow the product: a bag hangs at the
+    shoulder, a cap sits on the head, a belt at the waist. Framing all of them
+    the same way reproduces the bug this class exists to fix, just at a
+    different height.
+    """
+    text = f"{_lower(category)} {_lower(sub_category)}"
+    if re.search(r"\b(caps?|hats?|beanies?|sunglasses)\b", text):
+        return "head and shoulders"
+    if re.search(r"\b(belts?)\b", text):
+        return "waist and hips"
+    if re.search(r"\b(scar(?:f|ves)|ties?)\b", text):
+        return "neck and shoulders"
+    if re.search(r"\b(gloves?|watch(?:es)?)\b", text):
+        return "hands and forearms"
+    return "shoulder and torso"
+
+
 def classify_garment_type(category: str | None, sub_category: str | None) -> str | None:
-    """'top' | 'bottom' | None. Bottom wins when both match.
+    """'footwear' | 'accessory' | 'bottom' | 'top' | None.
 
     The product CATEGORY, never `mannequinType` — the mobile and decision flows
     set mannequinType to a model type ("Men Top", "Women Top", "Kids") regardless
     of the garment, so a pair of jeans arrives as "Men Top" and would be framed
     and styled as a shirt.
+
+    Footwear and accessories are tested FIRST because they are the narrowest and
+    the most specific: their regexes require whole words, so anything they match
+    really is that thing, whereas the top/bottom lists match substrings and would
+    happily claim "Backpacks & Bags" for nothing at all.
     """
+    if is_footwear_garment(category, sub_category):
+        return "footwear"
+    if is_accessory_garment(category, sub_category):
+        return "accessory"
     if is_bottom_garment(category, sub_category):
         return "bottom"
     cat, sub = _lower(category), _lower(sub_category)
@@ -340,32 +398,78 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
         else None
     )
     is_bottom = garment_class == "bottom"
+    is_footwear = garment_class == "footwear"
+    is_accessory = garment_class == "accessory"
+    # Where the camera goes for an accessory. Only read when is_accessory.
+    region = accessory_region(ctx.category, ctx.sub_category)
 
     if view == "front":
         view_description = "Full-body front view (head to feet)"
     elif view == "back":
         view_description = "Full-body back view (head to feet)"
     elif view == "front34":
-        view_description = (
-            "Lower-body three-quarter front view (waist to feet) focused on the bottoms"
-            if is_bottom else
-            "Tighter three-quarter-length (knee-up) front view — feet cropped out of "
-            "frame, NOT a full-body shot"
-        )
+        if is_footwear:
+            view_description = (
+                "Lower-leg three-quarter front view (knee to floor) focused on the "
+                "footwear"
+            )
+        elif is_accessory:
+            view_description = (
+                f"Three-quarter front view cropped to the {region}, focused on the "
+                "accessory"
+            )
+        elif is_bottom:
+            view_description = (
+                "Lower-body three-quarter front view (waist to feet) focused on the "
+                "bottoms"
+            )
+        else:
+            view_description = (
+                "Tighter three-quarter-length (knee-up) front view — feet cropped out "
+                "of frame, NOT a full-body shot"
+            )
     elif view == "back34":
-        view_description = (
-            "Lower-body three-quarter back view (waist to feet) focused on the bottoms"
-            if is_bottom else
-            "Tighter three-quarter-length (knee-up) back view — feet cropped out of "
-            "frame, NOT a full-body shot"
-        )
+        if is_footwear:
+            view_description = (
+                "Lower-leg three-quarter back view (knee to floor) focused on the "
+                "footwear, seen from behind"
+            )
+        elif is_accessory:
+            view_description = (
+                f"Three-quarter back view cropped to the {region}, focused on the "
+                "accessory"
+            )
+        elif is_bottom:
+            view_description = (
+                "Lower-body three-quarter back view (waist to feet) focused on the "
+                "bottoms"
+            )
+        else:
+            view_description = (
+                "Tighter three-quarter-length (knee-up) back view — feet cropped out "
+                "of frame, NOT a full-body shot"
+            )
     else:
-        view_description = (
-            "Medium close-up of the bottoms on the model (hip/thigh/knee detail) — "
-            "not an extreme macro" if is_bottom else
-            "Medium close-up of the upper garment on the model (neckline/chest "
-            "detail) — not an extreme macro"
-        )
+        if is_footwear:
+            view_description = (
+                "Medium close-up of the footwear as worn (upper, laces and sole "
+                "edge) — not an extreme macro"
+            )
+        elif is_accessory:
+            view_description = (
+                f"Medium close-up of the accessory as worn at the {region} — not an "
+                "extreme macro"
+            )
+        elif is_bottom:
+            view_description = (
+                "Medium close-up of the bottoms on the model (hip/thigh/knee detail) "
+                "— not an extreme macro"
+            )
+        else:
+            view_description = (
+                "Medium close-up of the upper garment on the model (neckline/chest "
+                "detail) — not an extreme macro"
+            )
 
     prompt = "Professional studio photography"
 
@@ -423,6 +527,26 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
             " Since the featured product is a bottom, pair it with a simple, plain, "
             "neutral-colored top that does not distract from the product."
         )
+    elif garment_class == "footwear":
+        # The hem instruction is the whole point. A full-length trouser breaks
+        # over the shoe and hides the very thing being sold, which is how the
+        # existing footwear renders ended up as pictures of an invented outfit
+        # with a few pixels of sandal at the bottom edge.
+        prompt += (
+            " The featured product is the FOOTWEAR. Dress the model in a simple, "
+            "plain, neutral-colored outfit with CROPPED OR ROLLED trouser hems that "
+            "stop clearly ABOVE the ankle, so the shoes are fully visible and "
+            "unobstructed — no long hems breaking over the shoe, no maxi skirt or "
+            "wide leg covering it. Both shoes are worn, and nothing in the outfit "
+            "competes with them for attention."
+        )
+    elif garment_class == "accessory":
+        prompt += (
+            f" The featured product is the ACCESSORY, worn at the {region}. Dress "
+            "the model in a simple, plain, neutral-colored outfit that does not "
+            "compete with it, and make sure the accessory is worn naturally, fully "
+            "visible and never hidden by hair, a sleeve or an arm."
+        )
     else:
         prompt += (
             " Complete the outfit with simple, plain, neutral-colored complementary "
@@ -472,28 +596,53 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
     is_three_quarter = view in ("front34", "back34")
 
     if view == "closeup":
-        close_up_framing = (
-            " Frame this as a medium CLOSE-UP of the bottoms (trousers/skirt/shorts) "
-            "as worn on the model: a crop focused on the hip-to-thigh/knee area "
-            "showing the waistband, pockets, fly/zip and the key design detail, with "
-            "the fabric texture, weave/knit and stitching sharp and in focus. Center "
-            "the BOTTOMS garment on the lower body — do NOT show the model's chest, "
-            "face or head. This is closer than the three-quarter shot, but it is NOT "
-            "an extreme macro — do NOT zoom in so far that only fabric fills the "
-            "frame; keep a recognisable portion of the bottoms on the lower body "
-            "visible for context."
-            if is_bottom else
-            " Frame this as a medium CLOSE-UP of the upper part of the garment as "
-            "worn on the model: a chest-up crop framed roughly from the "
-            "shoulders/neckline down to the mid-torso (upper chest area). The "
-            "collar/neckline, shoulders, upper chest and the key design detail "
-            "should be clearly visible together with some surrounding context, and "
-            "the fabric texture, weave/knit and stitching should be sharp and in "
-            "focus. This is closer than the three-quarter shot, but it is NOT an "
-            "extreme macro — do NOT zoom in so far that only fabric fills the frame; "
-            "keep a recognisable portion of the garment on the upper body visible "
-            "for context."
-        )
+        if is_footwear:
+            close_up_framing = (
+                " Frame this as a medium CLOSE-UP of the FOOTWEAR as worn on the "
+                "model: a crop from roughly mid-calf down to the floor, with BOTH "
+                "shoes filling most of the frame. The upper, laces or fastening, the "
+                "toe shape and the sole edge must all be clearly visible, with the "
+                "material texture and stitching sharp and in focus. Do NOT show the "
+                "model's torso, face or head. This is closer than the three-quarter "
+                "shot, but it is NOT an extreme macro — do NOT zoom so far that only "
+                "material fills the frame; keep both complete shoes and a little of "
+                "the floor visible for context."
+            )
+        elif is_accessory:
+            close_up_framing = (
+                " Frame this as a medium CLOSE-UP of the ACCESSORY as worn at the "
+                f"{region}: a crop centred on the product so that it fills most of "
+                "the frame, with its hardware, fastening, strap or brim, material "
+                "texture and stitching sharp and in focus. Show enough of the body "
+                "around it that it reads as WORN rather than as a product cut-out. "
+                "This is closer than the three-quarter shot, but it is NOT an extreme "
+                "macro — keep the whole accessory inside the frame."
+            )
+        elif is_bottom:
+            close_up_framing = (
+                " Frame this as a medium CLOSE-UP of the bottoms (trousers/skirt/"
+                "shorts) as worn on the model: a crop focused on the hip-to-thigh/"
+                "knee area showing the waistband, pockets, fly/zip and the key design "
+                "detail, with the fabric texture, weave/knit and stitching sharp and "
+                "in focus. Center the BOTTOMS garment on the lower body — do NOT show "
+                "the model's chest, face or head. This is closer than the "
+                "three-quarter shot, but it is NOT an extreme macro — do NOT zoom in "
+                "so far that only fabric fills the frame; keep a recognisable portion "
+                "of the bottoms on the lower body visible for context."
+            )
+        else:
+            close_up_framing = (
+                " Frame this as a medium CLOSE-UP of the upper part of the garment as "
+                "worn on the model: a chest-up crop framed roughly from the "
+                "shoulders/neckline down to the mid-torso (upper chest area). The "
+                "collar/neckline, shoulders, upper chest and the key design detail "
+                "should be clearly visible together with some surrounding context, and "
+                "the fabric texture, weave/knit and stitching should be sharp and in "
+                "focus. This is closer than the three-quarter shot, but it is NOT an "
+                "extreme macro — do NOT zoom in so far that only fabric fills the "
+                "frame; keep a recognisable portion of the garment on the upper body "
+                "visible for context."
+            )
         prompt += (
             f". CRITICAL: Keep the EXACT SAME garment, fabric, colour and details as "
             f"shown in the reference images (the front reference establishes the "
@@ -561,8 +710,46 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
             "the whole body and complete garment inside the frame. This is a "
             "complete head-to-toe photograph — do NOT crop out the head or the feet."
         )
+        # The full-body view stays full-body for footwear and accessories, so the
+        # gallery's first two images look like every other product's. What
+        # changes is that the product must not be lost in it.
+        if is_footwear:
+            prompt += (
+                " BOTH SHOES MUST BE FULLY VISIBLE AND UNOBSTRUCTED at the bottom "
+                "of the frame — they are the product. Nothing may cover or break "
+                "over them, and the model stands so that both are seen clearly."
+            )
+        elif is_accessory:
+            prompt += (
+                f" THE ACCESSORY AT THE {region.upper()} MUST BE FULLY VISIBLE AND "
+                "UNOBSTRUCTED — it is the product, worn naturally and never hidden "
+                "by hair, a sleeve or an arm."
+            )
     elif is_three_quarter:
-        if is_bottom:
+        if is_footwear:
+            prompt += (
+                " Capture a LOWER-LEG three-quarter shot focused on the FOOTWEAR: "
+                "frame from around the KNEE all the way DOWN TO THE FLOOR, so both "
+                "shoes fill most of the frame and are the clear subject. The camera "
+                "moves IN CLOSER than the full-body shot and the torso, head and "
+                "upper legs are OUT of frame. This must look clearly different from "
+                "the full-body shot — a tight, floor-level framing centred on the "
+                "shoes. IMPORTANT: the front reference image is provided ONLY for "
+                "the model's identity and appearance — do NOT copy its full-length "
+                "framing; recompose this shot tighter on the feet."
+            )
+        elif is_accessory:
+            prompt += (
+                f" Capture a three-quarter shot cropped to the {region}, focused on "
+                "the ACCESSORY: the camera moves IN CLOSER than the full-body shot "
+                "so the product fills most of the frame and is unmistakably the "
+                "subject, while still reading as worn on a person. This must look "
+                "clearly different from the full-body shot. IMPORTANT: the front "
+                "reference image is provided ONLY for the model's identity and "
+                "appearance — do NOT copy its full-length framing; recompose this "
+                "shot tighter on the product."
+            )
+        elif is_bottom:
             prompt += (
                 " Capture a LOWER-BODY three-quarter shot focused on the bottoms "
                 "(trousers/skirt/shorts): frame from around the WAIST (the top of "

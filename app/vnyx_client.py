@@ -2,7 +2,7 @@
 
 The ONLY file that knows the shape of the upstream API. Everything else in
 Hermes depends on ProductSnapshot alone, so this is the single file to touch when
-the VNYX schema moves.
+the VNYX schema moves.  
 
 Two payload shapes are accepted, deliberately:
 

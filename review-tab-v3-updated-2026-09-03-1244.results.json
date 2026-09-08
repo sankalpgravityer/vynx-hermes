@@ -1,0 +1,52 @@
+{
+  "apply": false,
+  "complete": false,
+  "results": [
+    {
+      "productId": "deacdec0-aafb-4d44-a9bb-aa5814438ab0",
+      "title": "Vintage Black Polo Shirt Men",
+      "tenant": "6045eee9-6b87-45f2-a582-2b47ea752c39",
+      "missingBefore": [
+        "brand",
+        "material",
+        "size"
+      ],
+      "updated": [],
+      "sizeChartAdded": 0,
+      "sizeChartNote": "",
+      "retailPrice": null,
+      "retailSource": null,
+      "priceBefore": "37.99",
+      "priceAfter": null,
+      "descriptionChars": 0,
+      "reason": "the model returned nothing for any missing field",
+      "outcome": "no_change"
+    },
+    {
+      "productId": "a435142a-fe1c-4a57-b05c-bd186b582ede",
+      "title": "Vintage White T-Shirt Women",
+      "tenant": "6045eee9-6b87-45f2-a582-2b47ea752c39",
+      "missingBefore": [
+        "brand",
+        "size",
+        "guide",
+        "chart"
+      ],
+      "updated": [
+        "international_size=\"XL\"",
+        "eu_size=\"52\"",
+        "internationalSize=XL",
+        "sizingGuide=Women Uppers"
+      ],
+      "sizeChartAdded": 0,
+      "sizeChartNote": "",
+      "retailPrice": null,
+      "retailSource": null,
+      "priceBefore": "16.99",
+      "priceAfter": null,
+      "descriptionChars": 0,
+      "reason": "dry run — nothing written",
+      "outcome": "would_update"
+    }
+  ]
+}

@@ -72,6 +72,18 @@ def ctx(**kw) -> PromptContext:
     ("Dresses", "Maxi", None),
     # Bottom wins when both match — a "jogger top" is framed as a bottom.
     ("Bottoms", "Top", "bottom"),
+    # Footwear and accessories, from the live category list.
+    ("Shoes", "Sneakers", "footwear"),
+    ("Women", "Shoes", "footwear"),
+    ("Backpacks & Bags", "Backpack", "accessory"),
+    ("Caps", "Cap", "accessory"),
+    ("Accessories", "Belt", "accessory"),
+    ("Accessories", "Scarf", "accessory"),
+    # WORD-BOUNDARY guards. A substring "cap" makes CAPRI TROUSERS headwear and
+    # a substring "boot" makes BOOTCUT JEANS footwear; both are real categories
+    # and both would be framed as something the customer is not buying.
+    ("Bottoms", "Capri Trousers", "bottom"),
+    ("Bottoms", "Bootcut Jeans", "bottom"),
 ])
 def test_garment_class(category, sub, expected):
     assert classify_garment_type(category, sub) == expected
@@ -891,3 +903,75 @@ def test_every_call_gets_its_own_transport():
     ca, cb = (a.client_args or {}), (b.client_args or {})
     if "transport" in ca:          # only when HERMES_IMAGE_FETCH_IPV4 is on
         assert ca["transport"] is not cb["transport"], "transport must not be shared"
+
+
+# --------------------------------------------------------------------------- #
+# Footwear and accessory framing
+#
+# The bug these fix, in one sentence: every MannequinType frames the item as
+# apparel worn on the torso, so a pair of sandals rendered as a full-body shot
+# of an invented t-shirt and trousers with the product a few pixels tall at the
+# bottom edge. 124 such renders reached the catalogue before footwear was
+# skipped outright on 2026-08-20; these tests are what let the skip be lifted.
+# --------------------------------------------------------------------------- #
+
+def _prompt(view, **kw):
+    return build_prompt(view, ctx(**kw), has_front_reference=False)
+
+
+SHOES = dict(category="Shoes", sub_category="Sneakers")
+BAG = dict(category="Backpacks & Bags", sub_category="Backpack")
+CAP = dict(category="Caps", sub_category="Cap")
+
+
+def test_footwear_three_quarter_views_go_to_the_floor():
+    """Knee-to-floor, not knee-UP. The default ¾ view crops the feet OUT, which
+    for a shoe product removes the product."""
+    for view in ("front34", "back34"):
+        p = _prompt(view, **SHOES)
+        assert "KNEE all the way DOWN TO THE FLOOR" in p, view
+        assert "both shoes fill most of the frame" in p, view
+        # The generic knee-up language must not also be present.
+        assert "FEET are deliberately CROPPED OUT" not in p, view
+
+
+def test_footwear_closeup_is_the_shoes_not_the_chest():
+    p = _prompt("closeup", **SHOES)
+    assert "CLOSE-UP of the FOOTWEAR" in p
+    assert "mid-calf down to the floor" in p
+    assert "chest-up crop" not in p
+
+
+def test_footwear_full_body_keeps_the_hems_clear():
+    """The full-body views stay full-body so the gallery is consistent, but a
+    full-length trouser breaks over the shoe and hides the product."""
+    p = _prompt("front", **SHOES)
+    assert "CROPPED OR ROLLED trouser hems" in p
+    assert "BOTH SHOES MUST BE FULLY VISIBLE" in p
+    assert "FULL-LENGTH, full-body shot" in p
+
+
+def test_an_accessory_is_framed_where_it_actually_SITS():
+    """One class, but the crop follows the product. Framing a cap at the
+    shoulder reproduces the original bug at a different height."""
+    assert "shoulder and torso" in _prompt("front34", **BAG)
+    assert "head and shoulders" in _prompt("front34", **CAP)
+    assert "waist and hips" in _prompt(
+        "front34", category="Accessories", sub_category="Belt"
+    )
+
+
+def test_accessory_closeup_still_reads_as_worn():
+    p = _prompt("closeup", **BAG)
+    assert "CLOSE-UP of the ACCESSORY" in p
+    assert "reads as WORN rather than as a product cut-out" in p
+
+
+def test_a_top_is_unaffected_by_any_of_this():
+    """The regression guard. 5,700 products take the top path and none of the
+    new language may leak into it."""
+    p = _prompt("front34", category="T-Shirts & Polos", sub_category="Tank Tops")
+    assert "FEET are deliberately CROPPED OUT" in p
+    for leaked in ("FOOTWEAR", "ACCESSORY", "DOWN TO THE FLOOR",
+                   "CROPPED OR ROLLED"):
+        assert leaked not in p, leaked

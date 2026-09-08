@@ -282,13 +282,17 @@ def test_generate_records_nothing_when_every_view_failed(
     assert r.json()["failed"] == ["AI_FRONT"]
 
 
-def test_generate_refuses_footwear_with_a_reason(client: TestClient, stub_generation):
+def test_generate_accepts_footwear_now_that_it_has_its_own_framing(
+    client: TestClient, stub_generation
+):
+    """Was a 409. Footwear is generated again, because the reason it was
+    refused — every framing putting the product at the bottom edge of a
+    full-body shot — is what the "footwear" garment class now fixes."""
     r = client.post("/v1/imagery/generate", json={
         "product": {**PRODUCT, "category": "Shoes", "subCategory": "Sneakers"},
         "media": MEDIA, "settings": SETTINGS,
     })
-    assert r.status_code == 409
-    assert "footwear" in r.json()["detail"]
+    assert r.status_code == 200, r.text
 
 
 def test_generate_refuses_when_the_tenant_switched_it_off(

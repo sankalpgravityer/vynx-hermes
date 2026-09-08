@@ -263,6 +263,7 @@ python demo.py     # runs that record through the pipeline and prints the report
 | `POST` | `/v1/reconcile` | detect, repair, re-verify, write |
 | `POST` | `/v1/batch` | background sweep over a list of product ids |
 | `POST` | `/v1/webhooks/product-enriched` | HMAC-verified hook from your pipeline |
+| `POST` | `/v1/readability` | **can the text in this photograph be read? multipart upload, ~1.5s budget** |
 | `POST` | `/v1/policy/reload` | re-read `policy.yaml` without a restart |
 
 `/v1/review-queue` is the one vnyx-api calls. It takes the whole page in one
@@ -299,6 +300,45 @@ curl -X POST localhost:8080/v1/validate \
   -d '{"product_id":"1a351701-7568-4414-8975-ce07d664ab95",
        "tenant_id":"34c354a5-3415-4513-85b8-d40c2ec3af7e"}'
 ```
+
+### `/v1/readability` — the odd one out
+
+Every other endpoint judges a product *record*. This one judges a single
+uploaded photograph and knows nothing about a product. What it shares is the
+thing that defines Hermes: a deterministic verdict with a stated reason, no
+model call, no write-back. It is a verifier of pixels instead of columns.
+
+It is also the only endpoint with a hard latency budget — it fires at shutter
+press on a warehouse phone, so ~1.5s covers the upload, the answer and the
+operator's retake decision.
+
+```bash
+curl -X POST localhost:8080/v1/readability -F "image=@care-label.jpg"
+```
+
+```json
+{ "readable": false,
+  "message": "Only part of the label is readable. Move closer so the whole label fills the frame. Also — hold the camera still and let it focus.",
+  "reasons": ["not_enough_text", "out_of_focus"],
+  "confidence": 0.9612, "line_count": 2, "detected_count": 3,
+  "text": "COTTON 100%\nSIZE M / EU 40",
+  "decode_ms": 34, "ocr_ms": 680, "duration_ms": 739 }
+```
+
+`readable` and `message` are the whole contract for a simple client.
+
+`min_lines` / `min_chars` are floors on how much text must come back legible, and
+they default low (1 line, 3 characters) **because a floor above what the label
+actually carries rejects a good photograph** — an adidas neck label reads
+"adidas" and "S" and nothing else, so `min_lines=3` fails a perfect capture of
+one. Raise them only per capture type you know: a full care label is where 4–6 is
+right. That floor is still what catches text too small to read, which confidence
+alone gets wrong — see the docs.
+
+PP-OCRv6 through RapidOCR's ONNX build, on CPU. **`docs/READABILITY.md` carries
+the measured thresholds, the latency table, the `onnxruntime` pin that Windows
+needs, and the two findings that shaped the design** — that no pixel statistic
+can be used as a gate, and that confidence alone cannot decide.
 
 ## Models
 

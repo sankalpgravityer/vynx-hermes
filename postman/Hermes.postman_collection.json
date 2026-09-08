@@ -420,6 +420,50 @@
         "description": "Edit config/policy.yaml, hit this, no restart needed.\nUse it to tune the grade bands while testing."
       },
       "response": []
+    },
+    {
+      "name": "10 - Readability: is the text in this photo legible?",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "image",
+              "type": "file",
+              "src": [],
+              "description": "Pick a photo of a care label or size tag. JPEG or PNG. Resize on the device first — 1280-1600px on the long edge at quality 80 is ~200KB and reads the same; a raw 12MP frame is 3-5MB and the upload alone blows the 1.5s budget."
+            },
+            {
+              "key": "min_lines",
+              "value": "1",
+              "type": "text",
+              "description": "OFF BY DEFAULT ON PURPOSE. The policy default is 1, and raising this is how you tell Hermes how much text to expect — but only raise it for a capture type you actually know. An adidas neck label carries 'adidas' and 'S' and nothing else, so min_lines=3 rejects a perfectly readable photograph of one. A full care label is the case where 4-6 is right.",
+              "disabled": true
+            },
+            {
+              "key": "min_chars",
+              "value": "3",
+              "type": "text",
+              "disabled": true,
+              "description": "OFF BY DEFAULT, same reasoning as min_lines. Policy default is 3."
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{baseUrl}}/v1/readability",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "v1",
+            "readability"
+          ]
+        },
+        "description": "Can the text in this photograph be read, and if not, what should the operator change?\n\nmultipart/form-data, NOT base64 in JSON: base64 adds a third to the payload and upload is the largest item in the latency budget.\n\n`readable` and `message` are the whole contract for a simple client. `reasons` carries a list, because a photo taken in a dark stockroom at arm's length is both underexposed and too far away.\n\nSTART WITH THE OVERRIDES OFF. min_lines/min_chars are floors on how much text must be legible, and a floor above what the label actually carries rejects a good photograph — a two-line neck label cannot satisfy min_lines=3. Raise them only per capture type you know.\n\nWatch `ocr_ms` and `duration_ms` in the response — they are how you tell whether the box is fast enough. See docs/READABILITY.md for the latency table and how to size it."
+      },
+      "response": []
     }
   ]
 }

@@ -19,3 +19,32 @@ openpyxl==3.1.5
 # border ring to tell a genuine cut-out from a photograph whose row merely claims
 # one. Header-only decode plus one masked statistic, so it stays cheap.
 Pillow==12.3.0
+
+# /v1/readability. PP-OCRv6 detection + recognition as ONNX, which is what lets
+# this run on CPU inside the endpoint's ~1.5s budget with no model call and no
+# PaddlePaddle build. `rapidocr`, not the retired `rapidocr_onnxruntime`; since
+# 2.0.6 it does not pull a runtime of its own, hence the explicit onnxruntime.
+rapidocr==3.9.2
+
+# PINNED, and not to the latest on purpose.
+#
+# onnxruntime 1.29.0 fails to load on Windows 10 with only the VC++ 2015-2019
+# redistributable (14.29) installed: `WinError 1114, A dynamic link library (DLL)
+# initialization routine failed`, raised by onnxruntime.dll itself before Python
+# is involved. Newer builds want the 2015-2022 redistributable (14.40+). 1.20.1
+# is the newest release that loads against 14.29 and is the first with cp313
+# wheels, so it is the one version that covers both.
+#
+# Linux is unaffected — any 1.2x works there. Raise this pin once every machine
+# that runs Hermes has the 2022 redistributable, and note that accuracy is
+# unchanged either way: same ONNX models, same operators.
+onnxruntime==1.20.1
+
+# numpy is a rapidocr dependency, named here because app/imaging/legibility.py
+# imports it directly for the Laplacian and the frame statistics.
+numpy>=2.0
+
+# FastAPI needs this to parse multipart/form-data, which is how /v1/readability
+# takes the image. Base64 in JSON would add a third to the payload, and upload is
+# the largest item in that endpoint's latency budget.
+python-multipart==0.0.32
