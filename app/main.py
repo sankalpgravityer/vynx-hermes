@@ -30,7 +30,7 @@ from app.rules import REGISTRY, run_all
 from app.rules import imagery as imagery_rules
 from app.rules.pricing import assess
 from app.vnyx_client import VnyxClient, to_snapshot
-from app import agent_cli, approval
+from app import agent_cli, approval, product_audit
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -353,6 +353,77 @@ def policy_reload() -> dict[str, Any]:
         "factor_tolerance": pr.get("factor_tolerance", pr["tolerance"]),
         "hard_max_ratio": pr["hard_max_ratio"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Product audit — one id, every check, the repairs, and a sheet
+#
+# The ONLY endpoint that reads Postgres directly. Every other one takes its data
+# in the request body, which is what keeps Hermes unable to reach a product the
+# caller was not already authorised to read. This one trades that for the thing
+# it exists to give: an answer from a product id and nothing else — no running
+# vnyx-api, no JWT, no tenant scoping to satisfy.
+#
+# The trade is worth stating plainly. A caller who can reach this endpoint can
+# read and repair ANY product in the database. It belongs behind the same network
+# boundary as the connection string itself.
+# --------------------------------------------------------------------------- #
+
+class ProductAuditRequest(BaseModel):
+    product_id: str
+    # Write the repairs that are safe to write from here. OFF by default: a dry
+    # run returns the identical report with `would fix` in place of `fixed`, and
+    # the classification is done by the same function either way, so the preview
+    # cannot disagree with the run.
+    apply: bool = False
+    # Spend model calls on the evidence layer. The rule engine is deterministic
+    # and free; this is not.
+    use_llm: bool = False
+    # Write the .xlsx. On by default — it is the deliverable.
+    sheet: bool = True
+    # Where to put it. Defaults to reports/generated/audit-<id8>-<stamp>.xlsx.
+    sheet_path: str | None = None
+    # Overrides DATABASE_URL for this call.
+    db: str | None = None
+
+
+@app.post("/v1/product-audit")
+def product_audit_endpoint(req: ProductAuditRequest) -> dict[str, Any]:
+    """Everything wrong with one product, what got fixed, and where the sheet is.
+
+    Runs the full rule set plus the approval-gate rules over a payload assembled
+    straight from Postgres — including the live ProductMedia rows and the size-
+    chart facts the review feed does not carry, which is why the imagery and
+    chart rules have been silent on every other path.
+
+    With `apply`, the repairs that can be applied safely from here are written in
+    one transaction and the rules are re-run against the STORED record. That
+    second verdict is the one reported: a repair can fail silently, and a gate
+    that trusted its own plan would call a product fixed whose writes never
+    landed.
+    """
+    dsn = req.db or settings().database_url
+    if not dsn:
+        raise HTTPException(
+            status_code=503,
+            detail="DATABASE_URL is not set, and no `db` was passed.",
+        )
+
+    try:
+        return product_audit.audit(
+            dsn,
+            req.product_id,
+            apply=req.apply,
+            use_llm=req.use_llm,
+            write_sheet=req.sheet,
+            sheet_path=req.sheet_path,
+        )
+    except product_audit.ProductNotFound:
+        raise HTTPException(status_code=404,
+                            detail=f"No product {req.product_id}")
+    except Exception as exc:  # noqa: BLE001 - surfaced to the caller verbatim
+        log.exception("product audit failed for %s", req.product_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 # --------------------------------------------------------------------------- #

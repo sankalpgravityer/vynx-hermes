@@ -181,7 +181,7 @@ def test_generic_guide_is_advisory_only():
     found = [f for f in gate.check_gate(p, policy()) if f.rule_id == "SIZE.012"]
     assert found, "should notice a better chart exists"
     assert found[0].severity.value == "medium"
-    assert found[0].detail["suggested"] == "Men Uppers"
+    assert found[0].detail["suggested"] == ["Men Uppers"]
 
 
 def test_generic_guide_kept_when_nothing_better_exists():
@@ -217,7 +217,7 @@ def test_generic_guide_flagged_when_the_product_carries_its_own_gender():
     p, _ = snap(sizingGuide="Defaults", masterCategory="Kids",
                 category="Bottoms", gender=["men"])
     found = [f for f in gate.check_gate(p, policy()) if f.rule_id == "SIZE.012"]
-    assert found and found[0].detail["suggested"] == "Men Uppers"
+    assert found and found[0].detail["suggested"] == ["Men Uppers"]
 
 
 def test_womens_product_on_defaults_is_the_dangerous_case():
@@ -233,7 +233,7 @@ def test_womens_product_on_defaults_is_the_dangerous_case():
     )
     found = [f for f in gate.check_gate(p, policy()) if f.rule_id == "SIZE.012"]
     assert found
-    assert found[0].detail["suggested"] == "Women Uppers"
+    assert found[0].detail["suggested"] == ["Women Uppers"]
 
 
 def test_guide_lookup_is_gender_aware_not_name_derived():

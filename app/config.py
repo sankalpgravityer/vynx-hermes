@@ -57,6 +57,17 @@ class Settings:
         self.vnyx_token = os.getenv("VNYX_API_TOKEN", "")
         self.vnyx_timeout_s = float(os.getenv("VNYX_TIMEOUT_S", "20"))
 
+        # Direct Postgres, for /v1/product-audit only.
+        #
+        # Every other endpoint takes its data in the request body and holds no
+        # credentials — that is the contract that keeps Hermes unable to reach a
+        # product the caller was not already authorised to read. The audit
+        # endpoint deliberately breaks it: its whole purpose is to answer "what
+        # is wrong with this id" with nothing but a connection string, no running
+        # vnyx-api and no JWT. Unset means the endpoint 503s rather than the
+        # service failing to boot.
+        self.database_url = os.getenv("DATABASE_URL", "")
+
         # Safety switches
         self.dry_run = os.getenv("HERMES_DRY_RUN", "false").lower() == "true"
         # Relative default so this works on Windows without an absolute path.

@@ -315,6 +315,14 @@ def to_snapshot(
 
         confidence=confidence,
         provenance=provenance,
+        # The unresolved column values, when the caller sent them. Deliberately
+        # NOT derived from `raw` here: which key is the column and which is the
+        # `properties` copy is knowledge the assembler has and this mapping does
+        # not — both arrive as plain keys on the same dict. Absent means the drift
+        # rules stay silent.
+        column_values=_first(raw, "columnValues", "column_values") or {},
+        properties_raw=(raw.get("properties")
+                        if isinstance(raw.get("properties"), dict) else {}),
         locked_fields=_first(raw, "lockedFields", "locked_fields") or [],
         # Accept it inline on the record too, so a single product can be posted
         # to /v1/validate with its own catalog attached.

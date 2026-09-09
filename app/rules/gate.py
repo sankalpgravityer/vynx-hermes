@@ -201,14 +201,55 @@ def expected_guide_name(p: ProductSnapshot) -> str | None:
 
 
 def _size_candidates(p: ProductSnapshot) -> list[str]:
-    """The size spellings to look for in a chart. Stored data uses several."""
+    """The size spellings to look for in a chart. Stored data uses several.
+
+    `waist` is only a size when it is NUMERIC. Real records use that column for
+    a fit descriptor too — "Mid" turns up as a waist — and feeding it in
+    produced the nonsense candidates "Mid" and "WMid", which can never match a
+    ladder and so pushed SIZE.013 into reporting a perfectly good product.
+    """
     waist = str(p.waist).strip() if p.waist else None
+    if waist and not _num(waist):
+        waist = None
     return [
         str(v).strip()
         for v in (p.size, p.international_size, waist,
                   f"W{waist}" if waist else None)
         if v and str(v).strip()
     ]
+
+
+def _num(text: str) -> str | None:
+    """The number in a size, or None. "W32" -> "32", "32.0" -> "32"."""
+    digits = "".join(ch for ch in str(text) if ch.isdigit() or ch == ".")
+    if not digits or digits == ".":
+        return None
+    try:
+        value = float(digits)
+    except ValueError:
+        return None
+    return str(int(value)) if value == int(value) else str(value)
+
+
+def _size_key(text: str) -> tuple[str, str] | None:
+    """A size as (family, value), so two spellings of one size compare equal.
+
+    ("num", "32")   from "32", "W32", "w 32", "32.0"
+    ("alpha", "m")  from "M", " m ", "M/L" -> "ml"
+
+    The FAMILY is what makes the comparison honest. A letter size and a waist
+    number are not the same kind of thing, so "no match" between them says
+    nothing about correctness — it says they cannot be compared. Treating that as
+    a defect is what made SIZE.013 block a fine product.
+    """
+    raw = str(text).strip().lower()
+    if not raw:
+        return None
+    number = _num(raw)
+    if number is not None:
+        return ("num", number)
+    letters = "".join(ch for ch in raw if ch.isalpha())
+    return ("alpha", letters) if letters else None
 
 
 def product_gender(p: ProductSnapshot) -> str | None:
@@ -278,6 +319,35 @@ def candidate_guides(p: ProductSnapshot, *,
             ]
             if same_side:
                 hits = same_side
+
+        # Drop charts named for a GARMENT this product is not.
+        #
+        # Same filter shape as the side narrowing above, and dropped the same way
+        # when it would empty the list, so it can only improve the answer.
+        #
+        # This tenant has "Men Uppers" AND "Men DressShirts", both listing "S".
+        # Every men's top on a generic chart therefore matched two charts, and
+        # every caller that needs ONE answer — better_guide, the SIZE.012 repair
+        # — gave up and escalated. A hoodie is not a dress shirt, and the guide's
+        # own name says so.
+        #
+        # Note which way round this reads. It does NOT derive a guide name from
+        # the category, which expected_guide_name explains at length is wrong. It
+        # asks whether a guide that has ALREADY matched on gender and ladder
+        # names a garment, and if so whether the product is that garment — using
+        # the tenant's own category names on one side and the guide's own name on
+        # the other. A men's business shirt keeps both candidates and still
+        # escalates, which is right: there the ambiguity is real.
+        product_garments = _garment_words(
+            f"{p.category or ''} {p.subcategory or ''}", pol
+        )
+        general = [
+            n for n in hits
+            if not _garment_words(n, pol)
+            or (_garment_words(n, pol) & product_garments)
+        ]
+        if general:
+            hits = general
     return sorted(hits)
 
 
@@ -341,6 +411,34 @@ def _side_of(text: str | None, pol: dict[str, Any]) -> str | None:
     return None
 
 
+def _garment_words(text: str | None, pol: dict[str, Any]) -> set[str]:
+    """The GARMENT tokens in a name, excluding the two body-side words.
+
+    `policy.sizing.sides` lists "upper" and "bottom" first and then the garments
+    that imply each side. That split is the difference between a chart named for
+    a whole half of the body and one named for a particular garment:
+
+        "Men Uppers"       -> {}          the general men's upper chart
+        "Men DressShirts"  -> {"shirt"}   a specialisation of it
+        "Men Bottoms"      -> {}
+
+    A general chart sizes anything on its side. A specialised one is only the
+    right answer for the garment it names — which is a fact about the guide's
+    own name, not an inference about the tenant's conventions.
+    """
+    low = str(text or "").strip().lower()
+    if not low:
+        return set()
+    sides = (pol.get("sizing") or {}).get("sides") or {}
+    return {
+        str(token).lower()
+        for side in ("bottom", "upper")
+        for token in (sides.get(side) or [])
+        if str(token).lower() not in ("upper", "bottom")
+        and str(token).lower() in low
+    }
+
+
 def category_side(p: ProductSnapshot, pol: dict[str, Any]) -> str | None:
     """Which half of the body this product is, from its taxonomy.
 
@@ -388,13 +486,29 @@ def guide_contains_size(p: ProductSnapshot, guide: str | None = None) -> bool | 
     pair = (p.catalog.sizing_guides or {}).get(name)
     if not pair:
         return None
-    ladder = {str(s).strip().lower() for s in (pair.get("sizes") or [])}
+    ladder = {
+        k for k in (_size_key(x) for x in (pair.get("sizes") or [])) if k
+    }
     if not ladder:
         return None
-    wanted = {s.lower() for s in _size_candidates(p)}
+    wanted = {k for k in (_size_key(x) for x in _size_candidates(p)) if k}
     if not wanted:
         return None
-    return bool(wanted & ladder)
+
+    if wanted & ladder:
+        return True
+
+    # No match — but is that a DEFECT or an incomparable pair?
+    #
+    # Only a defect when the two are the same KIND of size and the ladder simply
+    # does not carry this one (an "XXL" product on a chart that stops at "XL").
+    # A letter size against a waist-number ladder is a side/format mismatch, and
+    # SIZE.014 answers that properly from the category — so this returns None and
+    # defers rather than blocking on a comparison it cannot make.
+    families = {f for f, _ in ladder}
+    if not any(f in families for f, _ in wanted):
+        return None
+    return False
 
 
 def better_guide(p: ProductSnapshot,
@@ -606,24 +720,47 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
                         "product_gender": want,
                         "suggested": candidate_guides(p)},
             ))
-        else:
-            better = better_guide(p, pol)
-            if better:
-                # MEDIUM, so it does NOT block approval. Sitting on "Defaults" is
-                # a legitimate configuration and the tenant may intend it; it is
-                # worth correcting, not worth halting a catalog for. The hazard is
-                # real but latent — DEFAULTS_TABLE in backfill-eu-sizes.ts is a
-                # module constant, so a generic chart converts one gender
-                # correctly and the other silently wrong.
+        elif is_generic_guide(current) and want:
+            # SIZE.012 — on a generic chart while specific ones fit.
+            #
+            # MEDIUM, so it does NOT block approval. Sitting on "Defaults" is a
+            # legitimate configuration and the tenant may intend it; it is worth
+            # correcting, not worth halting a catalog for. The hazard is real but
+            # latent — DEFAULTS_TABLE in backfill-eu-sizes.ts is a module
+            # constant, so a generic chart converts one gender correctly and the
+            # other silently wrong.
+            #
+            # `suggested` is a LIST, matching SIZE.011/013/014. It used to be a
+            # single name from better_guide(), which returns None unless EXACTLY
+            # one chart fits — and that conflated two different facts:
+            #
+            #   nothing more specific exists   -> Defaults is right, stay silent
+            #   several more specific exist    -> still wrong, a human picks
+            #
+            # This tenant has both "Men Uppers" and "Men DressShirts" listing
+            # "S", so every men's top left on Defaults matched two charts, failed
+            # the len==1 test, and was reported as clean. A real men's hoodie
+            # (1939df54) is what surfaced it.
+            #
+            # The planner already reads the list correctly: one candidate becomes
+            # a set_column, several become an escalate naming them.
+            fits = candidate_guides(p, pol=pol)
+            if fits:
+                quoted = ", ".join("'" + n + "'" for n in fits)
+                named = (
+                    f"'{fits[0]}' matches" if len(fits) == 1
+                    else f"{len(fits)} charts match ({quoted})"
+                )
                 out.append(Finding(
                     rule_id="SIZE.012", severity=Severity.MEDIUM,
                     fields=["sizing_guide"],
                     message=(
-                        f"'{current}' is a generic chart; '{better}' matches this "
-                        f"product's gender and size."
+                        f"'{current}' is a generic chart; {named} this product's "
+                        f"gender and size."
+                        + ("" if len(fits) == 1 else " Pick one.")
                     ),
-                    detail={"sizing_guide": current, "suggested": better,
-                            "product_gender": product_gender(p)},
+                    detail={"sizing_guide": current, "suggested": fits,
+                            "product_gender": want},
                 ))
 
     # ---- IMG.030: a care label exists --------------------------------------
@@ -705,4 +842,117 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
             },
         ))
 
+    out.extend(check_column_drift(p))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# DRIFT.001 — the column and the `properties` copy hold different values
+# --------------------------------------------------------------------------- #
+
+# (snapshot field, column name, `properties` key) for every value VNYX genuinely
+# stores TWICE.
+#
+# This is not a hypothetical. `Product.internationalSize` is a real column and
+# `properties.international_size` is a real key, both written by different paths:
+# the analyze worker writes the property, the edit screen writes the column, and
+# no code copies one to the other. `PROPERTY_ALIASES` resolves a precedence
+# between them for READING, which is what makes the disagreement invisible —
+# every resolved view of the product shows the winner and nothing shows that
+# there was a contest.
+#
+# It matters because different consumers read different copies. The product
+# export reads the COLUMN. So a product whose column says "Unknown" and whose
+# property says "S" passes every size rule — the resolved size is "S" — and then
+# publishes with no size on it.
+#
+# Deliberately narrow. Only pairs where both sides are a plain scalar naming the
+# same thing; nothing derived, nothing where one side is a relation id.
+COLUMN_PROPERTY_PAIRS: tuple[tuple[str, str, str], ...] = (
+    ("international_size", "internationalSize", "international_size"),
+    ("master_category", "masterCategory", "mastercategory"),
+    ("subcategory", "subCategory", "sub_category"),
+)
+
+# Which side wins when they disagree, and why.
+#
+# The rule proposes the NON-placeholder side. That is the only direction that is
+# safe without knowing which write came last: "Unknown" is never the answer
+# somebody meant, so copying the real value over it cannot destroy information.
+# When BOTH sides hold a real value they simply differ, and no arithmetic settles
+# which is right — that escalates.
+_UNKNOWN = {"", "unknown", "n/a", "na", "none", "null", "-", "tbd"}
+
+
+def _meaningless(value: Any) -> bool:
+    return value is None or str(value).strip().lower() in _UNKNOWN
+
+
+def _same(a: Any, b: Any) -> bool:
+    """Compare on letters and digits only.
+
+    "Leather Jackets" and "leather  jackets" are the same value written by two
+    paths; reporting the difference in spacing as data drift is noise.
+    """
+    def flat(v: Any) -> str:
+        return "".join(ch for ch in str(v or "").lower() if ch.isalnum())
+    return flat(a) == flat(b)
+
+
+def check_column_drift(p: ProductSnapshot) -> list[Finding]:
+    """DRIFT.001 — a column and its `properties` twin hold different values.
+
+    Silent unless the caller supplied `column_values`; see the note on that field
+    in models.py. HIGH when one side is empty and the other is not, because the
+    consumer reading the empty side ships a product with the field missing.
+    MEDIUM when both hold real but different values — still wrong, but a human
+    has to pick.
+    """
+    if not p.column_values:
+        return []
+
+    out: list[Finding] = []
+    for field, column, prop_key in COLUMN_PROPERTY_PAIRS:
+        if column not in p.column_values:
+            continue
+        col_value = p.column_values[column]
+        prop_value = (p.properties_raw or {}).get(prop_key)
+
+        if _same(col_value, prop_value):
+            continue
+        col_empty, prop_empty = _meaningless(col_value), _meaningless(prop_value)
+        if col_empty and prop_empty:
+            continue
+
+        if col_empty or prop_empty:
+            winner = prop_value if col_empty else col_value
+            loser_side = "column" if col_empty else "properties"
+            out.append(Finding(
+                rule_id="DRIFT.001", severity=Severity.HIGH, fields=[field],
+                message=(
+                    f"'{column}' and 'properties.{prop_key}' disagree: the "
+                    f"{loser_side} holds {col_value if col_empty else prop_value!r} "
+                    f"and the other holds {winner!r}. Whichever consumer reads the "
+                    f"empty side publishes this product without a {field.replace('_', ' ')}."
+                ),
+                detail={
+                    "column": column, "column_value": col_value,
+                    "property": prop_key, "property_value": prop_value,
+                    "repair_to": winner, "repair_side": loser_side,
+                },
+            ))
+        else:
+            out.append(Finding(
+                rule_id="DRIFT.001", severity=Severity.MEDIUM, fields=[field],
+                message=(
+                    f"'{column}' holds {col_value!r} but "
+                    f"'properties.{prop_key}' holds {prop_value!r}. Both are real "
+                    f"values, so which is correct is a judgement."
+                ),
+                detail={
+                    "column": column, "column_value": col_value,
+                    "property": prop_key, "property_value": prop_value,
+                    "repair_to": None,
+                },
+            ))
     return out

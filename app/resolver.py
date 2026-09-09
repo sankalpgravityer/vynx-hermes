@@ -265,14 +265,43 @@ def resolve_attributes(p: ProductSnapshot, findings: list[Finding],
             handled.add("mannequin")
 
         elif f.rule_id == "GRADE.001":
-            patches.append(_gate(Patch(
-                field="grade", old_value=p.grade, new_value=f.detail["expected"],
-                action=Action.APPLY, rule_id=f.rule_id,
-                reason=f"Grade realigned to the condition '{p.condition}' per the "
-                       "grading policy.",
-                confidence=0.97, provenance=Provenance.DERIVED,
-            ), pol, p))
-            handled.add("grade")
+            # WHICH SIDE MOVES depends on which branch fired, and getting it
+            # backwards produced a repair that could never land.
+            #
+            # `basis: grade_label` — the tenant's own Grade row carries the label
+            # ("As New") and `condition` disagrees with it. `expected` is that
+            # LABEL, so the fix is to write CONDITION. Writing it into `grade`
+            # put a condition label where a grade CODE belongs: services/
+            # products.ts rejected it ("code not in the tenant's grade scale"),
+            # nothing changed, and the finding re-fired on every run — a repair
+            # that was planned forever and never converged.
+            #
+            # `basis: condition_to_grade` — the generic table maps a condition to
+            # a grade letter, so `expected` IS a code and `grade` is the side
+            # that moves.
+            #
+            # The rule's own message says which is authoritative: "These are kept
+            # in sync on every grade write" — the grade drives the condition.
+            if f.detail.get("basis") == "grade_label":
+                patches.append(_gate(Patch(
+                    field="condition", old_value=p.condition,
+                    new_value=f.detail["expected"],
+                    action=Action.APPLY, rule_id=f.rule_id,
+                    reason=f"Condition realigned to the label for Grade "
+                           f"{p.grade} ('{f.detail['expected']}').",
+                    confidence=0.97, provenance=Provenance.DERIVED,
+                ), pol, p))
+                handled.add("condition")
+            else:
+                patches.append(_gate(Patch(
+                    field="grade", old_value=p.grade,
+                    new_value=f.detail["expected"],
+                    action=Action.APPLY, rule_id=f.rule_id,
+                    reason=f"Grade realigned to the condition '{p.condition}' per "
+                           "the grading policy.",
+                    confidence=0.97, provenance=Provenance.DERIVED,
+                ), pol, p))
+                handled.add("grade")
 
         elif f.rule_id == "SIZE.002":
             # `detail` differs by WHICH branch of check_sizing fired, and the two

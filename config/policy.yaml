@@ -103,6 +103,15 @@ guardrails:
   # Fields the LLM is NEVER allowed to write directly. It may only supply
   # evidence; the deterministic resolver computes the final value.
   llm_forbidden_fields:
+    # `condition` is DERIVED from the tenant's grade, not observed.
+    #
+    # GRADE.001 keeps the pair in sync and the grade drives it. Letting the
+    # vision layer write condition too made the two fight: a run wrote
+    # `condition` from the photographs, GRADE.001 then fired because it no longer
+    # matched the grade label, and the product came out of a clean pass with a
+    # NEW blocker it did not have before. The model can still judge `grade` —
+    # visible wear is a fair vision question — and the condition follows from it.
+    - condition
     - price
     - retail_price
     - inventory

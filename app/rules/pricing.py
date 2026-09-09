@@ -417,15 +417,39 @@ def check(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
             fields=["price", "retail_price"],
             message=a.explanation, detail=payload, needs_evidence=True,
         ))
+    # A WINDOW verdict is only as authoritative as the target it was measured
+    # against, so its severity follows the basis.
+    #
+    # `backend_factor` is the tenant's own Grade.priceFactor — their stated
+    # intent, so a price outside it is a real defect and blocks.
+    #
+    # `policy_band` is policy.yaml's `grade_targets` GUESS, used when the grade
+    # has no factor configured (a tenant whose scale has no row for this code —
+    # exactly the "code not in the tenant's grade scale" case). Blocking on our
+    # own guess is the failure mode this codebase warns about elsewhere: "its
+    # Women Bottoms chart maps W28 to EU 36 where a generic table says 40.
+    # Validating against the policy file instead would reject most of the
+    # catalog." A perfectly sensible 50%-of-retail price read as too_low against
+    # a 70% guess and blocked approval, while PRICE.101 — the finding that says
+    # it WAS a guess — was only MEDIUM.
+    #
+    # PRICE.001 stays CRITICAL either way: at-or-above 95% of retail is an
+    # absolute invariant with no factor in it.
     elif a.verdict is PriceVerdict.TOO_HIGH:
         out.append(Finding(
-            rule_id="PRICE.002", severity=Severity.HIGH,
+            rule_id="PRICE.002",
+            severity=(
+                Severity.HIGH if a.rule == "backend_factor" else Severity.MEDIUM
+            ),
             fields=["price", "retail_price"],
             message=a.explanation, detail=payload, needs_evidence=True,
         ))
     elif a.verdict is PriceVerdict.TOO_LOW:
         out.append(Finding(
-            rule_id="PRICE.003", severity=Severity.HIGH,
+            rule_id="PRICE.003",
+            severity=(
+                Severity.HIGH if a.rule == "backend_factor" else Severity.MEDIUM
+            ),
             fields=["price", "retail_price"],
             message=a.explanation, detail=payload, needs_evidence=False,
         ))
