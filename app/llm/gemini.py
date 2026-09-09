@@ -197,12 +197,46 @@ class GeminiEvidence:
         return ev
 
     def audit_images(self, p: ProductSnapshot, fields: dict[str, Any]) -> VisionAudit:
-        """Check the structured attributes against the actual product photos."""
-        images = self._fetch_images(p.images[: self.cfg["max_images"]])
-        if not images:
+        """Check the structured attributes against the actual product photos.
+
+        CARE LABELS FIRST, and named as labels.
+
+        They used to be absent entirely — only `p.images`, the garment gallery,
+        was sent — so `brand`, `material` and the size fields were judged from a
+        photograph of the garment. The label is where those are actually written,
+        and vnyx-api's backfill-product-data.ts records the cost of the
+        alternative: reading the garment "produced hallucinated brands and a
+        leather jacket recorded as Knit".
+
+        Budgeted separately rather than sharing `max_images` with the gallery: a
+        product with five renders would otherwise fill the quota before the one
+        image that answers the question was reached.
+        """
+        cap = int(self.cfg["max_images"])
+        label_urls = p.care_label_urls[:2]
+        labels = self._fetch_images(label_urls)
+        garment = self._fetch_images(p.images[: max(cap - len(labels), 1)])
+        if not labels and not garment:
             return VisionAudit()
 
-        parts: list[Any] = list(images)
+        parts: list[Any] = []
+        if labels:
+            parts.append(
+                f"The first {len(labels)} image(s) are CARE LABEL photographs "
+                "from this product. They are the authority for brand, material "
+                "composition and size — read those fields from the label text, "
+                "not from the garment."
+            )
+            parts.extend(labels)
+        if garment:
+            parts.append(
+                f"The next {len(garment)} image(s) are the GARMENT itself. Use "
+                "them for colour, fit, condition and visible damage. Do NOT read "
+                "a brand off a garment print or logo — a printed graphic is not "
+                "the label."
+            )
+            parts.extend(garment)
+
         parts.append(
             "Here is what our catalogue claims about the garment in these photos:\n"
             + json.dumps(fields, indent=2)

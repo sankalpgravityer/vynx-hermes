@@ -251,6 +251,18 @@ class ProductSnapshot(BaseModel):
     # silent rather than reporting a product with pictures as having none.
     media: list[MediaAsset] = Field(default_factory=list)
 
+    # How many care-label photographs are on file (`Product.careLabelImages`).
+    #
+    # A COUNT, not the urls: the only question asked of it is "is there one", and
+    # the label images are not part of the gallery the imagery rules reason about.
+    #
+    # None means the caller did not send the field, which is NOT the same as zero —
+    # IMG.030 stays silent on None, because a raw webhook payload mentions no
+    # labels and reporting every such product as unlabelled would make the rule
+    # useless. vnyx-api's review feed has always sent this; nothing read it until
+    # the approval gate.
+    care_label_count: int | None = None
+
     # The generation pipeline's own view of this product.
     #
     # IDLE | GENERATING | COMPLETE | FAILED. Reported, never trusted: on the
@@ -274,6 +286,34 @@ class ProductSnapshot(BaseModel):
     # webhook payload, or a hand-written fixture), in which case the rules fall
     # back to policy.yaml and say so.
     catalog: TenantCatalog | None = None
+
+    @property
+    def care_label_urls(self) -> list[str]:
+        """The care-label photographs, from the typed media rows.
+
+        THE AUTHORITY for brand, material and size, and the reason this exists
+        separately from `images`: that list is the garment gallery, and the
+        evidence layer was only ever shown those. So the model was asked "what
+        brand is this?" while looking at a photograph of a t-shirt — the one
+        place the answer is written was never sent, and the prompt's own escape
+        hatch ("if a brand label is not legible, say uncertain") fired every
+        time.
+
+        vnyx-api's backfill-product-data.ts states the other half of it: reading
+        the garment rather than the label "produced hallucinated brands and a
+        leather jacket recorded as Knit". So these are passed FIRST, and labelled
+        as labels, rather than mixed into the gallery.
+
+        Derived rather than stored: the caller already sends the ProductMedia
+        rows, so there is nothing extra to plumb through the feed.
+        """
+        return [
+            m.url for m in self.media
+            if (m.view or "").upper() == "LABEL"
+            and m.is_current
+            and not m.deleted_at
+            and m.url
+        ]
 
     def prov(self, field: str) -> Provenance:
         if field in self.locked_fields:
@@ -704,6 +744,143 @@ class ImageryGenerateResponse(BaseModel):
     # describe a different one. This is the same record the regenerate worker
     # keeps for the same reason.
     image_settings: dict[str, Any] | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Readability — is the text in this photograph legible?
+#
+# Unlike everything above, this judges ONE uploaded image and knows nothing about
+# a product. It exists because the capture screen needs an answer at shutter press
+# — keep this frame, or ask for another — and the operator needs to be told what
+# to change.
+# --------------------------------------------------------------------------- #
+
+class LegibilityReason(str, Enum):
+    """Why a frame was rejected. Ordered roughly by how actionable it is.
+
+    A verdict carries a LIST of these: a photograph taken in a dark stockroom at
+    arm's length is both underexposed and too far away, and reporting only the
+    first would send the operator to fix the wrong thing.
+    """
+
+    # Nothing to read — settled before OCR runs.
+    BLANK_FRAME = "blank_frame"
+    # OCR ran and found no text at all.
+    NO_TEXT_FOUND = "no_text_found"
+    # Found text, but less than the caller said to expect.
+    NOT_ENOUGH_TEXT = "not_enough_text"
+    # Found enough text, but the recognizer is not confident about it.
+    LOW_CONFIDENCE = "low_confidence"
+    # Some lines read cleanly, too many others did not.
+    PARTIALLY_LEGIBLE = "partially_legible"
+
+    # Contributing causes. Never sufficient on their own — see the policy note on
+    # why no pixel statistic is allowed to decide.
+    OUT_OF_FOCUS = "out_of_focus"
+    TOO_DARK = "too_dark"
+    OVEREXPOSED = "overexposed"
+    GLARE = "glare"
+    WASHED_OUT = "washed_out"
+
+    # The upload itself was the problem.
+    DECODE_FAILED = "decode_failed"
+
+
+class TextLine(BaseModel):
+    """One line the recognizer returned, with the score that decided its fate."""
+
+    text: str
+    confidence: float
+    # Whether this line counted toward the verdict, i.e. scored at or above
+    # `line_score_min`. Weak lines are returned rather than dropped so a caller
+    # tuning the thresholds can see what it is rejecting.
+    kept: bool = True
+    # Axis-aligned box at the WORKING resolution, as [x, y, width, height].
+    # Working rather than original resolution because that is the space the
+    # geometry was measured in, and rescaling it would imply a precision the
+    # detector does not have.
+    box: list[int] = Field(default_factory=list)
+
+
+class FrameStats(BaseModel):
+    """What the pixels say, independent of any text.
+
+    Reported on every response, pass or fail. These are the numbers behind the
+    explanation, and a caller calibrating its own capture UI needs them even when
+    the answer was yes.
+    """
+
+    width: int = 0
+    height: int = 0
+    # What OCR actually saw, after the downscale.
+    working_width: int = 0
+    working_height: int = 0
+    # Variance of the Laplacian — the standard focus measure. High is sharp.
+    # Scale is arbitrary and content-dependent; compare it against other frames
+    # of the same subject, never against an absolute.
+    sharpness: float = 0.0
+    # Mean luma, 0-255.
+    brightness: float = 0.0
+    # Luma standard deviation, 0-255.
+    contrast: float = 0.0
+    # Fraction of pixels at 250+ and at 8-, i.e. blown highlights and crushed
+    # shadows.
+    clipped_fraction: float = 0.0
+    dark_fraction: float = 0.0
+
+
+class LegibilityVerdict(BaseModel):
+    """The answer the capture screen acts on.
+
+    `readable` and `message` are the whole contract for a simple client: keep the
+    frame, or show the message and ask for another. Everything else is evidence.
+    """
+
+    readable: bool
+    # One sentence addressed to the person holding the phone, in the imperative
+    # where there is something to do about it. Always set, including on success.
+    message: str
+    reasons: list[LegibilityReason] = Field(default_factory=list)
+
+    # Mean and worst recognition score across the KEPT lines. Both 0.0 when
+    # nothing was kept.
+    confidence: float = 0.0
+    min_confidence: float = 0.0
+    # Kept lines and the characters in them — the coverage half of the decision.
+    line_count: int = 0
+    char_count: int = 0
+    # Lines the detector found, including the weak ones. A frame with many
+    # detections and few keeps is the signature of clutter or of degraded text.
+    detected_count: int = 0
+
+    # Median height of the KEPT lines, in working-resolution pixels. 0 when
+    # nothing was kept.
+    #
+    # This is how "the label only has two lines" is told apart from "we missed
+    # four of them", which the line count alone cannot do. Detected box height
+    # bottoms out around 13px because of the detector's vertical padding, so text
+    # comfortably above that was resolved properly and a low line count means the
+    # frame genuinely holds little text — an adidas neck label reads "adidas" and
+    # "S" and that is all there is.
+    text_height_px: int = 0
+
+    # What was read, newline-joined over the kept lines. Returned because a caller
+    # that has gone to the trouble of uploading the frame usually wants the text
+    # too, and a second round trip to get it would cost another 1.5s.
+    text: str = ""
+    lines: list[TextLine] = Field(default_factory=list)
+
+    frame: FrameStats = Field(default_factory=FrameStats)
+
+    # True when the blank-frame gate answered without running OCR. Surfaced
+    # because it explains an unusually fast response, and because a caller seeing
+    # it often should look at its capture pipeline rather than at Hermes.
+    ocr_skipped: bool = False
+    # Split out so a deployment can see whether it is missing the budget on
+    # inference or on decoding a needlessly large upload.
+    decode_ms: int = 0
+    ocr_ms: int = 0
+    duration_ms: int = 0
 
 
 # `ProductSnapshot.imagery_settings` forward-references a class defined below it.

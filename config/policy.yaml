@@ -149,6 +149,48 @@ mannequin_map:
 
 sizing:
   eu_tolerance: 1
+
+  # Which half of the body a category and a guide name refer to.
+  #
+  # SIZE.014 compares the two: a Women > T-Shirts & Polos product sitting on
+  # "Women Bottoms" agrees on gender perfectly, so nothing else catches it, and
+  # the ladder test cannot either when a tenant's bottoms guide happens to list
+  # letter sizes rather than waist numbers.
+  #
+  # Substring tokens, matched lowercase, so real tenant names resolve without an
+  # exhaustive list: "T-Shirts & Polos" hits `shirt`, "Sweaters & Hoodies" hits
+  # `sweater`, "Women Bottoms" hits `bottom`. A category or guide matching
+  # NEITHER list resolves to no side and the rule stays silent — this decides
+  # nothing on a guess. Extend rather than replace when a tenant adds a branch.
+  sides:
+    bottom:
+      - bottom
+      - trouser
+      - jean
+      - pant
+      - short
+      - skirt
+      - legging
+      - chino
+      - denim bottom
+    upper:
+      - upper
+      - top
+      - shirt
+      - tee
+      - t-shirt
+      - polo
+      - sweater
+      - hoodie
+      - jumper
+      - knit
+      - jacket
+      - coat
+      - vest
+      - blazer
+      - dress   # a dress is sized on the upper ladder, not the waist one
+      - outerwear
+      - sweatshirt
   men_bottoms_waist_in_to_eu:
     28: 44
     29: 45
@@ -391,3 +433,124 @@ imagery:
     # gets the identical answer while doubling the wait.
     max_retries: 2
     retry_backoff_s: 3
+
+# --------------------------------------------------------------------------- #
+# Readability — can the text in a phone photograph actually be read?
+#
+# Fires at shutter press, so the whole answer has to come back inside ~1.5s and
+# the operator has to be told what to fix. No model call: OCR detection plus
+# recognition confidence, and pixel statistics to explain a failure.
+#
+# Every number below was measured — see docs/READABILITY.md for the harness and
+# the tables. Two findings shaped the design and are worth stating here because
+# they are counter-intuitive:
+#
+#   1. No pixel statistic is a usable GATE. A defocused label with a Laplacian
+#      variance of 1.7 read perfectly at 0.99 confidence, while a motion-blurred
+#      one at 103.6 was unreadable. Brightness is no better: a frame at mean 28.8
+#      (nearly black to the eye) still read at 0.994, because the recognizer
+#      normalises contrast per line. Gating on any of these produces false
+#      rejections on photographs OCR handles fine.
+#
+#   2. Confidence alone is not enough either. When text is too small, detection
+#      finds a FEW fragments and the recognizer is confident about those — 3 of 6
+#      lines at 0.97 confidence with 63% of characters wrong. Mean confidence
+#      passes it; a line/character floor is what catches it.
+#
+# So: confidence and coverage DECIDE, pixel statistics EXPLAIN.
+# --------------------------------------------------------------------------- #
+readability:
+  # Long edge the image is scaled to before OCR. THE latency knob — detection
+  # cost scales with pixel count, and on a 4-core i7-8565U the measured medians
+  # were 618ms at 512px, 784ms at 640px, 944ms at 800px and 2244ms at 1280px.
+  #
+  # 800 rather than 640 because 640 is where accuracy starts to go: text at 0.9%
+  # of frame height (a label shot at arm's length) came back with 52% of its
+  # characters wrong at 640px and perfect at 800px. Below ~0.7% nothing works at
+  # any resolution.
+  #
+  # Lower this to buy latency on a 2-vCPU box, and re-run the harness if you do.
+  working_px: 800
+
+  # Recognition score below which a line is treated as noise rather than text.
+  # Measured floor: every line of a readable frame scored >= 0.914, and the worst
+  # unreadable frame's best line was 0.694.
+  line_score_min: 0.80
+
+  # Mean recognition score across the kept lines. Readable frames measured
+  # 0.973-0.994; unreadable ones 0.000-0.783, so the gap either side of 0.90 is
+  # wide and this is not a knife-edge.
+  mean_score_min: 0.90
+
+  # How much text has to be there before "readable" means anything. These are the
+  # coverage floors that catch the too-small-text case confidence misses.
+  #
+  # Deliberately permissive defaults, because how much text SHOULD be in frame is
+  # the caller's domain knowledge, not Hermes's — a care label has six lines, a
+  # size tag has two. Both are overridable per request, and a client photographing
+  # a known label type should raise them.
+  min_lines: 1
+  min_chars: 3
+
+  # Median detected line height, in working-resolution pixels, above which the
+  # text that WAS found counts as properly resolved.
+  #
+  # Used only to word the NOT_ENOUGH_TEXT message, never to decide. It separates
+  # the two opposite things a missed line floor can mean: a distant label whose
+  # other lines went undetected ("move closer"), or a label that genuinely
+  # carries fewer lines than the caller asked for ("lower your floor"). Telling
+  # an operator to move closer when the label already fills the frame makes them
+  # retake a perfectly good photograph indefinitely.
+  #
+  # 20 because detected box height bottoms out at 13px on this detector — its
+  # vertical padding floor — so 13 means "as small as it gets" while the readable
+  # sizes in the harness measured 13-41px and an adidas neck mark measured 149.
+  resolved_text_min_height_px: 20
+
+  # Fraction of DETECTED lines that may fall below line_score_min before the
+  # frame is called partially legible. Some illegible clutter beside a clean label
+  # is normal — a fold, a seam, a barcode — so this is not zero.
+  max_weak_line_fraction: 0.5
+
+  # --- the one pre-OCR gate -------------------------------------------------
+  #
+  # An empty frame is the single case pixel statistics DO settle, and skipping
+  # OCR on it saves the ~900ms the model would spend finding nothing. Measured:
+  # a covered lens, a blown-out frame, a grey wall and plain garment fabric all
+  # came in at contrast <= 1.4, while the least contrasty READABLE frame measured
+  # 2.1. The floor sits below that with margin, so it only ever catches frames
+  # with no structure at all.
+  blank_frame_max_contrast: 1.5
+
+  # --- explanation thresholds ------------------------------------------------
+  #
+  # Read ONLY when the verdict is already "not readable", to say why. They never
+  # decide, so they are tuned to describe the common cause rather than to avoid
+  # false positives.
+  explain:
+    # Laplacian variance below which "out of focus" is the likely story. Set from
+    # the unreadable motion-blur cases (81.8-103.6) rather than from the defocus
+    # ones, which go to ~0.1 and would drag it uselessly low.
+    soft_focus_max_sharpness: 120.0
+    # Mean luma outside this band gets mentioned as a contributing cause.
+    #
+    # The upper bound is 248 and not lower because A CARE LABEL IS WHITE: the
+    # pristine frames in the harness measured 243.4 mean luma and read at 0.99,
+    # as did every low-contrast and JPEG variant of them (242.4-243.4). An
+    # earlier 235.0 told operators to "move out of direct light" on correctly
+    # exposed photographs of white fabric. Genuine glare measured 253.2-253.5,
+    # so the gap is real but it sits higher than it looks.
+    dark_max_brightness: 45.0
+    bright_min_brightness: 248.0
+    # Fraction of pixels at 250+ that reads as glare worth mentioning. This is
+    # the better glare signal of the two — a reflection blows out a REGION, and
+    # the harness separated cleanly on it (0.7% pristine against 96.9% glare)
+    # while mean luma barely moved.
+    glare_min_clipped_fraction: 0.25
+    # Mean luma stddev below which the frame is called washed out.
+    flat_max_contrast: 4.0
+
+  # Hard cap on the upload Hermes will decode, in megabytes. A phone that skips
+  # its client-side resize sends 3-5MB; anything past this is a mistake or an
+  # attack, and decoding it would blow the latency budget regardless.
+  max_upload_mb: 12

@@ -290,27 +290,23 @@ def not_generatable_reason(p: ProductSnapshot, pol: dict[str, Any]) -> str | Non
     settings = p.imagery_settings
     if settings and not settings.is_model_generation_enabled:
         return "this tenant has model generation switched off"
-    # CATEGORY FIELDS ONLY — deliberately NOT the title, which is what
-    # `isFootwearCategory` is given in analyze.worker.ts.
+    # FOOTWEAR IS NO LONGER REFUSED.
     #
-    # The title is a brand-name minefield. Measured on 11,818 live products,
-    # including it made Hermes refuse three garments the worker generates:
-    # "Vintage DC Shoes Dark T-Shirt" (cat T-Shirts), "Vintage Closed Black
-    # Sandal Dress" (cat Dresses) and a Nike "Lifestyle Shoe" filed under
-    # Sweaters. DC Shoes is a skate brand that puts its name on t-shirts;
-    # "Sandal" there is a colourway. A backfill and the analyze worker
-    # disagreeing about the same product is the failure this whole module
-    # exists to prevent, and the divergence is silent — the product simply
-    # never gets model images, and the reason reads as a deliberate policy.
+    # It was, and the reason was sound at the time: every MannequinType frames
+    # the item as apparel worn on the torso, so a pair of sandals rendered as a
+    # full-body shot of an invented t-shirt and trousers with a few pixels of
+    # product at the bottom edge. 124 such renders reached the catalogue before
+    # the skip landed on 2026-08-20.
     #
-    # masterCategory is passed for exact parity with the worker. It carries no
-    # footwear rows today (it holds Men/Women/Kids), so it changes nothing now
-    # and keeps the two in step if that ever changes.
-    if is_footwear(p.master_category, p.category, p.subcategory):
-        return (
-            "footwear — every mannequin type frames the item as apparel worn on "
-            "a torso, so the analyze pipeline skips it too"
-        )
+    # `classify_garment_type` now returns a "footwear" class that reframes the
+    # ¾ views to knee-to-floor and the close-up onto the shoes themselves, so
+    # the thing that made the render useless is fixed rather than avoided.
+    # Refusing here would keep the 28 live footwear products permanently
+    # without imagery for a reason that no longer holds.
+    #
+    # `is_footwear` is kept and still exported: the sheet and the audit script
+    # report which products took that framing, and analyze.worker.ts shares the
+    # word list.
     if not garment_photos(p, pol):
         return "no garment photograph to generate from"
     return None

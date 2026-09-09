@@ -2,7 +2,7 @@
 
 The ONLY file that knows the shape of the upstream API. Everything else in
 Hermes depends on ProductSnapshot alone, so this is the single file to touch when
-the VNYX schema moves.
+the VNYX schema moves.  
 
 Two payload shapes are accepted, deliberately:
 
@@ -293,6 +293,16 @@ def to_snapshot(
             if isinstance(m, dict) and _first(m, "url")
         ],
 
+        # Absent stays None rather than becoming 0 — IMG.030 branches on that
+        # difference, so a payload that never mentioned care labels must not read
+        # as a product without one.
+        care_label_count=(
+            int(_first(raw, "careLabelCount", "care_label_count") or 0)
+            if _first(raw, "careLabelCount", "care_label_count") is not None
+            else (len(raw["careLabelImages"])
+                  if isinstance(raw.get("careLabelImages"), list) else None)
+        ),
+
         generation_status=_str(_first(raw, "generationStatus", "generation_status")),
         is_regenerating=bool(
             raw.get("isRegenerating", raw.get("is_regenerating", False))
@@ -329,19 +339,22 @@ _FIELD_MAP = {
 }
 
 # Snapshot fields that live inside the `properties` Json map rather than as
-# columns, so they CANNOT be written field-by-field.
+# columns, so they cannot go through PUT /products/:id.
 #
-# PUT /products/:id takes `properties` as a whole record and REPLACES it
-# wholesale (services/products.ts is explicit: "This function replaces
-# `properties` wholesale, so applying the label to the stored copy would silently
-# discard every other property edit"). Sending `{properties: {color: "Blue"}}`
-# would therefore delete gender, size, waist, material, fit and everything else
-# on the product.
+# PUT takes `properties` as a whole record and REPLACES it wholesale
+# (services/products.ts is explicit: "This function replaces `properties`
+# wholesale, so applying the label to the stored copy would silently discard
+# every other property edit"). Sending `{properties: {color: "Blue"}}` would
+# therefore delete gender, size, waist, material, fit and everything else.
 #
 # Writing one of these safely means read-merge-write against the current row,
 # with no guard against a concurrent edit in between. That is a lost-update race
 # on the single Json column holding most of a product's attributes — not
 # something to run unattended. So these are REFUSED here and reported instead.
+#
+# The approval gate does not go through this client at all: it returns a
+# `set_property` action and vnyx-api performs the merge in-process, inside a
+# transaction with an optimistic-concurrency check. See app/approval.py.
 _PROPERTY_FIELDS = {
     "gender", "brand", "color", "material", "size", "eu_size", "waist",
     "length_size", "fit", "condition", "model", "supplier",
@@ -364,10 +377,22 @@ class VnyxClient:
         `/products/{id}` — plural. The previous singular `/product/{id}` matched
         no route in vnyx-api and 404'd on every call.
         """
+        return to_snapshot(self.fetch_product_raw(product_id, tenant_id))
+
+    def fetch_product_raw(self, product_id: str,
+                          tenant_id: str | None = None) -> dict[str, Any]:
+        """The product payload, unmapped.
+
+        The approval gate needs this rather than `fetch_product`: its re-verify
+        step has to re-attach the CATALOG the caller supplied, and `to_snapshot`
+        takes that as an argument — so the mapping has to happen after the fetch,
+        not inside it. Also what makes `updatedAt` reachable for the optimistic
+        concurrency check on a properties merge.
+        """
         params = {"tenantId": tenant_id} if tenant_id else None
         r = self.client.get(f"{self.base}/products/{product_id}", params=params)
         r.raise_for_status()
-        return to_snapshot(r.json())
+        return r.json()
 
     def fetch_review_feed(
         self,
@@ -395,18 +420,22 @@ class VnyxClient:
         return [to_snapshot(p) for p in products], int(body.get("total") or 0)
 
     def patch_product(self, product_id: str, payload: dict[str, Any],
-                      tenant_id: str | None = None) -> bool:
-        """Write back a repair.
+                      tenant_id: str | None = None) -> list[str]:
+        """Write back a repair. Returns the snapshot field names actually written.
 
-        `PUT`, not `PATCH`: vnyx-api exposes PUT /products/:id and no PATCH route,
-        so the previous implementation could not have written anything. The route
-        already treats a partial body as a partial update (productUpdateSchema is
-        `productCreateSchema.partial()`), so PUT is safe to use this way.
+        `PUT`, not `PATCH`: vnyx-api exposes PUT /products/:id and no PATCH route.
+        The route already treats a partial body as a partial update
+        (productUpdateSchema is `productCreateSchema.partial()`), so PUT is safe
+        to use this way.
 
-        UNUSED on the review-queue path, which is report-only by design — a failed
-        check produces `edit_url` for a human, not a write. It stays here for the
-        /v1/reconcile flow, and stays correct so enabling that flow later is a
-        config change rather than a debugging session.
+        A list rather than a bool so a caller can tell a partial write from a
+        complete one — `properties` fields are refused, and reporting success for
+        a payload half of which was dropped would leave the audit log claiming a
+        write that never happened.
+
+        UNUSED by the approval gate, which returns a repair plan for vnyx-api to
+        execute rather than writing anything itself (app/approval.py explains
+        why). This stays here for the /v1/reconcile flow.
         """
         body: dict[str, Any] = {}
         refused: list[str] = []
@@ -421,24 +450,24 @@ class VnyxClient:
             # an unreported no-op would leave the audit log claiming a write that
             # never happened.
             log.warning(
-                "refusing to write %s on %s — these live in the `properties` Json "
+                "refusing to write %s on %s - these live in the `properties` Json "
                 "map, which PUT /products/:id replaces wholesale; a partial write "
                 "would delete every other attribute. Escalate to a human instead.",
                 ", ".join(sorted(refused)), product_id,
             )
 
         if not body:
-            return False
+            return []
 
         params = {"tenantId": tenant_id} if tenant_id else None
         try:
             r = self.client.put(f"{self.base}/products/{product_id}",
                                 json=body, params=params)
             r.raise_for_status()
-            return True
+            return [k for k in payload if k not in _PROPERTY_FIELDS]
         except httpx.HTTPError as exc:
             log.error("write-back failed for %s: %s", product_id, exc)
-            return False
+            return []
 
     def close(self) -> None:
         self.client.close()

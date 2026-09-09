@@ -7,7 +7,7 @@ broken:
     404 products  five AI_FRONT rows and no other view   -> IMG.021, not IMG.001
     904 rows      size charts filed under view OTHER     -> not IMG.010
     955 products  no ¾ views (they postdate the catalog) -> IMG.005, not IMG.002
-    the shoe rack  footwear never gets an on-model shot  -> IMG.020, not IMG.001
+    the shoe rack  footwear framed as a torso garment    -> its own framing
 
 A rule set that gets the findings right and the traps wrong is worse than no
 rule set, because a reviewer stops reading it.
@@ -21,6 +21,7 @@ import pytest
 
 from app.config import policy
 from app.models import ImagerySettings, MediaAsset, ProductSnapshot
+from app.imaging.nanobanana import classify_garment_type
 from app.rules.imagery import (
     check_imagery, garment_photos, generation_plan, is_footwear, is_mislabelled,
     is_size_chart, needs_matting_for_generation, needs_segmenter,
@@ -159,11 +160,20 @@ def test_three_quarter_views_are_advisory_not_defects(pol):
     assert "IMG.002" not in found
 
 
-def test_footwear_is_a_reason_not_a_violation(pol):
+def test_footwear_is_generated_now_that_it_has_its_own_framing(pol):
+    """Footwear used to be refused outright (IMG.020), and the reason was sound:
+    every MannequinType frames the item as apparel worn on the torso, so a pair
+    of sandals came out as a full-body shot of an invented outfit with the
+    product a few pixels tall at the bottom edge.
+
+    `classify_garment_type` now returns "footwear", which reframes the three-
+    quarter views to knee-to-floor and the close-up onto the shoes. The thing
+    that made the render useless is fixed, so refusing is no longer right."""
     p = product(category="Shoes", subcategory="Sneakers", media=MATTED)
     found = ids(p, pol)
-    assert "IMG.020" in found
-    assert "IMG.001" not in found
+    assert "IMG.020" not in found
+    assert "IMG.001" in found
+    assert not_generatable_reason(p, pol) is None
 
 
 def test_bootcut_jeans_are_not_footwear(pol):
@@ -396,12 +406,13 @@ def test_plan_declines_a_finished_product(pol):
     assert plan.reason
 
 
-def test_plan_declines_footwear_and_says_why(pol):
+def test_plan_generates_footwear_with_the_footwear_framing(pol):
     p = product(category="Shoes", subcategory="Sneakers",
                 title="Vintage Nike Sneakers Men 9", media=[*MATTED])
     plan = generation_plan(p, pol)
-    assert not plan.should_generate
-    assert "footwear" in plan.reason
+    assert plan.should_generate
+    assert plan.views == ["AI_FRONT", "AI_BACK"]
+    assert classify_garment_type("Shoes", "Sneakers") == "footwear"
 
 
 def test_plan_declines_when_the_tenant_switched_generation_off(pol):

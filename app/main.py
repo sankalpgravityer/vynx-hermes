@@ -7,26 +7,30 @@ import hmac
 import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import (
+    BackgroundTasks, FastAPI, File, Form, Header, HTTPException, Request,
+    UploadFile,
+)
 from pydantic import BaseModel, Field
 
 from app.config import policy, reload_policy, settings
-from app.imaging import background, nanobanana, openai_image
+from app.imaging import background, legibility, nanobanana, openai_image
 from app.models import (
     BackgroundCheck, BackgroundVerdict, Finding, ImageryGenerateResponse,
-    ImagerySettings, ImageryVerdict, ProductSnapshot, ProductVerdict,
-    ReconcileResult, ReconcileStatus, ReviewQueueResponse, Severity,
-    SourceImage,
+    ImagerySettings, ImageryVerdict, LegibilityVerdict, ProductSnapshot,
+    ProductVerdict, ReconcileResult, ReconcileStatus, ReviewQueueResponse,
+    Severity, SourceImage,
 )
 from app.pipeline import reconcile
 from app.rules import REGISTRY, run_all
 from app.rules import imagery as imagery_rules
 from app.rules.pricing import assess
 from app.vnyx_client import VnyxClient, to_snapshot
-from app import agent_cli
+from app import agent_cli, approval
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -44,9 +48,32 @@ verifier_log = logging.getLogger("model-image-verifier")
 # be answered by looking.
 generator_log = logging.getLogger("model-image-generator")
 
+# And one for the readability checker, for the same reason both of the above have
+# their own: it runs at shutter press many times per product, and "why was this
+# frame rejected, and did we make the budget" has to be answerable from the log
+# rather than by reproducing an operator's photograph.
+readability_log = logging.getLogger("text-readability")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Pay the OCR graph-build cost at boot, not on the first shutter press.
+
+    ONNX Runtime compiles its execution graph on the first inference — measured at
+    611ms against ~150ms of steady-state overhead. /v1/readability is a latency
+    budget end to end, so that cost cannot be allowed to land on a request.
+
+    Deliberately non-fatal. `warm_up` swallows its own failures and logs them, so
+    a deployment without the OCR wheel still boots and serves the rest of Hermes;
+    the endpoint reports the problem per request, with an install hint.
+    """
+    legibility.warm_up(policy().get("readability") or {})
+    yield
+
+
 app = FastAPI(title="Hermes", version="1.0.0",
               description="Deterministic verification agent for AI-generated "
-                          "product records.")
+                          "product records.",
+              lifespan=lifespan)
 
 _vnyx: VnyxClient | None = None
 
@@ -160,6 +187,14 @@ def healthz() -> dict[str, Any]:
             "fallback_models": gen.get("fallback_models") or [],
             "openai_fallback": bool(gen.get("openai_fallback"))
             and openai_image.available(),
+        },
+        # Reported so a deployment can see BEFORE the first shutter press whether
+        # /v1/readability will answer or 503 — the OCR wheel and its native
+        # runtime are the one dependency of this service that fails at import
+        # rather than at call time.
+        "readability": {
+            "ocr_available": legibility.available(),
+            "working_px": (policy().get("readability") or {}).get("working_px"),
         },
     }
 
@@ -458,6 +493,71 @@ def review_queue(req: ReviewQueueRequest) -> ReviewQueueResponse:
         checked=len(verdicts),
         incorrect=sum(1 for v in verdicts if not v.correct),
         duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Approval gate — verify, repair, re-verify
+# --------------------------------------------------------------------------- #
+
+class ApprovalGateRequest(BaseModel):
+    """One product, asked whether it may be approved.
+
+    Same contract as /v1/review-queue: everything needed is in the body, Hermes
+    makes no callback, holds no credentials, and cannot reach a product the
+    caller was not already authorised to read.
+
+    It differs from the review queue in what it RETURNS, not in what it touches —
+    a typed repair plan carrying the computed value for each fixable finding. The
+    caller executes it, because every write it names lands on an invariant
+    vnyx-api owns: the `properties` merge, the ProductVariant price mirror,
+    recordStageTransition, and the ProductMedia gallery rules.
+    """
+
+    # The feed record, as GET /review-verification/feed serves it, with `media`
+    # and `careLabelCount` attached by the caller.
+    product: dict[str, Any] = Field(default_factory=dict)
+    media: list[dict[str, Any]] = Field(default_factory=list)
+    # This product's TENANT option lists. Load-bearing: the taxonomy, sizing and
+    # catalog rules validate against these, and the size-chart repair reads the
+    # tenant's existing charts from here before proposing a new one.
+    catalog: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] | None = None
+    # Off by default. The rule engine is deterministic and free; the evidence
+    # layer costs a model call per record that asks for one.
+    use_llm: bool = False
+    # The tenant's `duplicateProductOnBothGenders`.
+    #
+    # Decides who owns an unresolved gender. ON means split-gender.worker will
+    # narrow this row AND create the copy for the other gender, so the gate must
+    # not pre-empt it — narrowing first makes that worker's both-gender guard
+    # skip the second product entirely. OFF means there is no split to protect
+    # and the gate derives the gender from the master category, which is the same
+    # answer analyze.worker's inline narrowing reaches.
+    split_on_both_genders: bool = False
+
+
+@app.post("/v1/approval-gate")
+def approval_gate(req: ApprovalGateRequest) -> dict[str, Any]:
+    """Is this product fit to leave Review, and how would each blocker be fixed?
+
+    Runs the full rule set plus the gate-only rules (rules/gate.py) and returns
+    `ready` plus a repair plan. Writes nothing.
+
+    Call it AGAIN after executing the plan for the post-repair verdict. That
+    second answer is the one to approve on: a repair can fail silently, and a
+    gate that trusted its own plan would approve products whose fixes never
+    landed.
+    """
+    raw = {**req.product, "media": req.media or req.product.get("media") or []}
+    tenant_id = str(raw.get("tenantId") or raw.get("tenant_id") or "")
+
+    return approval.run_gate(
+        raw,
+        catalog=req.catalog.get(tenant_id) or req.catalog or None,
+        imagery_settings=req.settings,
+        llm=make_llm() if req.use_llm else None,
+        split_on_both_genders=req.split_on_both_genders,
     )
 
 
@@ -911,3 +1011,111 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
             "generatedWith": used,
         } if any(v.ok for v in views) else None),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Readability — can the text in this photograph be read?
+#
+# The odd one out in this service, and worth saying why it lives here anyway.
+# Every other endpoint judges a product RECORD; this judges one uploaded frame
+# and knows nothing about a product. What it shares is the thing that defines
+# Hermes: a deterministic verdict with a stated reason, no model call, and no
+# write-back. It is a verifier, of pixels instead of columns.
+#
+# It is also the only endpoint with a hard latency budget. It fires at shutter
+# press on a warehouse phone, so ~1.5s covers the upload, the answer and the
+# operator's retake decision. That is what shapes every choice in
+# app/imaging/legibility.py.
+# --------------------------------------------------------------------------- #
+
+@app.post("/v1/readability", response_model=LegibilityVerdict)
+def readability(
+    image: UploadFile = File(
+        ...,
+        description="The photograph, as multipart/form-data. JPEG or PNG.",
+    ),
+    min_lines: int | None = Form(
+        default=None,
+        description=(
+            "How many legible lines this frame must contain. Overrides the policy "
+            "default. Raise it when the client knows what it is photographing — a "
+            "care label has six lines, a size tag has two."
+        ),
+    ),
+    min_chars: int | None = Form(
+        default=None,
+        description="How many legible characters this frame must contain.",
+    ),
+) -> LegibilityVerdict:
+    """Is the text in this image readable, and if not, what should be fixed?
+
+    `readable` and `message` are the whole contract for a simple client: keep the
+    frame, or show the message and ask for another. Everything else on the
+    response is the evidence behind that, including the text itself — a caller
+    that has already paid the upload usually wants it, and a second round trip to
+    fetch it would cost another budget's worth of time.
+
+    MULTIPART, NOT BASE64 IN JSON, and not a URL. Base64 inflates the payload by
+    a third for nothing, and upload is the largest line item in the budget on a
+    mobile connection. A URL would mean Hermes fetching the bytes itself, adding a
+    second network hop to a request that has no room for one.
+
+    `def`, not `async def`: FastAPI runs a sync handler in its threadpool, so the
+    CPU-bound inference stays off the event loop without this file having to
+    manage an executor. Concurrent calls serialise inside the imaging layer — see
+    the lock there for why that is deliberate rather than a limitation.
+    """
+    cfg = policy().get("readability") or {}
+
+    data = image.file.read()
+    if not data:
+        raise HTTPException(400, "Empty upload.")
+
+    # Checked after reading rather than from a Content-Length header, which a
+    # client controls and can lie about. Read cost is bounded by the server's own
+    # request-size limits well before this.
+    cap_mb = float(cfg.get("max_upload_mb") or 12)
+    if len(data) > cap_mb * 1024 * 1024:
+        raise HTTPException(
+            413,
+            f"Image is {len(data) / 1024 / 1024:.1f}MB; the cap is {cap_mb:.0f}MB. "
+            "Resize on the device before uploading — 1280-1600px on the long edge "
+            "at quality 80 is about 200KB, reads the same, and is the difference "
+            "between fitting the latency budget and not.",
+        )
+
+    try:
+        verdict = legibility.assess(
+            data, cfg, min_lines=min_lines, min_chars=min_chars
+        )
+    except legibility.OcrUnavailable as exc:
+        # 503, not 500: the request is well-formed and the service is simply not
+        # in a position to serve it. Same distinction /v1/imagery/generate draws
+        # for a missing generation key.
+        raise HTTPException(503, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    # One line per call, whichever way it goes — the same reasoning as the imagery
+    # verifier's log. A checker that only speaks up on failure cannot be told
+    # apart from a checker that is not running, and here it also carries the
+    # latency split, which is the number a deployment has to watch.
+    readability_log.info(
+        "%s conf=%.3f lines=%d/%d chars=%d | %dx%d->%dx%d sharp=%.0f "
+        "bright=%.0f | decode=%dms ocr=%dms total=%dms%s",
+        "READABLE" if verdict.readable else "REJECTED",
+        verdict.confidence,
+        verdict.line_count,
+        verdict.detected_count,
+        verdict.char_count,
+        verdict.frame.width, verdict.frame.height,
+        verdict.frame.working_width, verdict.frame.working_height,
+        verdict.frame.sharpness,
+        verdict.frame.brightness,
+        verdict.decode_ms,
+        verdict.ocr_ms,
+        verdict.duration_ms,
+        f" | {','.join(r.value for r in verdict.reasons)}"
+        if verdict.reasons else "",
+    )
+    return verdict
