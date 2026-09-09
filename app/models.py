@@ -251,6 +251,18 @@ class ProductSnapshot(BaseModel):
     # silent rather than reporting a product with pictures as having none.
     media: list[MediaAsset] = Field(default_factory=list)
 
+    # How many care-label photographs are on file (`Product.careLabelImages`).
+    #
+    # A COUNT, not the urls: the only question asked of it is "is there one", and
+    # the label images are not part of the gallery the imagery rules reason about.
+    #
+    # None means the caller did not send the field, which is NOT the same as zero —
+    # IMG.030 stays silent on None, because a raw webhook payload mentions no
+    # labels and reporting every such product as unlabelled would make the rule
+    # useless. vnyx-api's review feed has always sent this; nothing read it until
+    # the approval gate.
+    care_label_count: int | None = None
+
     # The generation pipeline's own view of this product.
     #
     # IDLE | GENERATING | COMPLETE | FAILED. Reported, never trusted: on the
@@ -274,6 +286,34 @@ class ProductSnapshot(BaseModel):
     # webhook payload, or a hand-written fixture), in which case the rules fall
     # back to policy.yaml and say so.
     catalog: TenantCatalog | None = None
+
+    @property
+    def care_label_urls(self) -> list[str]:
+        """The care-label photographs, from the typed media rows.
+
+        THE AUTHORITY for brand, material and size, and the reason this exists
+        separately from `images`: that list is the garment gallery, and the
+        evidence layer was only ever shown those. So the model was asked "what
+        brand is this?" while looking at a photograph of a t-shirt — the one
+        place the answer is written was never sent, and the prompt's own escape
+        hatch ("if a brand label is not legible, say uncertain") fired every
+        time.
+
+        vnyx-api's backfill-product-data.ts states the other half of it: reading
+        the garment rather than the label "produced hallucinated brands and a
+        leather jacket recorded as Knit". So these are passed FIRST, and labelled
+        as labels, rather than mixed into the gallery.
+
+        Derived rather than stored: the caller already sends the ProductMedia
+        rows, so there is nothing extra to plumb through the feed.
+        """
+        return [
+            m.url for m in self.media
+            if (m.view or "").upper() == "LABEL"
+            and m.is_current
+            and not m.deleted_at
+            and m.url
+        ]
 
     def prov(self, field: str) -> Provenance:
         if field in self.locked_fields:

@@ -61,7 +61,18 @@ def resolve_pricing(p: ProductSnapshot, findings: list[Finding],
       3. Snap to the grade's target multiplier and a charm ending.
     """
     ids = {f.rule_id for f in findings}
-    RATIO_RULES = {"PRICE.001", "PRICE.002", "PRICE.020", "PRICE.010"}
+    # PRICE.003 (too LOW) belongs here as much as PRICE.002 (too high).
+    #
+    # It was missing, and the early return below then treated a too-low price as
+    # "no bad ratio to repair" — its own comment asserts the price "is inside its
+    # window", which is exactly what PRICE.003 says it is not. So an underpriced
+    # product was reported forever and never corrected, while an overpriced one
+    # was fixed on the first pass.
+    #
+    # The machinery downstream already handles the low side: `clamp` raises a
+    # price below `band["low"]`, and `direction = +1` rounds it inward rather
+    # than back out of the window. Only this set needed the entry.
+    RATIO_RULES = {"PRICE.001", "PRICE.002", "PRICE.003", "PRICE.020", "PRICE.010"}
 
     if not ids & RATIO_RULES:
         # No bad ratio to repair — but the cents may still need normalising, and
@@ -183,9 +194,17 @@ def resolve_pricing(p: ProductSnapshot, findings: list[Finding],
             else f"the retail anchor ({p.prov('retail_price').value}) has stronger "
                  f"provenance than the price ({p.prov('price').value})"
         )
+        # Report the rule that ACTUALLY fired. The old two-way ternary labelled
+        # every non-PRICE.001 correction "PRICE.002" (too high), so a too-low
+        # repair was filed against the wrong rule — which matters downstream,
+        # where callers decide what a write resolved by rule id.
+        fired = next(
+            (r for r in ("PRICE.001", "PRICE.003", "PRICE.002") if r in ids),
+            "PRICE.002",
+        )
         patches.append(_gate(Patch(
             field="price", old_value=price, new_value=new_price,
-            action=Action.APPLY, rule_id="PRICE.001" if "PRICE.001" in ids else "PRICE.002",
+            action=Action.APPLY, rule_id=fired,
             reason=(
                 f"Ratio was {ratio:.2f}; Grade {grade} allows "
                 f"{band['low']:.2f}–{band['high']:.2f} ({band['rule']}). "
@@ -256,13 +275,36 @@ def resolve_attributes(p: ProductSnapshot, findings: list[Finding],
             handled.add("grade")
 
         elif f.rule_id == "SIZE.002":
+            # `detail` differs by WHICH branch of check_sizing fired, and the two
+            # do not carry the same keys. The tenant-chart branch has no `waist`
+            # at all, so reading it unconditionally raised KeyError and took the
+            # whole resolver down — on the PRIMARY path, the one that uses the
+            # tenant's own chart. Nothing caught it until a caller ran the
+            # resolver over real feed data: /v1/review-queue never calls it, and
+            # /v1/reconcile is unwired.
+            basis = f.detail.get("basis")
+            tenant_chart = basis == "tenant_chart"
+            if tenant_chart:
+                source = f"the tenant's '{f.detail.get('sizing_guide')}' chart"
+            else:
+                waist = f.detail.get("waist")
+                source = (
+                    f"the generic W{waist} conversion table" if waist
+                    else "the generic conversion table"
+                )
             patches.append(_gate(Patch(
                 field="eu_size", old_value=p.eu_size,
                 new_value=str(f.detail["expected_eu"]), action=Action.APPLY,
                 rule_id=f.rule_id,
-                reason=f"EU size derived from W{f.detail['waist']} using the "
-                       "conversion table.",
-                confidence=0.95, provenance=Provenance.DERIVED,
+                reason=f"EU size derived from {source}.",
+                # The tenant's chart is authoritative; the policy table is a
+                # documented guess AT that chart, and the two disagree outright —
+                # it maps W28 to EU 40 where a real tenant's chart says 36. So a
+                # policy-derived value sits below `llm_apply_threshold` and _gate
+                # downgrades it to PROPOSE, which surfaces it for a human instead
+                # of writing a size that is probably wrong.
+                confidence=0.95 if tenant_chart else 0.80,
+                provenance=Provenance.DERIVED,
             ), pol, p))
             handled.add("eu_size")
 
@@ -284,14 +326,61 @@ def resolve_attributes(p: ProductSnapshot, findings: list[Finding],
             continue
         if not v.observed_value:
             continue
-        current = getattr(p, v.field, None)
-        if str(current).strip().lower() == str(v.observed_value).strip().lower():
+
+        observed = str(v.observed_value).strip()
+
+        # A PLACEHOLDER is the model declining to answer, not an answer.
+        #
+        # "Unknown" got written straight onto a product as its brand — the field
+        # went from a real (if wrong) value to the literal word Unknown, which is
+        # strictly worse and reads as a successful repair. `placeholders` is
+        # already the list check_completeness treats as absent, so trusting it
+        # here keeps one definition of "no value".
+        #
+        # vnyx-api's backfill-product-data.ts takes the same line from the other
+        # direction: it treats "the literal 'Unknown' the AI writes in place of
+        # an answer" as a hole to fill, never as content.
+        if observed.lower() in pol["confidence"]["placeholders"]:
             continue
+
+        # A value the tenant's own dropdown cannot offer is not selectable.
+        #
+        # The vision layer reads brands off garment prints — a tee printed with a
+        # film title came back as brand "Boyz N The Hood" — and writing that
+        # produces the blank-dropdown defect fix-subcategory-naming.ts describes:
+        # "the value is stored and is not wrong in spirit, it is simply not one
+        # of the options, so the control cannot select it and an operator reads
+        # the field as empty".
+        #
+        # PROPOSE rather than skip: the model may well have read the label
+        # correctly and the tenant may be missing a brand. That is worth a
+        # reviewer's attention, not silent discard.
+        catalog_fields = {"brand": "brands", "color": "colors",
+                          "material": "materials"}
+        off_catalog = False
+        if v.field in catalog_fields and p.catalog:
+            allowed = getattr(p.catalog, catalog_fields[v.field], None) or []
+            if allowed and observed.lower() not in {
+                str(a).strip().lower() for a in allowed
+            }:
+                off_catalog = True
+
+        current = getattr(p, v.field, None)
+        if str(current).strip().lower() == observed.lower():
+            continue
+        confident = v.confidence >= pol["confidence"]["llm_apply_threshold"]
         patches.append(_gate(Patch(
             field=v.field, old_value=current, new_value=v.observed_value,
-            action=Action.APPLY if v.confidence >= pol["confidence"]["llm_apply_threshold"]
-            else Action.PROPOSE,
-            rule_id="LLM.001", reason=v.evidence,
+            action=(
+                Action.APPLY if confident and not off_catalog
+                else Action.PROPOSE
+            ),
+            rule_id="LLM.001",
+            reason=(
+                f"{v.evidence} (NOT in this tenant's {v.field} list — add it "
+                f"there first, or correct the reading)"
+                if off_catalog else v.evidence
+            ),
             confidence=v.confidence, provenance=Provenance.AI,
         ), pol, p))
         handled.add(v.field)

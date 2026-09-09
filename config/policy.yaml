@@ -149,6 +149,48 @@ mannequin_map:
 
 sizing:
   eu_tolerance: 1
+
+  # Which half of the body a category and a guide name refer to.
+  #
+  # SIZE.014 compares the two: a Women > T-Shirts & Polos product sitting on
+  # "Women Bottoms" agrees on gender perfectly, so nothing else catches it, and
+  # the ladder test cannot either when a tenant's bottoms guide happens to list
+  # letter sizes rather than waist numbers.
+  #
+  # Substring tokens, matched lowercase, so real tenant names resolve without an
+  # exhaustive list: "T-Shirts & Polos" hits `shirt`, "Sweaters & Hoodies" hits
+  # `sweater`, "Women Bottoms" hits `bottom`. A category or guide matching
+  # NEITHER list resolves to no side and the rule stays silent — this decides
+  # nothing on a guess. Extend rather than replace when a tenant adds a branch.
+  sides:
+    bottom:
+      - bottom
+      - trouser
+      - jean
+      - pant
+      - short
+      - skirt
+      - legging
+      - chino
+      - denim bottom
+    upper:
+      - upper
+      - top
+      - shirt
+      - tee
+      - t-shirt
+      - polo
+      - sweater
+      - hoodie
+      - jumper
+      - knit
+      - jacket
+      - coat
+      - vest
+      - blazer
+      - dress   # a dress is sized on the upper ladder, not the waist one
+      - outerwear
+      - sweatshirt
   men_bottoms_waist_in_to_eu:
     28: 44
     29: 45

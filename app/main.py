@@ -30,7 +30,7 @@ from app.rules import REGISTRY, run_all
 from app.rules import imagery as imagery_rules
 from app.rules.pricing import assess
 from app.vnyx_client import VnyxClient, to_snapshot
-from app import agent_cli
+from app import agent_cli, approval
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -493,6 +493,71 @@ def review_queue(req: ReviewQueueRequest) -> ReviewQueueResponse:
         checked=len(verdicts),
         incorrect=sum(1 for v in verdicts if not v.correct),
         duration_ms=int((time.perf_counter() - started) * 1000),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Approval gate — verify, repair, re-verify
+# --------------------------------------------------------------------------- #
+
+class ApprovalGateRequest(BaseModel):
+    """One product, asked whether it may be approved.
+
+    Same contract as /v1/review-queue: everything needed is in the body, Hermes
+    makes no callback, holds no credentials, and cannot reach a product the
+    caller was not already authorised to read.
+
+    It differs from the review queue in what it RETURNS, not in what it touches —
+    a typed repair plan carrying the computed value for each fixable finding. The
+    caller executes it, because every write it names lands on an invariant
+    vnyx-api owns: the `properties` merge, the ProductVariant price mirror,
+    recordStageTransition, and the ProductMedia gallery rules.
+    """
+
+    # The feed record, as GET /review-verification/feed serves it, with `media`
+    # and `careLabelCount` attached by the caller.
+    product: dict[str, Any] = Field(default_factory=dict)
+    media: list[dict[str, Any]] = Field(default_factory=list)
+    # This product's TENANT option lists. Load-bearing: the taxonomy, sizing and
+    # catalog rules validate against these, and the size-chart repair reads the
+    # tenant's existing charts from here before proposing a new one.
+    catalog: dict[str, Any] = Field(default_factory=dict)
+    settings: dict[str, Any] | None = None
+    # Off by default. The rule engine is deterministic and free; the evidence
+    # layer costs a model call per record that asks for one.
+    use_llm: bool = False
+    # The tenant's `duplicateProductOnBothGenders`.
+    #
+    # Decides who owns an unresolved gender. ON means split-gender.worker will
+    # narrow this row AND create the copy for the other gender, so the gate must
+    # not pre-empt it — narrowing first makes that worker's both-gender guard
+    # skip the second product entirely. OFF means there is no split to protect
+    # and the gate derives the gender from the master category, which is the same
+    # answer analyze.worker's inline narrowing reaches.
+    split_on_both_genders: bool = False
+
+
+@app.post("/v1/approval-gate")
+def approval_gate(req: ApprovalGateRequest) -> dict[str, Any]:
+    """Is this product fit to leave Review, and how would each blocker be fixed?
+
+    Runs the full rule set plus the gate-only rules (rules/gate.py) and returns
+    `ready` plus a repair plan. Writes nothing.
+
+    Call it AGAIN after executing the plan for the post-repair verdict. That
+    second answer is the one to approve on: a repair can fail silently, and a
+    gate that trusted its own plan would approve products whose fixes never
+    landed.
+    """
+    raw = {**req.product, "media": req.media or req.product.get("media") or []}
+    tenant_id = str(raw.get("tenantId") or raw.get("tenant_id") or "")
+
+    return approval.run_gate(
+        raw,
+        catalog=req.catalog.get(tenant_id) or req.catalog or None,
+        imagery_settings=req.settings,
+        llm=make_llm() if req.use_llm else None,
+        split_on_both_genders=req.split_on_both_genders,
     )
 
 

@@ -58,7 +58,11 @@ def gather_evidence(p: ProductSnapshot, findings: list[Finding],
 
     visual_fields = {"brand", "color", "material", "fit", "defects", "grade",
                      "subcategory", "category"}
-    if p.images and (fields_touched & visual_fields):
+    # `care_label_urls` counts too. A product whose gallery is empty but whose
+    # care label was photographed is exactly the case worth asking about — the
+    # label carries brand, material and size — and gating on `p.images` alone
+    # skipped it silently.
+    if (p.images or p.care_label_urls) and (fields_touched & visual_fields):
         ev.vision = llm.audit_images(p, _claims(p))
 
     if p.description and ({"description", "title"} & fields_touched or ids & {"TEXT.004"}):
@@ -140,10 +144,17 @@ def reconcile(p: ProductSnapshot, *, apply: bool = False,
     applied: list[str] = []
     if apply and auto and not settings().dry_run and writer is not None:
         payload = {pt.field: pt.new_value for pt in auto}
-        if writer.patch_product(p.id, payload, tenant_id=p.tenant_id):
-            applied = list(payload)
-        else:
-            notes.append("Write-back to VNYX failed; patches are unapplied.")
+        # The RETURN VALUE, not `payload`: patch_product now splits the write
+        # across two endpoints (columns via PUT, `properties` via PATCH) which
+        # fail independently, so it reports which fields actually landed. Taking
+        # `payload` here would claim a price AND a size write when only the price
+        # went through.
+        applied = writer.patch_product(p.id, payload, tenant_id=p.tenant_id)
+        if len(applied) < len(payload):
+            missed = sorted(set(payload) - set(applied))
+            notes.append(
+                f"Write-back to VNYX did not apply: {', '.join(missed)}."
+            )
             status = ReconcileStatus.NEEDS_REVIEW
 
     return ReconcileResult(
