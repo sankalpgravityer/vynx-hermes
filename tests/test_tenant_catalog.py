@@ -142,9 +142,18 @@ def test_the_real_levis_record_is_clean_under_every_rule_group():
 
 def test_a_mens_tshirt_is_valid_against_the_tenant_tree():
     """`Men > T-Shirts & Polos > T-Shirts` is real. policy.yaml has no such
-    category, so validating against it would flag every top in the catalog."""
+    category, so validating against it would flag every top in the catalog.
+
+    `mannequinType` is overridden along with the category. BASE is the Levi's
+    JEANS record and carries "Men Bottom"; turning it into a t-shirt without
+    also changing the rig leaves a bottom mannequin on an upper garment, which
+    TAX.005 now correctly reports. The old TAX.005 could not see it — its
+    `mannequin_map` has no key for `Men|T-Shirts & Polos` — so the fixture was
+    quietly self-contradictory and the test passed anyway.
+    """
     p = snap(category="T-Shirts & Polos", subCategory="T-Shirts",
-             sizingGuide="Men Uppers", size="L", euSize="50", waist=None)
+             sizingGuide="Men Uppers", size="L", euSize="50", waist=None,
+             mannequinType="Men Top")
     assert [f.rule_id for f in check_taxonomy(p, POL)] == []
 
 

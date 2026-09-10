@@ -46,6 +46,7 @@ would approve products whose fixes never landed.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -96,6 +97,11 @@ _COLUMN_KEYS = {
     "sizing_guide": "sizingGuide",
     "mannequin": "mannequinType",
     "description": "summary",
+    # `internationalSize` is a real column as well as a `properties` key, and
+    # DRIFT.001 can plan a write to either side. Without this entry _apply_plan
+    # cannot map the storage name back onto the snapshot, so the shadow re-run
+    # sees the un-repaired value.
+    "international_size": "internationalSize",
 }
 
 # The imagery rules that mean "renders are missing", as opposed to the ones about
@@ -123,6 +129,28 @@ def _all_findings(p: ProductSnapshot, pol: dict[str, Any], *,
 # --------------------------------------------------------------------------- #
 # Plan building
 # --------------------------------------------------------------------------- #
+
+def _apply_plan(p: ProductSnapshot,
+                plan: list[dict[str, Any]]) -> ProductSnapshot:
+    """The product as it WOULD be once the plan is executed.
+
+    Only the field writes — a created chart or a generated render changes nothing
+    the attribute rules read. Storage keys are mapped back to snapshot field names
+    so a `set_column subCategory` lands on `subcategory`.
+    """
+    reverse = {v: k for k, v in _COLUMN_KEYS.items()}
+    updates: dict[str, Any] = {}
+    for a in plan:
+        if a["kind"] not in ("set_column", "set_property"):
+            continue
+        field = a.get("field")
+        if not field:
+            continue
+        name = reverse.get(field, field)
+        if hasattr(p, name):
+            updates[name] = a.get("value")
+    return p.model_copy(update=updates) if updates else p
+
 
 def _plan_size_chart(p: ProductSnapshot, pol: dict[str, Any],
                      findings: list[Finding],
@@ -303,35 +331,293 @@ def _plan_gender(p: ProductSnapshot, findings: list[Finding],
     })
 
 
+def _singular(text: str) -> str:
+    """Letters and digits only, with a trailing plural 's' dropped.
+
+    Enough to match "Leather Jackets" to a tree entry of "Leather Jacket", which
+    is the shape this disagreement actually takes: the extractor writes the
+    plural a shopper would type and the tenant configured the singular. Not a
+    stemmer — anything cleverer starts matching things that are genuinely
+    different, and a wrong subcategory is worse than an escalated one.
+    """
+    flat = "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+    return flat[:-1] if flat.endswith("s") and len(flat) > 3 else flat
+
+
 def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
                       plan: list[dict[str, Any]]) -> None:
-    """Fill in subCategory when the tenant's tree leaves exactly one option.
+    """Settle subCategory against the tenant's tree — absent, or not in it.
 
-    Deterministic and free, so it runs before the evidence layer is asked. When
-    the tree offers several the vision audit may still resolve it (subcategory is
-    in `visual_fields`), and when it offers none this escalates.
+    Two faults, one repair surface:
+
+      DATA.010  no subcategory at all. Fillable only when the tree leaves exactly
+                one option.
+      TAX.003   a subcategory that is not on this branch. The dropdown renders
+                BLANK for these — the value is stored, it is simply not offered —
+                so it reads to an operator as missing while being non-null in the
+                database. Repairable when the stored value matches exactly one
+                tree entry once case, punctuation and a trailing plural are
+                ignored.
+
+    Deterministic and free, so both run before the evidence layer is asked.
     """
-    absent = any(
-        f.rule_id == "DATA.010" and "subcategory" in f.fields for f in findings
-    )
-    if not absent or not p.catalog:
+    if not p.catalog:
         return
 
     subs = ((p.catalog.categories or {}).get(p.master_category or "") or {}).get(
         p.category or ""
     ) or []
-    if len(subs) == 1:
+    if not subs:
+        return
+
+    absent = any(
+        f.rule_id == "DATA.010" and "subcategory" in f.fields for f in findings
+    )
+    if absent:
+        if len(subs) == 1:
+            plan.append({
+                "kind": "set_column", "field": "subCategory", "value": subs[0],
+                "reason": "DATA.010",
+                "detail": (
+                    f"the only subcategory the tenant lists under "
+                    f"'{p.master_category} > {p.category}'"
+                ),
+            })
+            return
+
+        # THE TITLE, when it names exactly one of the branch's own options.
+        #
+        # "Relaxed Sweatshirt in Black size M" under Women > Sweaters & Hoodies,
+        # whose branch offers Sweatshirts / Fleece Pullover / Hoodies / Sweaters:
+        # the title says which one. Matched WORD BY WORD against the tenant's
+        # entries rather than by substring, so "Sweatshirt" finds "Sweatshirts"
+        # and "Vest" cannot quietly match "Puffer Vests" — and only accepted
+        # when exactly one entry matches.
+        #
+        # This is not "pick something from the category". Measured on
+        # production, 28 products have a blank subcategory and their branches
+        # offer four to eleven options each; choosing one without evidence would
+        # be wrong most of the time and indistinguishable afterwards from a
+        # value somebody meant. The title is evidence. Where there is none, this
+        # stays silent — it recovers 1 of the 28, and the other 27 genuinely
+        # cannot be known from the record.
+        # TWO shapes of entry, matched differently on purpose.
+        #
+        # A one-word entry ("Sweatshirts") is matched against the title's WORDS,
+        # so a bare "Vest" in a title cannot pick one of four vest TYPES.
+        # A multi-word entry ("Leather Vests") can never equal a single word, so
+        # it is matched against the title with the spaces taken out —
+        # "leathervest" inside "vintagebrownleathervestwomen". That direction is
+        # safe where the reverse is not: the entry has to appear in the title,
+        # not the other way round, so "Puffer Vests" does not match a faux-fur
+        # one. Restricted to multi-word entries because a three-letter
+        # normalised token would start finding itself inside unrelated words.
+        words = {_singular(w) for w in re.findall(r"[A-Za-z]+", p.title or "")}
+        flat_title = _singular(p.title or "")
+        named = [
+            s for s in subs
+            if (_singular(s) in words
+                or (len(s.split()) > 1 and _singular(s) in flat_title))
+        ]
+        if len(named) == 1:
+            plan.append({
+                "kind": "set_column", "field": "subCategory", "value": named[0],
+                "reason": "DATA.010",
+                "detail": (f"the title names it, and '{named[0]}' is the only "
+                           f"option on this branch that it matches"),
+            })
+        # Several or none: left for the evidence layer or a human. No escalate
+        # entry here — _plan_escalations already names an unrepaired DATA.010
+        # field, and a second one would double-count it.
+        return
+
+    off_tree = any(
+        f.rule_id == "TAX.003" and "subcategory" in f.fields for f in findings
+    )
+    if not off_tree or not p.subcategory:
+        return
+
+    want = _singular(p.subcategory)
+    matches = [s for s in subs if _singular(s) == want]
+    # Exactly one, or nothing. Two tree entries that both normalise to the stored
+    # value means the tenant configured a distinction this cannot see, and
+    # picking either would be a guess.
+    if len(matches) == 1 and matches[0] != p.subcategory:
         plan.append({
-            "kind": "set_column", "field": "subCategory", "value": subs[0],
-            "reason": "DATA.010",
+            "kind": "set_column", "field": "subCategory", "value": matches[0],
+            "reason": "TAX.003",
             "detail": (
-                f"the only subcategory the tenant lists under "
-                f"'{p.master_category} > {p.category}'"
+                f"'{p.subcategory}' is stored but not offered under "
+                f"'{p.master_category} > {p.category}', so the dropdown renders "
+                f"blank. The tenant's tree spells it '{matches[0]}'."
             ),
         })
-    # Several or none: left for the evidence layer or a human. No escalate entry
-    # here — _plan_escalations already names an unrepaired DATA.010 field, and a
-    # second one would double-count it.
+        return
+
+    # NOT A DATA PROBLEM — a missing option. Named explicitly because the fix
+    # lives somewhere else entirely and a bare "needs a human" sends the wrong
+    # person at it.
+    #
+    # Ten women's blazers on production sit under Women > Jackets with
+    # subCategory "Blazers", and every tenant's tree carries "Blazers" under
+    # MEN > Jackets and under no Women branch at all. Those products are
+    # correctly labelled; the option does not exist for them to point at. No
+    # per-product edit can fix that, and substituting "Sports Jackets" would
+    # write a garment type nobody chose.
+    other_branches = sorted({
+        f"{master} > {cat}"
+        for master, branch in (p.catalog.categories or {}).items()
+        for cat, options in (branch or {}).items()
+        if any(_singular(o) == want for o in options or [])
+    })
+    plan.append({
+        "kind": "escalate", "field": "subCategory", "reason": "TAX.003",
+        "detail": (
+            f"'{p.subcategory}' is not offered under "
+            f"'{p.master_category} > {p.category}' in any spelling"
+            + (f" — the tenant lists it under {', '.join(other_branches)}. "
+               f"Either the master category is wrong, or a tenant admin has to "
+               f"add the option to this branch."
+               if other_branches else
+               f". The branch offers {subs}. A tenant admin has to add it, or a "
+               f"reviewer picks one of those.")
+        ),
+    })
+
+
+def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
+                  plan: list[dict[str, Any]]) -> None:
+    """Fill an absent EU size from the product's own sizing chart.
+
+    A LOOKUP, not a conversion. `ProductSize.euSizes` is index-aligned with
+    `sizes` — VNYX documents the alignment on the column — so this reads the
+    pair out of the same table the edit screen builds its dropdown from. No
+    generic table, no arithmetic, nothing guessed: if the tenant's Men Uppers
+    chart says S sits at index 2 and euSizes[2] is "46", the answer is 46.
+
+    Why it needed its own planner: SIZE.002 validates an EU size that is PRESENT
+    and wrong, and stays silent when there is none to validate. So a product
+    whose size arrived from the care-label pass had a size, a guide and a chart
+    that pairs them, and still reported `eu_size` absent forever — and the edit
+    screen shows "EU Size is required" in red underneath.
+
+    Runs after the size repairs for the obvious reason: the lookup key is the
+    size, and computing it from the old one would pair the new size with the old
+    EU number.
+    """
+    absent = any(
+        f.rule_id == "DATA.010" and "eu_size" in (f.fields or [])
+        for f in findings
+    )
+    if not absent or not p.catalog:
+        return
+
+    # `_apply_plan` has already folded any planned size into the snapshot for
+    # the residual pass, but on the first pass the snapshot still holds the
+    # pre-repair size — so a size this run is about to write is preferred.
+    planned_size = next(
+        (a.get("value") for a in plan
+         if a.get("field") in ("size", "international_size", "internationalSize")
+         and a["kind"] in ("set_property", "set_column")),
+        None,
+    )
+    for candidate in (planned_size, p.size, p.international_size):
+        if not candidate:
+            continue
+        eu = p.catalog.eu_for_size(p.sizing_guide, candidate)
+        if eu:
+            plan.append({
+                "kind": "set_property", "field": "eu_size", "value": eu,
+                "reason": "DATA.010",
+                "detail": (f"the '{p.sizing_guide}' chart pairs "
+                           f"{candidate!r} with EU {eu}"),
+            })
+            return
+
+
+def _plan_mannequin(findings: list[Finding],
+                    plan: list[dict[str, Any]]) -> None:
+    """TAX.005 — swap the rig for the one the taxonomy calls for.
+
+    Only the DERIVED form, which carries `suggested`: the policy-map form knows
+    a list of allowed names and not which of them is right, so it escalates.
+
+    Worth repairing rather than escalating because it is the single commonest
+    approval blocker on this catalog — 255 wrong-gender rigs in a 1,762-product
+    review queue — and the correct value is arithmetic over two facts the record
+    already holds, not a judgement about the garment. It also feeds forward: the
+    renderer picks the model from this and the master category, so a product
+    approved with a Women rig on a men's coat renders the wrong model.
+    """
+    for f in findings:
+        if f.rule_id != "TAX.005":
+            continue
+        suggested = f.detail.get("suggested")
+        if not suggested:
+            continue
+        plan.append({
+            "kind": "set_column", "field": "mannequinType", "value": suggested,
+            "reason": "TAX.005",
+            "detail": f'was {f.detail.get("mannequin")!r}',
+        })
+        return
+
+
+def _plan_column_drift(findings: list[Finding],
+                       plan: list[dict[str, Any]]) -> None:
+    """DRIFT.001 — copy the real value over the empty one.
+
+    Only the HIGH form, where one side is a placeholder. The rule sets
+    `repair_to` to None when both sides hold real values, because nothing here
+    can decide which is right — that falls through to _plan_escalations.
+
+    The direction matters and is decided by the rule, not here: `repair_side`
+    names which copy is empty, so a column-side repair writes the column and a
+    properties-side repair writes the key. Writing both would be tempting and
+    wrong — it would silently pick a winner in the MEDIUM case too.
+
+    YIELDS TO ANY REPAIR ALREADY PLANNED FOR THE SAME VALUE. Runs after
+    _plan_subcategory and _plan_guide_switch, both of which decide the same
+    fields from the tenant's own tree — strictly better information than "the two
+    copies differ". On a real product the column held 'T-Shirt' and the tree
+    spells it 'T-Shirts': TAX.003 planned the column to 'T-Shirts', then this
+    planned the property to 'T-Shirt' from the PRE-repair column, and because the
+    executor mirrors both sides and applies in order, the drift entry landed last
+    and undid the taxonomy fix. Skipping is safe as well as correct — the earlier
+    repair writes both copies, which is what closes the drift.
+    """
+    def flat(s: Any) -> str:
+        return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
+
+    claimed = {flat(a.get("field")) for a in plan if a.get("field")}
+
+    for f in findings:
+        if f.rule_id != "DRIFT.001":
+            continue
+        value = f.detail.get("repair_to")
+        if value is None:
+            continue
+        if flat(f.detail.get("column")) in claimed or \
+                flat((f.fields or [None])[0]) in claimed:
+            continue
+        if f.detail.get("repair_side") == "column":
+            plan.append({
+                "kind": "set_column", "field": f.detail["column"],
+                "value": value, "reason": "DRIFT.001",
+                "detail": (
+                    f"the column holds a placeholder while "
+                    f"properties.{f.detail['property']} holds {value!r}"
+                ),
+            })
+        else:
+            plan.append({
+                "kind": "set_property", "field": (f.fields or [None])[0],
+                "value": value, "reason": "DRIFT.001",
+                "detail": (
+                    f"properties.{f.detail['property']} holds a placeholder "
+                    f"while the column holds {value!r}"
+                ),
+            })
 
 
 def _plan_fields(p: ProductSnapshot, pol: dict[str, Any],
@@ -599,6 +885,20 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
     )
     blocking = _blocking(findings)
 
+    # WHAT IS WRONG WITH THE PRODUCT AS STORED, kept for the report.
+    #
+    # `findings` below is deliberately rebound to a SHADOW product once a guide
+    # switch is planned, so the remaining fields are planned against the chart
+    # the product is about to be on rather than the one it is leaving. That is
+    # right for planning and wrong for reporting: the shadow no longer has the
+    # defect, so the finding that JUSTIFIED the repair disappears out of
+    # `field_issues` and `advisory` — while `blocking`, computed above, still
+    # carries it. A product came back with `sizingGuide -> Men Uppers` in the
+    # repair plan and no sizing-guide row anywhere in the issue list.
+    #
+    # Reported findings are the stored product's. The planner keeps its shadow.
+    reported = list(findings)
+
     plan: list[dict[str, Any]] = []
     # Built whenever ANY finding fired, not only a blocking one.
     #
@@ -640,7 +940,48 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
 
         _plan_gender(p, findings, plan)
         _plan_subcategory(p, findings, plan)
+        _plan_mannequin(findings, plan)
+        # Before _plan_fields, for the same reason the chart is: a drift repair
+        # settles WHICH copy of a value is authoritative, and a field repair
+        # planned first would be computed from the copy that is about to lose.
+        _plan_column_drift(findings, plan)
         _plan_fields(p, pol, findings, llm, plan)
+        # LAST of the field planners: its input is the size, which every planner
+        # above may have just changed.
+        _plan_eu_size(p, findings, plan)
+
+        # SETTLE THE PAIRED FIELDS.
+        #
+        # Several fields are only correct RELATIVE to another: euSize to size via
+        # the ladder, condition to grade via the grade label. Planning one pass
+        # against the original snapshot repaired one half and left the other
+        # describing the value it replaced — so a product that came in CLEAN went
+        # out with two blockers it did not arrive with:
+        #
+        #   pass 1  ready=YES blocking=[]        planned=4
+        #           wrote price, title, size, condition
+        #   pass 2  ready=NO  blocking=[SIZE.002, GRADE.001]
+        #
+        # Both new findings were consequences of the writes: a new `size` with the
+        # old `eu_size`, and a new `condition` against the unchanged grade label.
+        #
+        # So the plan is applied to a SHADOW and the rules re-run, exactly as
+        # pipeline.py does before it writes anything. A second round is enough —
+        # the dependents are one level deep — and bounding it is what stops a pair
+        # that disagrees in both directions from planning forever.
+        for _ in range(2):
+            shadow = _apply_plan(p, plan)
+            residual = _all_findings(
+                shadow, pol, split_on_both_genders=split_on_both_genders
+            )
+            new_blockers = [
+                f for f in _blocking(residual)
+                if f.rule_id not in {x.rule_id for x in blocking}
+            ]
+            if not new_blockers:
+                break
+            _plan_fields(shadow, pol, new_blockers, llm, plan)
+
         _plan_imagery(p, pol, findings, plan)
         _plan_escalations(findings, plan)
 
@@ -705,11 +1046,11 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
         # reviewer opening the modal is asking the second question. A missing
         # material is MEDIUM, so it sat collapsed behind an advisory disclosure
         # while the field itself read as empty on the form.
-        "field_issues": _field_issues(findings, plan),
+        "field_issues": _field_issues(reported, plan),
         # ---- the detail behind that answer ---------------------------------
         "ready": not blocking,
         "blocking": [f.model_dump(mode="json") for f in blocking],
-        "advisory": [f.model_dump(mode="json") for f in findings
+        "advisory": [f.model_dump(mode="json") for f in reported
                      if _RANK[f.severity] < _RANK[_BLOCKING_FLOOR]],
         "repair_plan": plan,
         # True when executing the plan should clear everything blocking. False
@@ -717,7 +1058,7 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
         # applies the free database writes, but defers a paid render rather than
         # spending it on a product a human has to touch anyway.
         "plan_covers_blockers": bool(blocking) and covered,
-        "findings": sorted({f.rule_id for f in findings}),
+        "findings": sorted({f.rule_id for f in reported}),
         "price": assess(p, pol).model_dump(mode="json"),
         "edit_url": p.edit_url,
         "duration_ms": int((time.perf_counter() - started) * 1000),

@@ -287,6 +287,30 @@ class ProductSnapshot(BaseModel):
     # back to policy.yaml and say so.
     catalog: TenantCatalog | None = None
 
+    # The RAW column values, before the properties map was consulted.
+    #
+    # Every other field on this snapshot is already resolved: `size` is whichever
+    # of the column and the `properties` copy won the precedence chain. That is
+    # right for judging the VALUE and wrong for judging the RECORD, because the
+    # two copies can hold different things and different consumers read different
+    # ones — the product export reads `Product.internationalSize`, the analyze
+    # worker writes `properties.international_size`, and nothing keeps them in
+    # step. A product whose column says "Unknown" and whose property says "S"
+    # looks correct through the resolved view and ships an unknown size.
+    #
+    # Only the pairs that genuinely exist in both places are carried; see
+    # COLUMN_PROPERTY_PAIRS in rules/gate.py. An empty dict means the caller did
+    # not supply them and the drift rules stay silent, which is the same contract
+    # `catalog` and `media` keep.
+    column_values: dict[str, Any] = Field(default_factory=dict)
+
+    # The `properties` Json map verbatim, unresolved — the other half of the pair
+    # above. Needed as the raw map rather than as resolved fields because the
+    # drift check asks about a SPECIFIC key ("is `international_size` set?"),
+    # which the alias chain deliberately hides by answering with whichever key
+    # won. Also empty by default, and equally silent when it is.
+    properties_raw: dict[str, Any] = Field(default_factory=dict)
+
     @property
     def care_label_urls(self) -> list[str]:
         """The care-label photographs, from the typed media rows.
