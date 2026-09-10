@@ -46,6 +46,7 @@ would approve products whose fixes never landed.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -382,6 +383,49 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
                     f"'{p.master_category} > {p.category}'"
                 ),
             })
+            return
+
+        # THE TITLE, when it names exactly one of the branch's own options.
+        #
+        # "Relaxed Sweatshirt in Black size M" under Women > Sweaters & Hoodies,
+        # whose branch offers Sweatshirts / Fleece Pullover / Hoodies / Sweaters:
+        # the title says which one. Matched WORD BY WORD against the tenant's
+        # entries rather than by substring, so "Sweatshirt" finds "Sweatshirts"
+        # and "Vest" cannot quietly match "Puffer Vests" — and only accepted
+        # when exactly one entry matches.
+        #
+        # This is not "pick something from the category". Measured on
+        # production, 28 products have a blank subcategory and their branches
+        # offer four to eleven options each; choosing one without evidence would
+        # be wrong most of the time and indistinguishable afterwards from a
+        # value somebody meant. The title is evidence. Where there is none, this
+        # stays silent — it recovers 1 of the 28, and the other 27 genuinely
+        # cannot be known from the record.
+        # TWO shapes of entry, matched differently on purpose.
+        #
+        # A one-word entry ("Sweatshirts") is matched against the title's WORDS,
+        # so a bare "Vest" in a title cannot pick one of four vest TYPES.
+        # A multi-word entry ("Leather Vests") can never equal a single word, so
+        # it is matched against the title with the spaces taken out —
+        # "leathervest" inside "vintagebrownleathervestwomen". That direction is
+        # safe where the reverse is not: the entry has to appear in the title,
+        # not the other way round, so "Puffer Vests" does not match a faux-fur
+        # one. Restricted to multi-word entries because a three-letter
+        # normalised token would start finding itself inside unrelated words.
+        words = {_singular(w) for w in re.findall(r"[A-Za-z]+", p.title or "")}
+        flat_title = _singular(p.title or "")
+        named = [
+            s for s in subs
+            if (_singular(s) in words
+                or (len(s.split()) > 1 and _singular(s) in flat_title))
+        ]
+        if len(named) == 1:
+            plan.append({
+                "kind": "set_column", "field": "subCategory", "value": named[0],
+                "reason": "DATA.010",
+                "detail": (f"the title names it, and '{named[0]}' is the only "
+                           f"option on this branch that it matches"),
+            })
         # Several or none: left for the evidence layer or a human. No escalate
         # entry here — _plan_escalations already names an unrepaired DATA.010
         # field, and a second one would double-count it.
@@ -408,6 +452,115 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
                 f"blank. The tenant's tree spells it '{matches[0]}'."
             ),
         })
+        return
+
+    # NOT A DATA PROBLEM — a missing option. Named explicitly because the fix
+    # lives somewhere else entirely and a bare "needs a human" sends the wrong
+    # person at it.
+    #
+    # Ten women's blazers on production sit under Women > Jackets with
+    # subCategory "Blazers", and every tenant's tree carries "Blazers" under
+    # MEN > Jackets and under no Women branch at all. Those products are
+    # correctly labelled; the option does not exist for them to point at. No
+    # per-product edit can fix that, and substituting "Sports Jackets" would
+    # write a garment type nobody chose.
+    other_branches = sorted({
+        f"{master} > {cat}"
+        for master, branch in (p.catalog.categories or {}).items()
+        for cat, options in (branch or {}).items()
+        if any(_singular(o) == want for o in options or [])
+    })
+    plan.append({
+        "kind": "escalate", "field": "subCategory", "reason": "TAX.003",
+        "detail": (
+            f"'{p.subcategory}' is not offered under "
+            f"'{p.master_category} > {p.category}' in any spelling"
+            + (f" — the tenant lists it under {', '.join(other_branches)}. "
+               f"Either the master category is wrong, or a tenant admin has to "
+               f"add the option to this branch."
+               if other_branches else
+               f". The branch offers {subs}. A tenant admin has to add it, or a "
+               f"reviewer picks one of those.")
+        ),
+    })
+
+
+def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
+                  plan: list[dict[str, Any]]) -> None:
+    """Fill an absent EU size from the product's own sizing chart.
+
+    A LOOKUP, not a conversion. `ProductSize.euSizes` is index-aligned with
+    `sizes` — VNYX documents the alignment on the column — so this reads the
+    pair out of the same table the edit screen builds its dropdown from. No
+    generic table, no arithmetic, nothing guessed: if the tenant's Men Uppers
+    chart says S sits at index 2 and euSizes[2] is "46", the answer is 46.
+
+    Why it needed its own planner: SIZE.002 validates an EU size that is PRESENT
+    and wrong, and stays silent when there is none to validate. So a product
+    whose size arrived from the care-label pass had a size, a guide and a chart
+    that pairs them, and still reported `eu_size` absent forever — and the edit
+    screen shows "EU Size is required" in red underneath.
+
+    Runs after the size repairs for the obvious reason: the lookup key is the
+    size, and computing it from the old one would pair the new size with the old
+    EU number.
+    """
+    absent = any(
+        f.rule_id == "DATA.010" and "eu_size" in (f.fields or [])
+        for f in findings
+    )
+    if not absent or not p.catalog:
+        return
+
+    # `_apply_plan` has already folded any planned size into the snapshot for
+    # the residual pass, but on the first pass the snapshot still holds the
+    # pre-repair size — so a size this run is about to write is preferred.
+    planned_size = next(
+        (a.get("value") for a in plan
+         if a.get("field") in ("size", "international_size", "internationalSize")
+         and a["kind"] in ("set_property", "set_column")),
+        None,
+    )
+    for candidate in (planned_size, p.size, p.international_size):
+        if not candidate:
+            continue
+        eu = p.catalog.eu_for_size(p.sizing_guide, candidate)
+        if eu:
+            plan.append({
+                "kind": "set_property", "field": "eu_size", "value": eu,
+                "reason": "DATA.010",
+                "detail": (f"the '{p.sizing_guide}' chart pairs "
+                           f"{candidate!r} with EU {eu}"),
+            })
+            return
+
+
+def _plan_mannequin(findings: list[Finding],
+                    plan: list[dict[str, Any]]) -> None:
+    """TAX.005 — swap the rig for the one the taxonomy calls for.
+
+    Only the DERIVED form, which carries `suggested`: the policy-map form knows
+    a list of allowed names and not which of them is right, so it escalates.
+
+    Worth repairing rather than escalating because it is the single commonest
+    approval blocker on this catalog — 255 wrong-gender rigs in a 1,762-product
+    review queue — and the correct value is arithmetic over two facts the record
+    already holds, not a judgement about the garment. It also feeds forward: the
+    renderer picks the model from this and the master category, so a product
+    approved with a Women rig on a men's coat renders the wrong model.
+    """
+    for f in findings:
+        if f.rule_id != "TAX.005":
+            continue
+        suggested = f.detail.get("suggested")
+        if not suggested:
+            continue
+        plan.append({
+            "kind": "set_column", "field": "mannequinType", "value": suggested,
+            "reason": "TAX.005",
+            "detail": f'was {f.detail.get("mannequin")!r}',
+        })
+        return
 
 
 def _plan_column_drift(findings: list[Finding],
@@ -787,11 +940,15 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
 
         _plan_gender(p, findings, plan)
         _plan_subcategory(p, findings, plan)
+        _plan_mannequin(findings, plan)
         # Before _plan_fields, for the same reason the chart is: a drift repair
         # settles WHICH copy of a value is authoritative, and a field repair
         # planned first would be computed from the copy that is about to lose.
         _plan_column_drift(findings, plan)
         _plan_fields(p, pol, findings, llm, plan)
+        # LAST of the field planners: its input is the size, which every planner
+        # above may have just changed.
+        _plan_eu_size(p, findings, plan)
 
         # SETTLE THE PAIRED FIELDS.
         #

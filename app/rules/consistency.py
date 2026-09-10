@@ -139,15 +139,77 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
 
     # Mannequin rig must match gender+category — this is the "Women Top on
     # men's jeans" defect.
+    #
+    # TWO PASSES, because the first one covers almost nothing.
+    #
+    # `mannequin_map` is keyed `{masterCategory}|{category}` and policy.yaml
+    # holds seven of them: Men|Tops, Men|Outerwear, Men|Bottoms, Women|Tops,
+    # Women|Outerwear, Women|Bottoms, Women|Dresses. A real tenant's categories
+    # are Jackets, Sweaters & Hoodies, T-Shirts & Polos, Shirts, Vests,
+    # Accessories, Footwear — of which only `Bottoms` is in that list. Measured
+    # on production: of 1,762 products in review, 300 have a category the map
+    # can key on at all. The other 83% were unjudged, and among them sat 255
+    # wrong-GENDER mannequins and 21 wrong-SIDE ones — every one of which blocks
+    # approval, because scripts/approve-products.ts checks this properly and
+    # Hermes was reporting the products clean.
+    #
+    # So the map stays as the exact-name check where a tenant does use those
+    # names, and the general case is derived the way approve-products.ts derives
+    # it: the mannequin's own name carries its gender and its side, and the
+    # product's taxonomy carries the side it needs. No category list required,
+    # so it works on any tenant's tree.
+    mannequin_flagged = False
     if p.mannequin and p.master_category and p.category:
         key = f"{p.master_category}|{p.category}"
         allowed = pol["mannequin_map"].get(key)
         if allowed and p.mannequin.strip() not in allowed:
+            mannequin_flagged = True
             out.append(Finding(
                 rule_id="TAX.005", severity=Severity.HIGH, fields=["mannequin"],
                 message=f"Mannequin '{p.mannequin}' is wrong for {key.replace('|', ' > ')}; "
                         f"expected one of {allowed}.",
-                detail={"allowed": allowed},
+                detail={"allowed": allowed, "basis": "policy_map"},
+            ))
+
+    if p.mannequin and not mannequin_flagged:
+        # Imported here rather than at module scope: gate.py is the approval-only
+        # rule set and importing it eagerly from the shared registry would invert
+        # the dependency the note at the top of that file describes.
+        from app.rules.gate import _side_of, resolve_gender
+
+        want_side = _side_of(p.subcategory, pol) or _side_of(p.category, pol)
+        have_side = _side_of(p.mannequin, pol)
+        rig_gender = resolve_gender(p.mannequin)
+        master_gender = resolve_gender(p.master_category)
+
+        problems: list[str] = []
+        if rig_gender and master_gender and rig_gender != master_gender:
+            problems.append(
+                f"it is a {rig_gender}'s rig on a {master_gender}'s product")
+        if want_side and have_side and want_side != have_side:
+            problems.append(
+                f"it is a {have_side}-body rig and "
+                f"'{p.subcategory or p.category}' is a {want_side}")
+
+        if problems:
+            # The corrected rig, when both halves can be named. "Men" + "upper"
+            # -> "Men Top", which is the spelling VNYX's MannequinType uses.
+            suggested = None
+            side = want_side or have_side
+            gender = master_gender or rig_gender
+            if side and gender:
+                suggested = f"{gender.capitalize()} " + (
+                    "Top" if side == "upper" else "Bottom")
+            out.append(Finding(
+                rule_id="TAX.005", severity=Severity.HIGH, fields=["mannequin"],
+                message=(f"Mannequin '{p.mannequin}' is wrong for "
+                         f"{p.master_category} > {p.category}: "
+                         + "; ".join(problems) + "."
+                         + (f" '{suggested}' is the match." if suggested else "")),
+                detail={"mannequin": p.mannequin, "suggested": suggested,
+                        "product_side": want_side, "rig_side": have_side,
+                        "product_gender": master_gender, "rig_gender": rig_gender,
+                        "basis": "derived"},
             ))
 
     # TAX.006 — the sizing guide must be one the tenant actually configured.

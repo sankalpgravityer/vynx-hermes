@@ -48,3 +48,16 @@ numpy>=2.0
 # takes the image. Base64 in JSON would add a third to the payload, and upload is
 # the largest item in that endpoint's latency budget.
 python-multipart==0.0.32
+
+# The Auto Approval Agent's worker and scheduler.
+#
+# The broker carries a TICK, never a product id — the queue itself is the
+# AutoApprovalRunProduct table, claimed with FOR UPDATE SKIP LOCKED. So Redis
+# holds no backlog and a flush loses nothing; see app/celery_app.py.
+celery[redis]==5.4.0
+redis==5.2.1
+
+# zoneinfo is stdlib on 3.9+, but Windows ships no system tz database, so
+# ZoneInfo("Europe/Amsterdam") raises without this. The schedule window is
+# local wall-clock arithmetic, so it is not optional on a Windows worker.
+tzdata==2025.2 ; sys_platform == "win32"

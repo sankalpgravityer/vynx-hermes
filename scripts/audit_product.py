@@ -33,7 +33,20 @@ from app.config import settings  # noqa: E402
 
 # ANSI, but only when stdout is a terminal — a redirect to a file should not
 # collect escape codes.
-_TTY = sys.stdout.isatty()
+#
+# Guarded, because a module-level read of sys.stdout is only safe when stdout is
+# a real stream. It is not under Celery (a LoggingProxy, which has neither
+# `.isatty` nor `.encoding`), under pytest's capture, or behind a StringIO — and
+# an AttributeError here fails the IMPORT, not the call. repair_product.py hit
+# exactly that once the Auto Approval worker started importing it.
+def _tty() -> bool:
+    try:
+        return bool(sys.stdout.isatty())
+    except (AttributeError, ValueError):  # pragma: no cover
+        return False
+
+
+_TTY = _tty()
 
 # A Windows console is cp1252 unless something has changed the code page, and
 # `print("──")` on one raises UnicodeEncodeError rather than degrading. Ask for
@@ -48,7 +61,7 @@ except (AttributeError, OSError):  # pragma: no cover - not a real stream
 
 def _encodable(sample: str) -> bool:
     try:
-        sample.encode(sys.stdout.encoding or "ascii")
+        sample.encode(getattr(sys.stdout, "encoding", None) or "ascii")
     except (UnicodeEncodeError, LookupError):
         return False
     return True

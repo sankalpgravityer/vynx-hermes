@@ -199,7 +199,26 @@ def connect(dsn: str, *, read_only: bool, statement_timeout_s: int = 60):
             "hermes-product-audit (read-only)" if read_only
             else "hermes-product-audit (apply)"
         ),
-        options=f"-c statement_timeout={int(statement_timeout_s) * 1000}",
+        # timezone=UTC, and it is load-bearing rather than tidy.
+        #
+        # Every timestamp column this codebase touches is `timestamp WITHOUT time
+        # zone`, written by two sides that disagreed about which clock to store:
+        # Prisma Client materialises `@default(now())` itself and sends a JS Date,
+        # which is always UTC, while `now()` from here resolves against the SESSION
+        # timezone -- local time on a developer box.
+        #
+        # Any interval spanning both writers is then wrong by the host's UTC
+        # offset. It showed up as single-product Auto Approval runs reporting
+        # "5h 34m" on an IST machine: startedAt (Prisma, UTC) subtracted from
+        # completedAt (here, local) is +5:30 of nothing.
+        #
+        # Passed as a connection OPTION, not `SET TIME ZONE`: plain SET is
+        # transactional, so a rolled-back transaction would silently restore the
+        # local clock and the skew would come back intermittently.
+        options=(
+            f"-c statement_timeout={int(statement_timeout_s) * 1000} "
+            f"-c timezone=UTC"
+        ),
     )
     conn.read_only = read_only
     return conn
