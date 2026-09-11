@@ -185,6 +185,7 @@ STEP_FOR_SCRIPT = {
     "relabel-ai-views.ts": "relabel",
     "backfill-product-data.ts": "extract",
     "verify-and-repair.ts": "reconcile",
+    "fix-selling-price.ts": "price",
     "backfill-imagery.ts": "render",
     "approve-products.ts": "approve",
 }
@@ -459,7 +460,9 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
 def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            infer: bool, min_confidence: int, skip_render: bool,
            approve: bool, skip_bin: bool,
-           quiet: bool, progress: str = "") -> dict[str, Any]:
+           quiet: bool, progress: str = "",
+           severity_overrides: dict[str, str] | None = None,
+           ) -> dict[str, Any]:
     started = time.perf_counter()
     state = needs(dsn, product_id)
     steps: list[dict[str, Any]] = []
@@ -719,6 +722,51 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     step("reconcile", "", _reconcile)
 
+    # ---- 3b. selling price ------------------------------------------------
+    #
+    # WHY THIS IS NOT PART OF reconcile. The gate computes a corrected price
+    # and puts it in the plan, but resolver._gate downgrades any numeric change
+    # over `pricing.auto_apply_max_delta_pct` (60%) from APPLY to PROPOSE, and
+    # verifyAndRepair executes no `propose` without `--authorize`. So the
+    # products whose price was MOST wrong were precisely the ones nothing
+    # touched: BOA-006108 sat at 356.99 against a 61.99 retail — a 93%
+    # correction — and blocked on PRICE.001 every single pass.
+    #
+    # Raising the threshold or passing --authorize would both defeat a guard
+    # that is right for a plan assembled from rules and evidence. This step is
+    # narrower than either: fix-selling-price.ts calls `verifySellingPrice`,
+    # the same function analyze and regrade use, and clamps to the nearest edge
+    # of the grade's own window. It guesses nothing, so the size of the change
+    # is not evidence that the change is risky.
+    #
+    # AFTER reconcile, deliberately. Reconcile can repair the grade and the
+    # retail anchor, and both are inputs to the window — running this first
+    # would clamp against numbers that are about to change.
+    #
+    # ALWAYS RUN in apply mode rather than gated on a price finding: the script
+    # is a no-op when the price is already inside the window, it costs no model
+    # call, and having it decide is what keeps Hermes from holding a second
+    # opinion about what a correct price is.
+    def _price() -> str:
+        ok, _, payload = run_step(vnyx_api, "fix-selling-price.ts",
+                                  [*common, *(["--apply"] if apply else [])],
+                                  timeout_s=120, quiet=quiet,
+                                  results_name="price.json")
+        if not ok:
+            raise StepFailed("fix-selling-price.ts returned non-zero")
+
+        rows = (payload or {}).get("results") or []
+        row = rows[0] if rows else None
+        if not row:
+            return "price already inside the window"
+        before, after = row.get("before"), row.get("after")
+        if after is None or before == after:
+            return "price already inside the window"
+        verb = "would set" if not apply else "set"
+        return f'{verb} {before} {ARROW} {after} ({row.get("reason") or "clamped"})'
+
+    step("price", "", _price)
+
     # ---- 4. render --------------------------------------------------------
     def _render() -> str:
         ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
@@ -767,7 +815,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # success and leave the field unwritten, and a report that trusted its own
     # steps would call the product finished.
     after = needs(dsn, product_id)
-    final = product_audit.audit(dsn, product_id, apply=False, write_sheet=False)
+    # The tenant's Brain overrides apply to the FINAL verdict too. Without them
+    # the chain would repair against a downgraded rule set and then be judged
+    # against the un-downgraded one, so a product the tenant had explicitly
+    # stopped blocking on would still come back held.
+    final = product_audit.audit(dsn, product_id, apply=False, write_sheet=False,
+                                severity_overrides=severity_overrides)
 
     return {
         "product_id": product_id,
@@ -1117,6 +1170,7 @@ def main() -> int:
         # file-not-found.
         required = ("backfill-bg-removal.ts", "relabel-ai-views.ts",
                     "backfill-product-data.ts", "verify-and-repair.ts",
+                    "fix-selling-price.ts",
                     "backfill-imagery.ts", "approve-products.ts")
         missing = [s for s in required
                    if not (vnyx_api / "scripts" / s).exists()]

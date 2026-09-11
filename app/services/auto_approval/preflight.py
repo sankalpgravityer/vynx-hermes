@@ -37,6 +37,10 @@ REQUIRED_SCRIPTS = (
     "relabel-ai-views.ts",
     "backfill-imagery.ts",
     "verify-and-repair.ts",
+    # The price clamp. Absent, the chain runs and silently leaves a price that
+    # violates PRICE.001 — the exact failure verify-and-repair.ts was added to
+    # close, one step further along.
+    "fix-selling-price.ts",
 )
 
 
