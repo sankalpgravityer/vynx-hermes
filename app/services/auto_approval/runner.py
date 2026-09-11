@@ -299,6 +299,9 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
             skip_render=rs.skip_render,
             approve=approve,
             skip_bin=rs.skip_bin_placement,
+            # Frozen in the run's configSnapshot, so a mid-run Brain edit cannot
+            # change how the products still queued are judged.
+            severity_overrides=rs.severity_overrides,
             quiet=True,
         )
     except product_audit.ProductNotFound:

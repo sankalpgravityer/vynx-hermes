@@ -113,16 +113,120 @@ def _blocking(findings: list[Finding]) -> list[Finding]:
     return [f for f in findings if _RANK[f.severity] >= _RANK[_BLOCKING_FLOOR]]
 
 
+_SEVERITY_BY_NAME: dict[str, Severity] = {s.value: s for s in Severity}
+
+# Values that mean "drop this finding entirely" rather than "re-rank it".
+_DROP_TOKENS = frozenset({"ignore", "off", "none", "skip", "false"})
+
+
+def apply_severity_overrides(
+    findings: list[Finding], overrides: dict[str, str] | None
+) -> list[Finding]:
+    """Re-rank or drop findings per the tenant's Brain configuration.
+
+    WHY THIS EXISTS. `AutoApprovalConfig.severityOverrides` has been carried
+    from the Brain screen, through vnyx-api, into the run's frozen
+    configSnapshot and on into `RunSettings.severity_overrides` since the
+    feature shipped — and then dropped on the floor, because nothing ever read
+    it. A setting a user can change that provably does nothing is worse than no
+    setting at all.
+
+    TWO KEY FORMS, and the field-scoped one is the point:
+
+        "DATA.010"           every finding from that rule
+        "DATA.010:material"  only findings naming that field
+
+    DATA.010 covers ten required fields — brand, size, eu_size, the three
+    taxonomy levels, color, material, condition, gender. A tenant who does not
+    record fibre composition needs to stop blocking on `material` WITHOUT also
+    stopping blocking on a missing category, so a rule-level override is far too
+    blunt to express the common case. Most specific wins.
+
+    VALUES are a severity name (`low`/`medium`/`high`/`critical`) or one of
+    `ignore`/`off`/`none`/`skip` to remove the finding outright. Downgrading
+    below the blocking floor is the normal way to stop something blocking while
+    keeping it visible in the report; dropping is for a rule a tenant considers
+    genuinely inapplicable.
+
+    UNKNOWN KEYS AND VALUES ARE IGNORED, deliberately. This runs inside the
+    verification path for every product, and a typo in a JSON config column must
+    not raise there — the cost of a silently ineffective override is one puzzled
+    user, and the cost of an exception is a tenant whose queue stops draining.
+    """
+    if not overrides:
+        return findings
+
+    # Normalise once, not per finding: this is called on every product.
+    by_rule: dict[str, str] = {}
+    by_rule_field: dict[tuple[str, str], str] = {}
+    for raw_key, raw_val in overrides.items():
+        key = str(raw_key or "").strip()
+        val = str(raw_val or "").strip().lower()
+        if not key or not val:
+            continue
+        if ":" in key:
+            rule, _, field = key.partition(":")
+            by_rule_field[(rule.strip().upper(), field.strip().lower())] = val
+        else:
+            by_rule[key.upper()] = val
+
+    out: list[Finding] = []
+    for f in findings:
+        rule = (f.rule_id or "").upper()
+        want: str | None = None
+
+        # Field-scoped first — "most specific wins" is the whole reason the
+        # two-part key exists.
+        for field in f.fields or ():
+            hit = by_rule_field.get((rule, str(field).strip().lower()))
+            if hit:
+                want = hit
+                break
+        if want is None:
+            want = by_rule.get(rule)
+
+        if want is None:
+            out.append(f)
+            continue
+        if want in _DROP_TOKENS:
+            continue
+
+        target = _SEVERITY_BY_NAME.get(want)
+        if target is None:
+            # Unrecognised severity name: leave the finding exactly as the rule
+            # produced it rather than guessing what was meant.
+            out.append(f)
+            continue
+
+        # model_copy, not mutation: `findings` is rebound against a SHADOW
+        # product further down run_gate, and a mutated Finding would leak the
+        # override into whatever else holds a reference to the same object.
+        out.append(f.model_copy(update={"severity": target}))
+
+    return out
+
+
 def _all_findings(p: ProductSnapshot, pol: dict[str, Any], *,
-                  split_on_both_genders: bool = False) -> list[Finding]:
+                  split_on_both_genders: bool = False,
+                  severity_overrides: dict[str, str] | None = None,
+                  ) -> list[Finding]:
     """The standard rule set plus the gate-only rules.
 
     `check_gate` is called explicitly rather than registered in REGISTRY — see
     the note at the top of rules/gate.py. Adding it there would change what
     /v1/review-queue reports for every existing caller.
+
+    The overrides are applied HERE rather than at run_gate's top, because
+    run_gate calls this three times — once for the stored record, once against
+    the shadow product after a guide switch is planned, and once for the
+    residual check — and a re-ranking that applied to only the first would make
+    `blocking` and `field_issues` disagree about the same finding.
     """
-    return run_all(p, pol) + gate_rules.check_gate(
-        p, pol, split_on_both_genders=split_on_both_genders
+    return apply_severity_overrides(
+        run_all(p, pol) + gate_rules.check_gate(
+            p, pol, split_on_both_genders=split_on_both_genders
+        ),
+        severity_overrides,
     )
 
 
@@ -552,14 +656,49 @@ def _plan_mannequin(findings: list[Finding],
     for f in findings:
         if f.rule_id != "TAX.005":
             continue
+
+        # ---- the gender fields follow the RIG -----------------------------
+        #
+        # Planned BEFORE the rig itself, and usually instead of changing it.
+        # See the note in rules/consistency.py: the operator's rig selection is
+        # a human act about the garment in their hands, while masterCategory is
+        # the extractor's branch guess. Bringing the other two fields to the rig
+        # is what keeps the mannequin, the gender, the master category, the size
+        # chart and the rendered model describing one garment instead of two.
+        #
+        # `master_category_should_be` is only set when the tenant's own taxonomy
+        # holds the same category path under the other gender — the rule checks
+        # that against catalog.categories rather than assuming it.
+        master = f.detail.get("master_category_should_be")
+        gender = f.detail.get("gender_should_be")
+        if master:
+            plan.append({
+                "kind": "set_column", "field": "masterCategory", "value": master,
+                "reason": "TAX.005",
+                "detail": (f'the {f.detail.get("rig_gender")} rig is the anchor; '
+                           f'was {f.detail.get("product_gender")!r}'),
+            })
+            if gender:
+                plan.append({
+                    "kind": "set_property", "field": "gender", "value": [gender],
+                    "reason": "TAX.005",
+                    "detail": f'brought into line with the {gender} rig',
+                })
+
+        # ---- and the rig, only if its SIDE is wrong ------------------------
+        #
+        # `suggested` now carries the rig's own gender, so it differs from the
+        # stored rig only when the top/bottom side is wrong — which is a fact
+        # about the garment type and still comes from the subcategory. Skipping
+        # the write when they match stops the plan reporting a repair that
+        # changes nothing.
         suggested = f.detail.get("suggested")
-        if not suggested:
-            continue
-        plan.append({
-            "kind": "set_column", "field": "mannequinType", "value": suggested,
-            "reason": "TAX.005",
-            "detail": f'was {f.detail.get("mannequin")!r}',
-        })
+        if suggested and suggested != f.detail.get("mannequin"):
+            plan.append({
+                "kind": "set_column", "field": "mannequinType", "value": suggested,
+                "reason": "TAX.005",
+                "detail": f'was {f.detail.get("mannequin")!r}',
+            })
         return
 
 
@@ -870,18 +1009,26 @@ def _field_issues(findings: list[Finding],
 def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
              imagery_settings: dict[str, Any] | None = None,
              llm: Any | None = None,
-             split_on_both_genders: bool = False) -> dict[str, Any]:
+             split_on_both_genders: bool = False,
+             severity_overrides: dict[str, str] | None = None,
+             ) -> dict[str, Any]:
     """Verify one product and compute the repair for everything blocking it.
 
     Writes nothing, ever. Call it a second time after executing the plan to get
     the post-repair verdict.
+
+    `severity_overrides` is the tenant's Brain setting, keyed `RULE` or
+    `RULE:field` — see apply_severity_overrides. Threaded down to every
+    `_all_findings` call rather than applied once here, so the three passes
+    cannot disagree about the same finding.
     """
     started = time.perf_counter()
     pol = policy()
 
     p = to_snapshot(raw, catalog=catalog, imagery_settings=imagery_settings)
     findings = _all_findings(
-        p, pol, split_on_both_genders=split_on_both_genders
+        p, pol, split_on_both_genders=split_on_both_genders,
+        severity_overrides=severity_overrides,
     )
     blocking = _blocking(findings)
 
@@ -935,7 +1082,8 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
         if switched:
             p = p.model_copy(update={"sizing_guide": switched})
             findings = _all_findings(
-                p, pol, split_on_both_genders=split_on_both_genders
+                p, pol, split_on_both_genders=split_on_both_genders,
+                severity_overrides=severity_overrides,
             )
 
         _plan_gender(p, findings, plan)
@@ -972,7 +1120,8 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
         for _ in range(2):
             shadow = _apply_plan(p, plan)
             residual = _all_findings(
-                shadow, pol, split_on_both_genders=split_on_both_genders
+                shadow, pol, split_on_both_genders=split_on_both_genders,
+                severity_overrides=severity_overrides,
             )
             new_blockers = [
                 f for f in _blocking(residual)

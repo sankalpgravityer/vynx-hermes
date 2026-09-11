@@ -968,7 +968,9 @@ def apply_plan(dsn: str, product_id: str, plan: list[dict[str, Any]],
 def audit(dsn: str, product_id: str, *, apply: bool = False,
           use_llm: bool = False, app_base: str = DEFAULT_APP_BASE,
           write_sheet: bool = True,
-          sheet_path: str | None = None) -> dict[str, Any]:
+          sheet_path: str | None = None,
+          severity_overrides: dict[str, str] | None = None,
+          ) -> dict[str, Any]:
     """Verify one product, repair what can be repaired, report the rest.
 
     The gate is asked TWICE when anything was written. The second answer is
@@ -987,6 +989,7 @@ def audit(dsn: str, product_id: str, *, apply: bool = False,
         catalog=loaded["catalog"],
         imagery_settings=loaded["imagery_settings"],
         llm=None if not use_llm else _llm(),
+        severity_overrides=severity_overrides,
     )
 
     write_result: dict[str, Any] = {"applied": [], "skipped": [], "wrote": False,
@@ -1006,6 +1009,11 @@ def audit(dsn: str, product_id: str, *, apply: bool = False,
                 catalog=reloaded["catalog"],
                 imagery_settings=reloaded["imagery_settings"],
                 llm=None if not use_llm else _llm(),
+                # The SAME overrides on the re-verify. Skipping them here would
+                # make a product that passed pass 1 fail pass 2 on a finding the
+                # tenant had explicitly downgraded, and the audit would report
+                # a repair that "did not land" when it landed fine.
+                severity_overrides=severity_overrides,
             )
     else:
         # Nothing was written, so every applicable action is a would-be change.

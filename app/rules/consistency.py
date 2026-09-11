@@ -192,23 +192,81 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
                 f"'{p.subcategory or p.category}' is a {want_side}")
 
         if problems:
-            # The corrected rig, when both halves can be named. "Men" + "upper"
-            # -> "Men Top", which is the spelling VNYX's MannequinType uses.
-            suggested = None
+            # THE RIG IS THE ANCHOR FOR GENDER. The side still comes from the
+            # garment.
+            #
+            # This used to be `gender = master_category or rig_gender`, so a
+            # Women Top rig on a product the extractor had filed under Men was
+            # "fixed" by rewriting the RIG to Men Top. That is backwards on the
+            # evidence:
+            #
+            #   the rig     an operator physically selected it in the booth and
+            #               photographed the garment on it. A human action about
+            #               the item in their hands.
+            #   masterCategory
+            #               the extraction model's choice of category BRANCH,
+            #               made from photographs. For a genuinely unisex
+            #               garment the prompt even instructs it to treat the
+            #               item as the Men branch while reporting gender
+            #               "Unisex" — so Men here is frequently an artefact of
+            #               that instruction rather than a judgement.
+            #
+            # Preferring the branch over the rig produced exactly one coherent
+            # field and three incoherent ones: CBOA-006175 ended up a Men Top
+            # rig, gender women, masterCategory Men, a Women Uppers size chart
+            # and female renders — and it APPROVED, because rewriting the rig is
+            # what made TAX.005 pass. Four fields describing two different
+            # garments, published.
+            #
+            # So the rig decides the gender, and masterCategory and the gender
+            # property are brought to it. The side is a separate question — top
+            # vs bottom is about the garment type, so it still comes from the
+            # subcategory.
             side = want_side or have_side
-            gender = master_gender or rig_gender
+            gender = rig_gender or master_gender
+            suggested = None
             if side and gender:
                 suggested = f"{gender.capitalize()} " + (
                     "Top" if side == "upper" else "Bottom")
+
+            # WHAT THE OTHER TWO FIELDS SHOULD BECOME, and whether the tenant's
+            # own taxonomy can actually hold it.
+            #
+            # Checked against `catalog.categories`, never assumed: a men's
+            # category path is not guaranteed to exist under Women. If it does
+            # not, the switch is NOT planned — a product with a valid path and a
+            # wrong master category is recoverable, one pointing at a branch
+            # that does not exist is not, and the finding still reports the
+            # disagreement for a human.
+            master_should_be = None
+            taxonomy_ok = False
+            if rig_gender and master_gender and rig_gender != master_gender:
+                candidate = rig_gender.capitalize()
+                subs = (p.catalog.categories.get(candidate) or {}).get(
+                    p.category or ""
+                )
+                taxonomy_ok = bool(subs) and (
+                    p.subcategory is None or p.subcategory in subs
+                )
+                if taxonomy_ok:
+                    master_should_be = candidate
+
             out.append(Finding(
                 rule_id="TAX.005", severity=Severity.HIGH, fields=["mannequin"],
-                message=(f"Mannequin '{p.mannequin}' is wrong for "
-                         f"{p.master_category} > {p.category}: "
+                message=(f"Mannequin '{p.mannequin}' and "
+                         f"{p.master_category} > {p.category} disagree: "
                          + "; ".join(problems) + "."
-                         + (f" '{suggested}' is the match." if suggested else "")),
+                         + (f" The rig is the anchor, so master category "
+                            f"becomes '{master_should_be}'."
+                            if master_should_be else "")
+                         + (f" '{suggested}' is the matching rig."
+                            if suggested and suggested != p.mannequin else "")),
                 detail={"mannequin": p.mannequin, "suggested": suggested,
                         "product_side": want_side, "rig_side": have_side,
                         "product_gender": master_gender, "rig_gender": rig_gender,
+                        "master_category_should_be": master_should_be,
+                        "gender_should_be": rig_gender if master_should_be else None,
+                        "taxonomy_supports_switch": taxonomy_ok,
                         "basis": "derived"},
             ))
 

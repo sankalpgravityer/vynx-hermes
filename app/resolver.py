@@ -140,7 +140,32 @@ def resolve_pricing(p: ProductSnapshot, findings: list[Finding],
     ratio = price / retail
     band = band_for(p, pol)
     grade = grade_of(p, pol)
-    if band["low"] <= ratio <= band["high"] and ratio < pr["hard_max_ratio"]:
+
+    # "IN BAND" MUST MEAN WHAT THE RULE MEANS BY IT, and it did not.
+    #
+    # `band_for` returns the RAW multipliers — a grade-A factor of 0.5 with a
+    # +/-20% tolerance gives 0.40-0.60. `rules/pricing.assess` rounds those
+    # bounds to the tenant's charm ending BEFORE judging, so on a 49.99 retail
+    # its window is 20.99-30.99, not 19.996-29.994.
+    #
+    # The two therefore disagreed about a thin sliver just inside each raw
+    # bound, and the disagreement was unrecoverable: `assess` returned TOO_LOW,
+    # rules/pricing raised PRICE.003 at HIGH — above the blocking floor — and
+    # this early return then decided there was nothing to repair, so no patch
+    # was ever produced. A product in that sliver blocked approval on every
+    # pass, forever, and no amount of re-running could fix it.
+    #
+    # Seen on BOA-006169: price 20.00, retail 49.99, ratio 0.400080. The rule's
+    # floor was 20.99, this comparison's was 0.40. Blocked permanently over 99
+    # cents, with `corrected_price: 20.99` sitting in the assessment unused.
+    #
+    # So gate on `assess`, which is the function the RULE blocks on. Repairing
+    # against a second, differently-rounded opinion of the same question is
+    # exactly how the two drift apart. Only OK returns: ROUND_REQUIRED means the
+    # cents still need normalising, and the clamp-and-round machinery below
+    # produces the same shelf price for it that `assess` already computed.
+    assessment = assess(p, pol)
+    if assessment.verdict is PriceVerdict.OK and ratio < pr["hard_max_ratio"]:
         return patches  # anchor fix alone resolved it
 
     price_trust = p.trust("price")
