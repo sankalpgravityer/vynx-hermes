@@ -86,13 +86,23 @@ def _finish(
     deltas: dict[str, Any] | None = None,
     error: str | None = None,
     duration_ms: int | None = None,
+    expect_status: str = "IN_PROGRESS",
 ) -> None:
     """Write the terminal status, the product's cache and the run counters.
 
-    ONE TRANSACTION, and the run-product UPDATE is conditional on IN_PROGRESS —
-    so a row the lease reaper already took back is not resurrected, and the
-    counters cannot be incremented twice for one product. That conditional is
-    the whole reason the counters can be denormalised at all.
+    ONE TRANSACTION, and the run-product UPDATE is conditional on the status the
+    caller expects to find — so a row the lease reaper already took back is not
+    resurrected, and the counters cannot be incremented twice for one product.
+    That conditional is the whole reason the counters can be denormalised at all.
+
+    `expect_status` EXISTS FOR THE PARALLEL PATH and defaults to the claim-based
+    one, so the Celery worker is unchanged. A tenant may have only one
+    IN_PROGRESS row — `AutoApprovalRunProduct_one_in_progress_per_tenant` is a
+    unique index, not a convention — so scripts/run_from_sheet.py --workers
+    leaves its rows QUEUED while it works and finishes them from there. What
+    matters is that the update stays CONDITIONAL: whichever status it starts
+    from, the first writer flips it and any second writer sees rowcount 0. The
+    exactly-once property is preserved; only the starting state differs.
     """
     counter = {
         "VERIFIED": "verifiedCount",
@@ -120,10 +130,11 @@ def _finish(
                        "leaseExpiresAt"    = NULL,
                        "updatedAt"         = now()
                  WHERE id = %(id)s::uuid
-                   AND status = 'IN_PROGRESS'::"VerificationStatus"
+                   AND status = %(expect)s::"VerificationStatus"
                 """,
                 {
                     "id": row["id"],
+                    "expect": expect_status,
                     "st": verdict.status,
                     "oc": verdict.outcome,
                     "rs": verdict.reason[:500],
@@ -229,8 +240,119 @@ def _finish(
     )
 
 
-def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
-    """One claimed product, start to finish. Never raises."""
+# ─── The two terminal rules the agent applies to every tenant ──────────────
+#
+# DEFAULTS, not policy. Both describe a product that cannot become approvable by
+# re-running anything, so holding one for a human is a queue that never drains:
+#
+#   no care label      a photograph of a physical tag. Nothing generates one,
+#                      and brand / size / material are all read off it.
+#   no brand or size   after the care-label pass has already had its chance.
+#
+# A mannequin mismatch deliberately is NOT here: TAX.005 in rules/consistency.py
+# already holds those, which is right — the record is sound and the photograph
+# is a re-shoot, so archiving it would take a fixable product out of Review.
+#
+# These live here rather than in AutoApprovalConfig on purpose: they are the
+# same for every tenant, so a column would be a switch nobody ever moves.
+
+_NO_LABEL = "care label is missing"
+
+
+def _archive(row: dict[str, Any], reason: str) -> bool:
+    """Run vnyx-api's reject step. Returns False if it refused.
+
+    The SAME script POST /products/bulk action=REJECT uses, so the stage
+    machine's hooks fire and the product lands in Rejected exactly as a human
+    rejection would. Publishing is not a risk: onApprovedArrival is the only
+    hook that enqueues a Shopify upsert and a rejection never reaches it.
+    """
+    import importlib
+
+    rp = importlib.import_module("scripts.repair_product")
+    try:
+        ok, out, _ = rp.run_step(
+            None, "reject-products.ts",
+            ["--product", str(row["productId"]), "--apply", "--reason", reason],
+            timeout_s=120, quiet=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — a refusal must not kill the pump
+        log.warning("reject step failed for %s: %s", row["productSku"], exc)
+        return False
+    if not ok:
+        log.warning("reject step returned non-zero for %s: %s",
+                    row["productSku"], (out or "")[-200:])
+    return bool(ok)
+
+
+def _has_care_label(product_id: str) -> bool:
+    r = db.fetch_one(
+        """
+        SELECT count(*)::int AS n FROM "ProductMedia"
+         WHERE "productId" = %(p)s::uuid AND view = 'LABEL'
+           AND "isCurrent" = true AND "deletedAt" IS NULL
+           AND "mediaType" = 'IMAGE'
+        """,
+        {"p": product_id},
+    )
+    return bool(r and r["n"])
+
+
+def _missing_attrs(product_id: str) -> list[str]:
+    """Which of brand / size the product still lacks. Placeholders count.
+
+    BOAS and Klekt do not leave these empty — they store the literal string
+    "Unknown", so a NULL test reports a perfectly good value and every product
+    this rule exists for slips through. product_audit owns that placeholder set
+    and `read_property` owns the alias scan (this tenant stores `Brand`, not
+    `brand`); both are imported rather than restated so they cannot drift.
+    """
+    from app.product_audit import PLACEHOLDERS, read_property
+
+    r = db.fetch_one(
+        'SELECT p.properties, p."internationalSize" AS size'
+        ' FROM "Product" p WHERE p.id = %(p)s::uuid',
+        {"p": product_id},
+    ) or {}
+    props = r.get("properties") if isinstance(r.get("properties"), dict) else {}
+
+    def blank(*values: Any) -> bool:
+        return not any(
+            v is not None and str(v).strip().lower() not in PLACEHOLDERS
+            for v in values
+        )
+
+    missing = []
+    if blank(read_property(props, "brand")):
+        missing.append("brand")
+    if blank(r.get("size"), read_property(props, "international_size")):
+        missing.append("size")
+    return missing
+
+
+def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
+               ignore_stop: bool = False,
+               allow_stage: list[str] | None = None,
+               expect_status: str = "IN_PROGRESS",
+               silent: bool = False) -> None:
+    """One claimed product, start to finish. Never raises.
+
+    `ignore_stop` skips the `enabled` re-read described at the approve decision
+    below. DEFAULT FALSE, so the Celery path is untouched — the only caller that
+    passes it is scripts/run_from_sheet.py, where a person has typed --approve
+    and then confirmed at a prompt.
+
+    `allow_stage` widens which stages the approval pre-flight will move a
+    product FROM, and is likewise passed by that one caller. Also default-None,
+    so the unattended agent keeps approving only out of REVIEW: a stage flag
+    that lags the work is a judgement about a specific batch someone is
+    watching, not a rule the background loop should apply to the catalogue.
+
+    `expect_status` is the status the row is expected to still hold when the
+    verdict is written — IN_PROGRESS for the claim-based path, QUEUED for
+    --workers, which cannot use IN_PROGRESS because only one row per tenant may
+    hold it. See _finish.
+    """
     repair = _load_repair()
 
     tenant_id = str(row["tenantId"])
@@ -262,6 +384,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
                         False,
                         False,
                     ),
+                    expect_status=expect_status,
                 )
                 return
 
@@ -285,9 +408,53 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
     # therefore prevents the approval outright; one that lands during repair()
     # may still let this single product through, which is what the stop
     # response tells the operator rather than promising more than it can.
-    approve = rs.approve and cfgmod.is_enabled(tenant_id)
+    #
+    # WHAT `enabled` ACTUALLY GUARDS, and why one caller may skip it.
+    #
+    # It is read fresh rather than taken from the run's snapshot because it is
+    # the STOP button: pressing Stop has to take effect on the next product, not
+    # at the end of the run. That reasoning is about the UNATTENDED loop — beat
+    # ticks, the sweep dispatches a pump, and nobody is watching. The flag is
+    # the only way a human can interrupt it.
+    #
+    # It is not the right gate for a person running one named product from a
+    # terminal with --approve, who has already confirmed at a prompt. There the
+    # instruction IS the human decision the flag stands in for, and requiring a
+    # tenant to be armed as well means arming the background agent just to
+    # approve a single product by hand — which is strictly more dangerous than
+    # the thing it was protecting against.
+    #
+    # So the opt-out is explicit, defaults off, and is passed by exactly one
+    # caller. The Celery path never sets it.
+    approve = rs.approve and (ignore_stop or cfgmod.is_enabled(tenant_id))
 
     t0 = time.monotonic()
+
+    # NO CARE LABEL — decided BEFORE the chain, because the chain cannot help.
+    # A care label is a photograph of a physical tag: nothing generates one, the
+    # extract step has nothing to read, and brand / size / material all come off
+    # it. Running the chain anyway costs ~2 minutes and a vision call to reach a
+    # conclusion one count already gave.
+    #
+    # Only when the repairs are allowed to write. A shadow pass must not archive
+    # a product; it records what it would have done and stops there.
+    if rs.apply and not _has_care_label(product_id):
+        events.emit(tenant_id, "warn",
+                    f"{row['productSku']} — {_NO_LABEL}, rejecting",
+                    run_id=row["runId"], run_product_id=row["id"],
+                    product_id=product_id)
+        if _archive(row, _NO_LABEL):
+            _finish(
+                row,
+                Verdict("FAILED", "NO_CARE_LABEL", _NO_LABEL, False, False),
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                expect_status=expect_status,
+            )
+            return
+        # The reject step refused. Fall through and verify it normally rather
+        # than leave the row unfinished — a held product is recoverable, a
+        # stranded one is not.
+
     try:
         result = repair(
             db.dsn(),
@@ -302,6 +469,11 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
             # Frozen in the run's configSnapshot, so a mid-run Brain edit cannot
             # change how the products still queued are judged.
             severity_overrides=rs.severity_overrides,
+            allow_stage=allow_stage,
+            # Several products narrate at once under --workers, and interleaved
+            # line-by-line output reads as one product doing the wrong steps in
+            # the wrong order. The caller prints a block per product instead.
+            silent=silent,
             quiet=True,
         )
     except product_audit.ProductNotFound:
@@ -309,6 +481,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
             row,
             Verdict("CANCELLED", "PRODUCT_DELETED", "The product no longer exists.", False, False),
             duration_ms=int((time.monotonic() - t0) * 1000),
+            expect_status=expect_status,
         )
         return
     except BaseException as exc:  # noqa: BLE001
@@ -353,6 +526,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
             ),
             error=str(exc)[:2000],
             duration_ms=duration,
+            expect_status=expect_status,
         )
         return
 
@@ -374,6 +548,33 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
         )
 
     verdict = classify(result)
+
+    # NO BRAND OR SIZE — decided AFTER the chain, and that ordering is the whole
+    # point. Both are read off the care label by the extract and care-label
+    # steps, so asking first would reject products the pipeline was about to
+    # fix. Asking now means the label has had its chance and the answer is
+    # settled: nothing further will produce them.
+    #
+    # Only converts a HOLD. A product that VERIFIED is approvable and must not
+    # be archived over a field the pre-flight was content with; a FAILED one
+    # already has its terminal verdict.
+    if (rs.apply and verdict.status == "HELD_FOR_HUMAN"
+            and (missing := _missing_attrs(product_id))):
+        why = f"{' and '.join(missing)} missing — not readable from the care label"
+        events.emit(tenant_id, "warn", f"{row['productSku']} — {why}, rejecting",
+                    run_id=row["runId"], run_product_id=row["id"],
+                    product_id=product_id)
+        if _archive(row, why):
+            _finish(
+                row,
+                Verdict("FAILED", "NO_BRAND_OR_SIZE", why, False, False),
+                blocking_rules=list(result.get("remaining") or []),
+                steps=steps,
+                duration_ms=duration,
+                expect_status=expect_status,
+            )
+            return
+
     _finish(
         row,
         verdict,
@@ -387,6 +588,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings) -> None:
             "stageAfter": result.get("stage_after"),
         },
         duration_ms=duration,
+        expect_status=expect_status,
     )
 
 

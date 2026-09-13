@@ -61,3 +61,16 @@ redis==5.2.1
 # ZoneInfo("Europe/Amsterdam") raises without this. The schedule window is
 # local wall-clock arithmetic, so it is not optional on a Windows worker.
 tzdata==2025.2 ; sys_platform == "win32"
+
+# Background removal, in-process. u2net_cloth_seg is a CLOTHING parser, not a
+# salient-object detector: on a studio shot the salient object is the whole
+# mannequin-on-podium assembly, which is why isnet and u2net both kept it and
+# this one does not. See docs/DEPLOY-BACKGROUND-REMOVAL.md for the measurements.
+#
+# Brings scipy, numba, llvmlite, scikit-image, pymatting and pooch with it
+# (~300 MB installed). It does NOT pull an onnxruntime of its own, so the pin
+# above still governs.
+#
+# The 168 MB model is fetched on first use into U2NET_HOME — pre-fetch it at
+# deploy or the first product pays for it inside a step that has a timeout.
+rembg==2.0.84
