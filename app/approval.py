@@ -320,6 +320,66 @@ def _plan_size_chart(p: ProductSnapshot, pol: dict[str, Any],
     })
 
 
+# Charts whose NAME marks them as specialised, and the words a garment has to
+# carry for one to be the right answer. Anything not listed here is general.
+#
+# Keyed on a squashed lowercase name so "Men DressShirts", "Men Dress Shirts"
+# and "men-dressshirts" all match the same entry -- guide names are tenant text,
+# not an enum.
+_SPECIALISED_GUIDES: dict[str, tuple[str, ...]] = {
+    "dressshirts": ("dress shirt", "business shirt", "formal shirt"),
+}
+
+
+def _squash(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _pick_guide(p: ProductSnapshot, candidates: list[str]) -> str | None:
+    """One chart out of several that all fit, or None to leave it to a human.
+
+    WHY THIS EXISTS. SIZE.011/013/014 can name more than one chart whose ladder
+    covers the product, and every one of those used to escalate. On a real
+    catalogue that is most of the tops: BOAS has both "Men Uppers" and
+    "Men DressShirts", both list S-XXL, so every men's t-shirt reported "2 charts
+    fit this product; pick one" and waited for a person who would answer "Men
+    Uppers" every time.
+
+    THE RULE IS SPECIFIC-BEATS-GENERAL, NOT A HARDCODED NAME. A blanket "always
+    prefer Uppers" would file an actual business shirt on the general chart,
+    which is the same class of error the escalation was protecting against --
+    just silent. So a specialised chart wins only when the garment's own
+    taxonomy names its domain; otherwise the general chart does, because that is
+    what "general" means.
+
+    Still returns None when the choice is genuinely open -- two specialised
+    charts, or two general ones -- because then there is nothing to reason from
+    and a guess would be a guess.
+    """
+    text = f"{p.subcategory or ''} {p.category or ''} {p.title or ''}".lower()
+
+    specialised: list[str] = []
+    general: list[str] = []
+    for c in candidates:
+        squashed = _squash(c)
+        words = next(
+            (w for key, w in _SPECIALISED_GUIDES.items() if key in squashed),
+            None,
+        )
+        if words is None:
+            general.append(c)
+        elif any(w in text for w in words):
+            # The garment names this chart's domain: it wins outright.
+            return c
+        else:
+            specialised.append(c)
+
+    # No specialised chart claimed it, so the general one is the answer.
+    if len(general) == 1:
+        return general[0]
+    return None
+
+
 def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
                        plan: list[dict[str, Any]]) -> str | None:
     """Move the product onto the chart its taxonomy and size actually call for.
@@ -345,6 +405,19 @@ def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
     # SIZE.011/013/014 carry a LIST (the candidates), SIZE.012 a single name.
     if isinstance(suggested, list):
         if len(suggested) != 1:
+            # Try to resolve it before handing it to a person — see _pick_guide.
+            chosen = _pick_guide(p, suggested) if suggested else None
+            if chosen:
+                plan.append({
+                    "kind": "set_column", "field": "sizingGuide", "value": chosen,
+                    "reason": finding.rule_id,
+                    "detail": (
+                        f"was '{p.sizing_guide}'; {len(suggested)} charts fit "
+                        f"({', '.join(suggested)}) and '{chosen}' is the general "
+                        f"one for this garment"
+                    ),
+                })
+                return chosen
             plan.append({
                 "kind": "escalate", "field": "sizingGuide",
                 "reason": finding.rule_id,

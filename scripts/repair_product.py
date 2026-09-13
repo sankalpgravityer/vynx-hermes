@@ -101,6 +101,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import builtins
 import os
 import shutil
 import subprocess
@@ -177,6 +178,12 @@ class StepFailed(Exception):
     pass
 
 
+def _trailing_int(line: str) -> int | None:
+    """The number at the end of a `label : 12` summary line, or None."""
+    tail = line.rsplit(":", 1)[-1].strip()
+    return int(tail) if tail.isdigit() else None
+
+
 # Which of vnyx-api's scripts each step runs. The REMOTE transport names the
 # step rather than the script — the server resolves it through its own closed
 # map, so nothing this file sends can become a filename over there.
@@ -186,8 +193,10 @@ STEP_FOR_SCRIPT = {
     "backfill-product-data.ts": "extract",
     "verify-and-repair.ts": "reconcile",
     "fix-selling-price.ts": "price",
+    "reject-products.ts": "reject",
     "backfill-imagery.ts": "render",
     "approve-products.ts": "approve",
+    "resync-listings.ts": "resync",
 }
 
 
@@ -253,6 +262,14 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
         options["skipBin"] = True
     if "--authorize" in args:
         options["authorize"] = True
+    if "--provider" in args:
+        options["bgProvider"] = args[args.index("--provider") + 1]
+    if "--allow-stage" in args:
+        options["allowStage"] = [
+            s.strip().upper()
+            for s in args[args.index("--allow-stage") + 1].split(",")
+            if s.strip()
+        ]
     # `--apply` on the approve script is what publishes to Shopify, so it is
     # carried as its own flag rather than folded into `apply`.
     if step == "approve" and "--apply" in args:
@@ -426,7 +443,8 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
 
 def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
                   apply: bool, skip_bin: bool,
-                  quiet: bool) -> dict[str, Any]:
+                  quiet: bool,
+                  allow_stage: list[str] | None = None) -> dict[str, Any]:
     """Run approve-products.ts and read back its structured verdict.
 
     Shelled out rather than reimplemented for the reason in the module
@@ -443,6 +461,11 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
         args.append("--apply")
     if skip_bin:
         args.append("--skip-bin")
+    if allow_stage:
+        # Relaxes ONLY the stage clause of the pre-flight; every required-field
+        # check still applies. See approve-products.ts for why that is not
+        # --force.
+        args.extend(["--allow-stage", ",".join(allow_stage)])
     ok, _, payload = run_step(vnyx_api, "approve-products.ts", args,
                               timeout_s=300, quiet=quiet,
                               results_name="approve.json")
@@ -462,7 +485,21 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            approve: bool, skip_bin: bool,
            quiet: bool, progress: str = "",
            severity_overrides: dict[str, str] | None = None,
+           allow_stage: list[str] | None = None,
+           silent: bool = False,
            ) -> dict[str, Any]:
+    # SILENT SHADOWS THE BUILTIN, deliberately and only inside this function.
+    #
+    # repair() narrates itself across ~20 print() calls, which is exactly right
+    # for one product in a terminal and unreadable for several at once: run
+    # --workers 2 and two products interleave line by line, so one product
+    # appears to run `reconcile` twice and `matte` after `approve`. Threading a
+    # flag through every call site would be noise; assigning the name here makes
+    # it local to repair() and to the closures inside it, so `step()` and the
+    # rest pick it up with no edit. The caller gets the same data from the
+    # returned dict, which is what run_from_sheet prints atomically instead.
+    print = (lambda *a, **k: None) if silent else builtins.print  # noqa: A001
+
     started = time.perf_counter()
     state = needs(dsn, product_id)
     steps: list[dict[str, Any]] = []
@@ -500,10 +537,59 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     # ---- 1. matte ---------------------------------------------------------
     def _matte() -> str:
+        # FORCE THE SEGMENTER HERE, not in vnyx-api's environment.
+        #
+        # BG_REMOVAL_RETIRED would do it globally, but that re-points every
+        # caller — the web upload, the analyze worker, Sync now — for all twenty
+        # tenants, as a side effect of deploying a file. This chain is the only
+        # caller that needs the Hermes cut-out, so it asks per call.
+        #
+        # It is also the only thing that can win: resolveBgRemovalProvider reads
+        # the PRODUCT's own imageSettings snapshot before the tenant column, and
+        # 14,696 products carry a baked-in `vnyx-gemini` pointing at a host that
+        # sits behind a 100s proxy timeout and returns a 524 error PAGE.
+        #
+        # Settable per deployment, and emptying it restores the old behaviour.
+        provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
+        force = ["--provider", provider] if provider else []
         ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts",
-                           [*common, *live], timeout_s=600, quiet=quiet)
+                           [*common, *live, *force], timeout_s=600, quiet=quiet)
         if not ok:
             raise StepFailed("background removal returned non-zero")
+
+        # EXIT CODE 0 IS NOT ENOUGH HERE, and trusting it hid a real outage.
+        #
+        # backfill-bg-removal.ts processes each image independently and exits 0
+        # whether or not any cut-out was produced -- correct for a bulk backfill,
+        # where one bad image should not abandon the other four hundred. Read as
+        # a STEP result it is wrong: the chain printed a green `run matte`, the
+        # product kept its RAW images, and IMG.010 then blocked approval with
+        # nothing in the log to connect the two.
+        #
+        # What it was hiding: the segmenter at vnyxremoveapi.vnyx.ai sits behind
+        # Cloudflare, whose origin timeout is 100s and cannot be raised below
+        # Enterprise. Two images took 240s and both came back as a 524 error
+        # PAGE -- HTML with a 200-shaped body, which is why nothing downstream
+        # noticed.
+        #
+        # So the summary the script already prints is parsed, and a step that
+        # wrote nothing while failing something says so.
+        written = failed = None
+        for line in (out or "").splitlines():
+            low = line.lower()
+            if "cut-outs written" in low:
+                written = _trailing_int(line)
+            elif "failed" in low and ":" in line:
+                failed = _trailing_int(line)
+        if failed and not written:
+            raise StepFailed(
+                f"background removal produced no cut-outs ({failed} image(s) "
+                f"failed). The segmenter is unreachable or timing out — see the "
+                f"vnyx-api log for the provider's response."
+            )
+        if failed:
+            return (f'{", ".join(state["unmatted_views"])} '
+                    f'({written} written, {failed} FAILED)')
         return f'{", ".join(state["unmatted_views"])}'
 
     matte_why = ""
@@ -568,16 +654,41 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             raise StepFailed("extraction returned non-zero")
         return "read the care label" + (" and the cut-outs" if infer else "")
 
-    want_extract = state["description_missing"] or state["attributes_missing"]
+    # ATTRIBUTES THAT DO NOT JUSTIFY A VISION CALL ON THEIR OWN.
+    #
+    # `material` is the case this exists for. It is missing on most of the
+    # catalogue, and the bulk extractor only recovers it when the fibre
+    # composition happens to be printed legibly on the tag — the three BOAS
+    # products checked most recently were all "missing material" with two care
+    # labels each. A seventeen-field pass costs 60-250 seconds and a paid vision
+    # call, and usually returns "Unknown" anyway, which the placeholder list
+    # then reads as still empty.
+    #
+    # Brand and size are NOT in here and should not be: they are on every tag,
+    # and the narrow care-label pass below reads them cheaply and better.
+    #
+    # `--infer` overrides it. That flag means "look at the garment, not just the
+    # label", which is the one way material is sometimes recoverable, so asking
+    # for it explicitly is asking for this too.
+    _NOT_WORTH_EXTRACT = {"material"}
+
+    missing = set(state["attributes_missing"])
+    worth_extracting = missing if infer else missing - _NOT_WORTH_EXTRACT
+
+    want_extract = state["description_missing"] or worth_extracting
     # Everything still missing that ONLY the care-label pass below can do better.
     narrow_only = (
         state["care_label"]
         and not state["description_missing"]
-        and set(state["attributes_missing"]) <= {"brand", "size"}
+        and worth_extracting <= {"brand", "size"}
     )
     if not state["care_label"] and not infer:
         extract_why = ("no care label to read — attributes are never inferred "
                        "from the garment (pass --infer to override)")
+    elif not want_extract and missing:
+        # Something IS missing; it is just not worth the call.
+        extract_why = (f'only {", ".join(sorted(missing))} missing — not worth a '
+                       f'vision pass (use --infer to try anyway)')
     elif not want_extract:
         extract_why = "description and every attribute already present"
     elif narrow_only:
@@ -795,7 +906,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # repairs; publishing has to be asked for separately.
         verdict = approve_check(vnyx_api, dsn, product_id,
                                 apply=apply and approve, skip_bin=skip_bin,
-                                quiet=quiet)
+                                quiet=quiet, allow_stage=allow_stage)
         outcome = verdict.get("outcome", "?")
         problems = verdict.get("problems") or []
         if outcome == "approved":

@@ -46,7 +46,11 @@ WITH claimed AS (
     -- Review while it waits. cancel_stale_queued() tidies those rows up, and
     -- this clause makes sure one cannot be claimed in the meantime even if the
     -- sweep has not run yet.
-    AND pr."currentStage" = 'REVIEW'::"ProductStage"
+    --
+    -- Parameterised, defaulting to REVIEW alone, so the unattended loop is
+    -- unchanged. scripts/run_from_sheet.py --include-label is the only caller
+    -- that widens it.
+    AND pr."currentStage" = ANY(%(stages)s::"ProductStage"[])
     AND pr."isDeleted"  = false
     AND pr."isArchived" = false
     -- The pipeline must STILL be finished with it. A product can start
@@ -80,7 +84,8 @@ RETURNING q.*;
 
 
 def claim_next(
-    tenant_id: str, lease_seconds: int, include_failed: bool = False
+    tenant_id: str, lease_seconds: int, include_failed: bool = False,
+    stages: list[str] | None = None,
 ) -> dict[str, Any] | None:
     """Take at most one queue row for this tenant, or return None.
 
@@ -88,6 +93,10 @@ def claim_next(
     right now": nothing queued, another pump holds the tenant, or the
     one-in-progress index refused us. Only the first is really "empty", but the
     caller's behaviour is identical, and NONE of them burns an attempt.
+
+    `stages` defaults to REVIEW alone — the unattended loop's behaviour,
+    unchanged. Widening it is a deliberate act by an operator working a named
+    batch; see scripts/run_from_sheet.py --include-label.
     """
     conn = db.product_audit.connect(db.dsn(), read_only=False, statement_timeout_s=60)
     try:
@@ -115,6 +124,7 @@ def claim_next(
                             if include_failed
                             else ["COMPLETE"]
                         ),
+                        "stages": stages or ["REVIEW"],
                     },
                 )
             except pg_errors.UniqueViolation:

@@ -711,6 +711,87 @@ def _product_gender(p: ProductSnapshot) -> str | None:
     return None
 
 
+class CutoutRequest(BaseModel):
+    """One photograph to cut out. Bytes in, bytes out — no product, no database.
+
+    Deliberately stateless, like every other endpoint here: vnyx-api owns the
+    ProductMedia row and the R2 key, and a service that could write either would
+    need credentials this one does not have.
+    """
+
+    image_base64: str | None = None
+    image_url: str | None = None
+    timeout_s: float = 180.0
+
+
+class CutoutResponse(BaseModel):
+    ok: bool
+    image_base64: str | None = None
+    provider: str = "none"
+    error: str | None = None
+    duration_ms: int = 0
+
+
+@app.post("/v1/imagery/remove-background", response_model=CutoutResponse)
+def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
+    """Cut the background out of one photograph. Gemini, then OpenAI.
+
+    REPLACES THE HOP TO vnyxremoveapi.vnyx.ai, which sits behind a Cloudflare
+    proxy whose 100-second origin timeout cannot be raised below Enterprise —
+    segmentation calls routinely exceed it and come back as a 524 error PAGE,
+    HTML with a 200-shaped body that nothing downstream inspected.
+
+    THE RESULT IS CHECKED BEFORE IT IS RETURNED. A generative model asked to
+    remove a background will sometimes return a tidied version of the same
+    photograph; accepting that writes a BG_REMOVED row over an untouched image,
+    which app/imaging/background.py exists to detect and which nothing else can.
+    So a provider that hands back the picture unchanged is treated as having
+    failed, and the next one is tried.
+
+    Every attempt is logged at INFO under `hermes.cutout`, which is the point of
+    moving it here: the whole chain is visible in one service's log.
+    """
+    import base64 as _b64
+    import time as _time
+
+    from app.imaging import cutout
+
+    started = _time.perf_counter()
+
+    raw: bytes | None = None
+    if req.image_base64:
+        try:
+            raw = _b64.b64decode(req.image_base64, validate=True)
+        except Exception:
+            raise HTTPException(400, "image_base64 is not valid base64")
+    elif req.image_url:
+        # Fetched here rather than asking the caller to inline megabytes of
+        # JPEG. Same IPv4 pin the render path uses — see app/net.py.
+        try:
+            from app.net import make_client
+
+            # make_client, not a bare httpx.Client: it carries the IPv4 pin this
+            # host needs, without which an R2 fetch stalls ~43s on the IPv6
+            # attempt before falling back.
+            with make_client(30.0) as client:
+                resp = client.get(req.image_url)
+                resp.raise_for_status()
+                raw = resp.content
+        except Exception as exc:
+            raise HTTPException(400, f"could not fetch image_url: {exc}")
+    else:
+        raise HTTPException(400, "pass image_base64 or image_url")
+
+    out, err, provider = cutout.remove_background(raw, timeout_s=req.timeout_s)
+    return CutoutResponse(
+        ok=out is not None,
+        image_base64=_b64.b64encode(out).decode() if out else None,
+        provider=provider,
+        error=err,
+        duration_ms=int((_time.perf_counter() - started) * 1000),
+    )
+
+
 @app.post("/v1/imagery/verify", response_model=ImageryVerdict)
 def imagery_verify(req: ImageryVerifyRequest) -> ImageryVerdict:
     """Are this product's pictures finished? Writes nothing, ever.
