@@ -442,6 +442,29 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
     }
 
 
+def _generation_in_flight(state: dict[str, Any]) -> bool:
+    """Is a generation genuinely running for this product right now?
+
+    GENERATING / isRegenerating, AND touched within `imagery.stale_generation_hours`
+    (the same threshold IMG.011 and vnyx-api's generation reaper use). Older than
+    that the flag is a stranded row and must not block a repair forever.
+    """
+    if state.get("generation_status") != "GENERATING" and not state.get("is_regenerating"):
+        return False
+    stamp = state["loaded"]["record"].get("updatedAt")
+    if not stamp:
+        return True
+    try:
+        touched = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        if touched.tzinfo is None:
+            touched = touched.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    hours = float((policy().get("imagery") or {}).get("stale_generation_hours") or 1)
+    age_h = (datetime.now(timezone.utc) - touched).total_seconds() / 3600
+    return age_h < hours
+
+
 # --------------------------------------------------------------------------- #
 # The chain
 # --------------------------------------------------------------------------- #
@@ -538,6 +561,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         try:
             note = run()
             ok = True
+            # The in-process steps (twin, care label, gate) have no subprocess
+            # output to show, so their one-line result is printed here — the
+            # same line the run log records as the step's note. Subprocess
+            # steps get their summary echoed too, which costs one dim line.
+            if note:
+                print(f'        {paint(note, DIM)}')
         except StepFailed as exc:
             note, ok = str(exc), False
             print(f'        {paint("FAILED: " + note, RED)}')
@@ -546,6 +575,51 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     common = ["--db", dsn, "--product", product_id]
     live = ["--apply"] if apply else []
+
+    # ---- 0. twin ----------------------------------------------------------
+    #
+    # BEFORE EVERYTHING, because it changes what "missing" means for every step
+    # that follows. A C-twin is the same garment as its parent listed under the
+    # other gender; duplication copied the pictures and not the measurements, so
+    # the twin arrives with blank brand / size and the default rules would
+    # reject it for facts its parent already carries. Gender-neutral fields only
+    # — see app/twins.py for the two lists and why.
+    #
+    # Through apply_plan like the care-label pass: one transaction, guarded on
+    # updatedAt, both copies of a doubled value written.
+    twin_note = ""
+
+    def _twin() -> str:
+        nonlocal state, twin_note
+        from app import twins
+
+        record = state["loaded"]["record"]
+        parent_sku = twins.parent_sku(record.get("sku"), policy())
+        parent = twins.load_parent(dsn, parent_sku or "", str(record["tenantId"]))
+        if parent is None:
+            return f"parent {parent_sku} is not in this tenant — nothing to inherit"
+        plan = twins.inheritance_plan(record, parent, policy())
+        if not plan:
+            return f"parent {parent_sku} holds nothing the twin lacks"
+        summary = ", ".join(f'{a["field"]}={a["value"]!r}' for a in plan)
+        if apply:
+            outcome = product_audit.apply_plan(
+                dsn, product_id, plan, record.get("updatedAt"))
+            if outcome["conflict"]:
+                raise StepFailed(outcome.get("message", "changed mid-repair"))
+            if outcome["skipped"]:
+                raise StepFailed("; ".join(
+                    s.get("why", "?") for s in outcome["skipped"]))
+            # Re-read: the extract / care-label decisions below key off what is
+            # still missing, and that just changed.
+            state = needs(dsn, product_id)
+        twin_note = f'from {parent_sku}: {summary}'
+        return f'{"inherited" if apply else "would inherit"} {summary} from {parent_sku}'
+
+    from app import twins as _twins
+
+    is_twin = _twins.parent_sku(state["sku"], policy()) is not None
+    step("twin", "" if is_twin else "not a C-twin", _twin)
 
     # ---- 1. matte ---------------------------------------------------------
     def _matte() -> str:
@@ -894,7 +968,15 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         verb = "would set" if not apply else "set"
         return f'{verb} {before} {ARROW} {after} ({row.get("reason") or "clamped"})'
 
-    step("price", "", _price)
+    # CONSIGNMENT: the selling price is the consignor's under contract. The gate
+    # already refuses to plan a price write for these tenants (approval.py); this
+    # keeps the clamp step from doing what the gate declined to.
+    from app.approval import is_consignment
+    price_why = ("consignment tenant — the selling price is the consignor's, "
+                 "not written" if is_consignment(
+                     str(state["loaded"]["record"].get("tenantId") or ""), policy())
+                 else "")
+    step("price", price_why, _price)
 
     # ---- 4. render --------------------------------------------------------
     def _render() -> str:
@@ -908,6 +990,14 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         render_why = "--no-render"
     elif not state["renders_missing"]:
         render_why = "all five views already exist"
+    elif _generation_in_flight(state):
+        # CREDIT-RESUME SAFETY. A generation already running will deliver these
+        # renders; firing a second one pays twice for the same five pictures and
+        # races the first for the rows. backfill-imagery.ts does not check this
+        # itself. Only a LIVE run is respected: past `stale_generation_hours` the
+        # flag is a stranded row, not work in progress, and the render goes ahead.
+        render_why = ("generation already in flight — not paying for a second "
+                      "run while the first is live")
     else:
         render_why = ""
     step("render", render_why, _render)

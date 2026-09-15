@@ -382,6 +382,18 @@ SELECT "isModelGenerationEnabled", "isRemoveBgEnabled", "isCloseUpEnabled",
  LIMIT 1
 """
 
+# The tenant's working vocabulary: which subcategory values its live products
+# actually carry, and how often. The tree says what MAY be chosen; this says what
+# IS chosen, and when a title names two valid options the planner prefers the
+# one the tenant files under. One GROUP BY per tenant, alongside the other five.
+SUBCATEGORY_USAGE_SQL = """
+SELECT "subCategory", count(*)::int
+  FROM "Product"
+ WHERE "tenantId" = %s::uuid AND "isDeleted" = false
+   AND "subCategory" IS NOT NULL AND "subCategory" <> ''
+ GROUP BY "subCategory"
+"""
+
 
 class ProductNotFound(Exception):
     pass
@@ -422,6 +434,9 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
     cur.execute(IMAGERY_SETTINGS_SQL, (tenant_id,))
     imagery_row = cur.fetchone()
 
+    cur.execute(SUBCATEGORY_USAGE_SQL, (tenant_id,))
+    usage = {str(name): int(n) for name, n in cur.fetchall() if name}
+
     categories: dict[str, dict[str, list[str]]] = {}
     for path, depth in paths:
         parts = path.split(">")
@@ -441,6 +456,7 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
         "colors": options["colors"],
         "materials": options["materials"],
         "brands": options["brands"],
+        "subcategoryUsage": usage,
     }
     grade_ladder = [
         {"code": c, "label": lbl, "severity": sev,

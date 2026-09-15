@@ -222,12 +222,35 @@ def _all_findings(p: ProductSnapshot, pol: dict[str, Any], *,
     residual check — and a re-ranking that applied to only the first would make
     `blocking` and `field_issues` disagree about the same finding.
     """
-    return apply_severity_overrides(
+    findings = apply_severity_overrides(
         run_all(p, pol) + gate_rules.check_gate(
             p, pol, split_on_both_genders=split_on_both_genders
         ),
         severity_overrides,
     )
+    # CONSIGNMENT tenants: a price outside the grade window is the consignor's
+    # choice, so PRICE.002 / PRICE.003 stop blocking approval and stay visible
+    # as MEDIUM. PRICE.001 (at or above retail) is arithmetic, not a choice, and
+    # keeps its severity. Applied here for the same reason the overrides are:
+    # every one of run_gate's three passes must see the same ranking.
+    if is_consignment(p.tenant_id, pol):
+        findings = [
+            f.model_copy(update={"severity": Severity.MEDIUM})
+            if f.rule_id in _CONSIGNMENT_SOFT_RULES and _RANK[f.severity] > _RANK[Severity.MEDIUM]
+            else f
+            for f in findings
+        ]
+    return findings
+
+
+# The price findings a consignment contract makes advisory. Not PRICE.001.
+_CONSIGNMENT_SOFT_RULES = frozenset({"PRICE.002", "PRICE.003", "PRICE.011"})
+
+
+def is_consignment(tenant_id: str | None, pol: dict[str, Any]) -> bool:
+    """Is this tenant on `pricing.consignment_tenants`? Ids compared as strings."""
+    ids = (pol.get("pricing") or {}).get("consignment_tenants") or []
+    return bool(tenant_id) and str(tenant_id) in {str(x) for x in ids}
 
 
 # --------------------------------------------------------------------------- #
@@ -603,9 +626,31 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
                 "detail": (f"the title names it, and '{named[0]}' is the only "
                            f"option on this branch that it matches"),
             })
-        # Several or none: left for the evidence layer or a human. No escalate
-        # entry here — _plan_escalations already names an unrepaired DATA.010
-        # field, and a second one would double-count it.
+            return
+        # SEVERAL named: the tenant's own vocabulary breaks the tie.
+        #
+        # The auditor this was ported from counted the subcategory values seen
+        # across a run and preferred one the tenant already used. Here the count
+        # comes from the tenant's whole catalogue (`subcategory_usage`, loaded
+        # with the catalog) and it decides only between options the title
+        # ALREADY named — and only when one of them is clearly the house
+        # spelling: used at least twice as often as the runner-up. A near-tie is
+        # still a guess, and a guess stays a human's.
+        if len(named) > 1:
+            usage = p.catalog.subcategory_usage or {}
+            ranked = sorted(named, key=lambda s: usage.get(s, 0), reverse=True)
+            top, second = usage.get(ranked[0], 0), usage.get(ranked[1], 0)
+            if top > 0 and top >= 2 * max(second, 1):
+                plan.append({
+                    "kind": "set_column", "field": "subCategory",
+                    "value": ranked[0], "reason": "DATA.010",
+                    "detail": (f"the title names {len(named)} options on this "
+                               f"branch; '{ranked[0]}' is the one this tenant "
+                               f"files under ({top} products vs {second})"),
+                })
+        # None named, or no clear house spelling: left for the evidence layer or
+        # a human. No escalate entry here — _plan_escalations already names an
+        # unrepaired DATA.010 field, and a second one would double-count it.
         return
 
     off_tree = any(
@@ -858,6 +903,22 @@ def _plan_fields(p: ProductSnapshot, pol: dict[str, Any],
 
     auto = [pt for pt in patches
             if pt.action is Action.APPLY and pt.new_value is not None]
+
+    # CONSIGNMENT: the price is the consignor's under contract, not vnyx's to
+    # correct. A price the resolver would have written becomes an escalation
+    # that says so, and the reconcile step (which executes this plan inside
+    # vnyx-api) therefore never touches it. Retail stays repairable — it is the
+    # anchor, not the agreed price.
+    if is_consignment(p.tenant_id, pol):
+        for pt in [x for x in auto if x.field == "price"]:
+            plan.append({
+                "kind": "escalate", "field": "price", "reason": pt.rule_id,
+                "detail": ("consignment tenant — the selling price is the "
+                           "consignor's and is not written by the agent"),
+            })
+        auto = [pt for pt in auto if pt.field != "price"]
+        patches = [pt for pt in patches
+                   if not (pt.field == "price" and pt.action is not Action.APPLY)]
 
     for pt in patches:
         if pt.action is Action.APPLY:

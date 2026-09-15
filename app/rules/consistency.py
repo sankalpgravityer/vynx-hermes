@@ -422,6 +422,28 @@ def check_grading(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
                         "basis": "condition_to_grade"},
             ))
 
+    # ATTR.004 — a condition that is not a condition.
+    #
+    # GRADE.001 above needs a grade to compare against. With none, a free-text
+    # condition ("Good condition overall, small mark on hem") passes every rule
+    # while being unusable as the facet it is published as. Checked against the
+    # tenant's own grade label first — the record carries only its OWN grade's
+    # label, so a match there is definitive — then against the policy's condition
+    # vocabulary. MEDIUM: the value needs a reviewer's eye, the product may be fine.
+    elif p.condition and not _is_placeholder(p.condition, pol):
+        known = {k.strip().lower() for k in pol["pricing"]["condition_to_grade"]}
+        if p.grade_label:
+            known.add(p.grade_label.strip().lower())
+        if p.condition.strip().lower() not in known:
+            out.append(Finding(
+                rule_id="ATTR.004", severity=Severity.MEDIUM, fields=["condition"],
+                message=(f"Condition '{p.condition}' is not one of the known "
+                         f"condition labels and there is no grade to derive it "
+                         f"from."),
+                detail={"value": p.condition, "known": sorted(known)},
+                needs_evidence=True,
+            ))
+
     # Defects: the operator's list REPLACES the AI's in VNYX when present
     # (someone holding the garment outranks a model looking at a photo of it), so
     # "no defects recorded" has to consider both or a fully operator-reported
@@ -550,6 +572,48 @@ def check_copy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
         ))
         return out
 
+    # TEXT.006 — the title the pipeline wrote at creation and never replaced.
+    #
+    # "Generating Product..." is written when the row is created and overwritten
+    # when generation succeeds; still carrying it means nothing was produced. On
+    # one 61-product batch that was 35 rows, every one of which would otherwise
+    # have shipped under the placeholder. HIGH: this is not copy quality, it is
+    # a product with no title.
+    prefixes = [str(x).strip().lower()
+                for x in (pol.get("copy") or {}).get("placeholder_title_prefixes") or []]
+    hit = next((x for x in prefixes if x and title.strip().startswith(x)), None)
+    if hit:
+        out.append(Finding(
+            rule_id="TEXT.006", severity=Severity.HIGH, fields=["title"],
+            message=(f"Title still carries the generation placeholder "
+                     f"('{p.title}'); the pipeline never replaced it."),
+            detail={"prefix": hit},
+        ))
+        return out
+
+    # TEXT.007 — the copy says the other gender.
+    #
+    # A men's product whose title or description says "women's" is either a
+    # C-twin whose copy was inherited from its parent, or a product filed under
+    # the wrong gender; both are worth a look. Only a CONTRADICTION fires: the
+    # opposite word present and the product's own gender word absent, so a
+    # "Unisex — men / women" description stays quiet.
+    gender = _gender_side(p.gender)
+    if gender:
+        own = _MEN_WORDS if gender == "men" else _WOMEN_WORDS
+        other = _WOMEN_WORDS if gender == "men" else _MEN_WORDS
+        for field, text in (("title", p.title), ("description", p.description)):
+            words = set(re.findall(r"[a-z']+", (text or "").lower()))
+            if words & other and not words & own:
+                out.append(Finding(
+                    rule_id="TEXT.007", severity=Severity.MEDIUM,
+                    fields=[field, "gender"],
+                    message=(f"The {field} says "
+                             f"'{sorted(words & other)[0]}' but the product is "
+                             f"listed as {gender}."),
+                    detail={"found": sorted(words & other), "gender": gender},
+                ))
+
     # TEXT.002 — the title should name the brand, colour and subcategory.
     #
     # Matched on a normalised STEM, not a raw token. Titles are written in the
@@ -594,7 +658,55 @@ def check_copy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
             rule_id="TEXT.004", severity=Severity.MEDIUM, fields=["description"],
             message="Description is empty.", detail={}, needs_evidence=True,
         ))
+
+    # TEXT.005 — `material` is a fibre, not a paragraph.
+    #
+    # The bulk extractor sometimes pastes the whole composition line into the
+    # field ("100% Cotton. Made in Portugal. Machine wash cold…"), which the
+    # storefront then renders as a facet value. LOW: cosmetic, and the fix is a
+    # reviewer trimming it, not a rule guessing which words to keep.
+    max_chars = int((pol.get("copy") or {}).get("material_max_chars") or 0)
+    if max_chars and p.material and len(p.material.strip()) > max_chars:
+        out.append(Finding(
+            rule_id="TEXT.005", severity=Severity.LOW, fields=["material"],
+            message=(f"Material is {len(p.material.strip())} characters — a "
+                     f"sentence, not a fibre (limit {max_chars})."),
+            detail={"length": len(p.material.strip()), "limit": max_chars},
+        ))
     return out
+
+
+_MEN_WORDS = {"men", "men's", "mens", "man", "man's", "male", "gents"}
+_WOMEN_WORDS = {"women", "women's", "womens", "woman", "woman's", "female",
+                "ladies", "ladies'"}
+
+
+def _gender_side(value: Any) -> str | None:
+    """'men' | 'women' | None — a local mirror of rules/gate.py's resolver.
+
+    Local rather than imported: consistency.py is imported by gate.py's
+    neighbours and a cross-import between rule modules is the kind of cycle that
+    only shows up at startup.
+    """
+    if value is None:
+        return None
+    parts: list[str]
+    if isinstance(value, (list, tuple)):
+        parts = [str(v) for v in value]
+    else:
+        text = str(value).strip()
+        if text.startswith("["):
+            parts = [x.strip(" \"'") for x in text.strip("[]").split(",")]
+        else:
+            parts = text.split(",")
+    sides = set()
+    for part in parts:
+        low = part.strip().lower()
+        if low in _WOMEN_WORDS or low.startswith("women") or low.startswith("female"):
+            sides.add("women")
+        elif low in _MEN_WORDS or low.startswith("men") or low.startswith("male"):
+            sides.add("men")
+    return sides.pop() if len(sides) == 1 else None
 
 
 def check_completeness(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
@@ -627,5 +739,21 @@ def check_completeness(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]
         out.append(Finding(
             rule_id="DATA.002", severity=Severity.HIGH, fields=["inventory"],
             message="Inventory is negative.", detail={"inventory": p.inventory},
+        ))
+
+    # DATA.003 — vintage is one-of-one.
+    #
+    # A quantity other than the configured one on a product heading for approval
+    # is a data-entry slip: 0 means there is nothing to sell, 3 means the same
+    # garment will oversell twice. MEDIUM so a multi-unit tenant is warned rather
+    # than blocked; `completeness.expected_inventory: null` switches it off.
+    expected = (pol.get("completeness") or {}).get("expected_inventory")
+    if (expected is not None and p.inventory is not None and p.inventory >= 0
+            and int(p.inventory) != int(expected)):
+        out.append(Finding(
+            rule_id="DATA.003", severity=Severity.MEDIUM, fields=["inventory"],
+            message=(f"Inventory is {p.inventory}; a one-of-one garment should "
+                     f"carry {expected}."),
+            detail={"inventory": p.inventory, "expected": expected},
         ))
     return out

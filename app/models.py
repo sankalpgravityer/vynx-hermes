@@ -80,6 +80,14 @@ class TenantCatalog(BaseModel):
     colors: list[str] = Field(default_factory=list)
     materials: list[str] = Field(default_factory=list)
     brands: list[str] = Field(default_factory=list)
+    # How often this tenant's OTHER products use each subcategory value — the
+    # tenant's working vocabulary, counted from its catalogue rather than read
+    # from its tree. A tie-breaker only: when a title names several valid
+    # subcategories, the one the tenant already files things under wins. Empty
+    # means not supplied, and the planner decides nothing on it.
+    subcategory_usage: dict[str, int] = Field(
+        default_factory=dict, alias="subcategoryUsage"
+    )
 
     def eu_for_size(self, guide: str | None, size: str | None) -> str | None:
         """The EU size this guide pairs with `size`, or None if it cannot say.

@@ -89,4 +89,30 @@ def check_catalog(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
     out.extend(
         _check_one(p.material, p.catalog.materials, "material", "ATTR.003", pol)
     )
+    out.extend(check_supplier(p, pol))
     return out
+
+
+def check_supplier(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
+    """ATTR.005 — the supplier should be the tenant's canonical one.
+
+    The auditor this was ported from carried one canonical supplier per tenant
+    and flagged every product naming another. Here the map lives in policy.yaml
+    (`suppliers.canonical_by_tenant`, keyed by tenant id) and is empty by
+    default — a tenant with no entry is never judged, and a product with no
+    supplier is DATA territory, not this rule's.
+    """
+    canonical = ((pol.get("suppliers") or {}).get("canonical_by_tenant") or {})
+    want = canonical.get(str(p.tenant_id or ""))
+    if not want or not p.supplier:
+        return []
+    if p.supplier.strip().lower() in pol["confidence"]["placeholders"]:
+        return []
+    if _norm(p.supplier) == _norm(str(want)):
+        return []
+    return [Finding(
+        rule_id="ATTR.005", severity=Severity.MEDIUM, fields=["supplier"],
+        message=(f"Supplier '{p.supplier}' is not this tenant's canonical "
+                 f"supplier '{want}'."),
+        detail={"value": p.supplier, "canonical": want},
+    )]

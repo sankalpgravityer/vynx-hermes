@@ -37,6 +37,7 @@ confirm because the call failed is `review` — never approve gender-blind.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -79,10 +80,16 @@ SCHEMA: dict[str, Any] = {
                                       "empty."},
         "view": {"type": "string", "enum": ["front", "back"],
                  "description": "front unless the model clearly faces away."},
+        "garment": {
+            "type": "string",
+            "description": "One or two plain words for the main garment being "
+                           "sold in this image — 'jeans', 'puffer jacket', "
+                           "'t-shirt', 'dress'. Empty if unclear.",
+        },
         "confidence": {"type": "number", "description": "0.0 to 1.0."},
     },
     "required": ["model_present", "face_ok", "gender", "lead_ok",
-                 "body_coherent", "body_issue", "view", "confidence"],
+                 "body_coherent", "body_issue", "view", "garment", "confidence"],
 }
 
 SYSTEM = (
@@ -102,7 +109,8 @@ _DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "required": True,
     "lead_views": ["AI_FRONT", "AI_FRONT_34"],
-    "block_on": ["no_model", "bad_face", "broken_body", "gender_mismatch"],
+    "block_on": ["no_model", "bad_face", "broken_body", "gender_mismatch",
+                 "category_mismatch"],
     "accessory_terms": [
         "cap", "caps", "beanie", "beanies", "hat", "hats", "gloves", "belt",
         "belts", "scarf", "scarves", "bag", "bags", "backpack", "backpacks",
@@ -203,13 +211,49 @@ def _gender_word(value: Any) -> str | None:
     return None
 
 
+def garment_family(text: Any, pol: dict[str, Any] | None) -> str | None:
+    """Which family — tops, bottoms, dresses, outerwear, footwear, accessories —
+    a garment word or a category name belongs to, per `policy.yaml:
+    garment_families`. None when no family's tokens appear, or when more than
+    one does: this decides nothing on a guess.
+
+    Token match on word stems, longest token first, so 'puffer jacket' lands on
+    outerwear before 'jacket' could be read as anything else and 'sweatshirt'
+    is not matched by 'shirt' (the whole word is compared, with a plural
+    stripped).
+    """
+    if not text:
+        return None
+    families = ((pol or {}).get("garment_families") or {})
+    words = {w.rstrip("s") for w in re.findall(r"[a-z\-]+", str(text).lower())}
+    words |= {w.replace("-", "") for w in words}
+    hits: set[str] = set()
+    for family, tokens in families.items():
+        if family == "adjacent":
+            continue
+        for tok in tokens or []:
+            t = str(tok).lower().rstrip("s")
+            if t in words or t.replace("-", "") in words:
+                hits.add(family)
+                break
+    return hits.pop() if len(hits) == 1 else None
+
+
+def _adjacent(a: str, b: str, pol: dict[str, Any] | None) -> bool:
+    pairs = ((pol or {}).get("garment_families") or {}).get("adjacent") or []
+    return any({a, b} == {str(x) for x in pair} for pair in pairs if len(pair) == 2)
+
+
 def decide(raw: dict[str, Any], *, product_gender: str | None,
-           accessory: bool, pol: dict[str, Any] | None) -> GateVerdict:
+           accessory: bool, pol: dict[str, Any] | None,
+           category: Any = None, subcategory: Any = None) -> GateVerdict:
     """The pure decision, separated from the call so it can be tested cold.
 
     Order matters and follows the auditor's: NO MODEL first (nothing else can
     be judged without one), then the gender the picture shows against the
-    gender the record claims, then face, then body. Soft flags never block.
+    gender the record claims, then face, then body — the render defects —
+    then the one DATA question the picture can answer: is this the kind of
+    garment the category says? Soft flags never block.
     """
     block_on = set(config(pol)["block_on"])
     seen = _gender_word(raw.get("gender"))
@@ -247,6 +291,22 @@ def decide(raw: dict[str, Any], *, product_gender: str | None,
         issue = str(raw.get("body_issue") or "").strip()[:60]
         return verdict("regen", "IMAGE_QUALITY",
                        [f"BROKEN BODY — {issue or 'the body is anatomically broken'}"])
+
+    # CATEGORY vs PICTURE (the auditor's CATEGORY_IMAGE_MISMATCH). Not a render
+    # defect — the render may be perfect — so it is `review`, not `regen`: a
+    # human decides whether the category or the photograph is wrong. Fires only
+    # when both sides map to a family, the families differ, and the pair is not
+    # one the model routinely conflates (tops/outerwear).
+    garment = str(raw.get("garment") or "").strip()
+    if garment and "category_mismatch" in block_on:
+        fam_seen = garment_family(garment, pol)
+        filed_under = subcategory or category
+        fam_filed = garment_family(filed_under, pol)
+        if (fam_seen and fam_filed and fam_seen != fam_filed
+                and not _adjacent(fam_seen, fam_filed, pol)):
+            return verdict("review", "CATEGORY_IMAGE_MISMATCH",
+                           [f"the render shows {garment} ({fam_seen}) but the "
+                            f"product is filed under '{filed_under}' ({fam_filed})"])
 
     if raw.get("lead_ok") is False:
         soft.append("BAD LEAD — not a usable primary image")
@@ -319,6 +379,7 @@ def judge(media: list[dict[str, Any]], *, gender: Any,
     from app.rules.gate import resolve_gender
 
     verdict = decide(raw, product_gender=resolve_gender(gender),
-                     accessory=is_accessory(subcategory, category, pol=pol), pol=pol)
+                     accessory=is_accessory(subcategory, category, pol=pol), pol=pol,
+                     category=category, subcategory=subcategory)
     verdict.lead_url, verdict.lead_view = lead_url, lead_view
     return verdict
