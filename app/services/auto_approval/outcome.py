@@ -110,6 +110,37 @@ def classify(result: dict[str, Any]) -> Verdict:
             retryable=False,
         )
 
+    # ---- ready by every column check, refused on the picture ----------------
+    #
+    # repair() replaces `would_approve` with these two when the image gate
+    # spoke. They are tested BEFORE would_approve because they arrive in its
+    # place: the pre-flight passed, the move was withheld, and the reason is
+    # the render, not a field. `gate_code` names which — IMAGE_QUALITY,
+    # MODEL_GENDER_MISMATCH — so the Review tab can group by cause.
+    if outcome == "gate_blocked":
+        return Verdict(
+            status="HELD_FOR_HUMAN",
+            outcome=str(approval.get("gate_code") or "IMAGE_QUALITY"),
+            reason=("; ".join(blockers) or "The image gate refused the lead render.")[:500],
+            approved=False,
+            retryable=False,
+        )
+
+    # The gate could not RUN — provider down, image unreachable. Not a verdict
+    # about the product, so retryable: the runner puts it back with a backoff
+    # and only records this outcome once the attempts are spent.
+    if outcome == "gate_unavailable":
+        return Verdict(
+            status="HELD_FOR_HUMAN",
+            outcome="VISION_UNAVAILABLE",
+            reason=(
+                "; ".join(blockers)
+                or "The image gate could not run, so the render was not judged."
+            )[:500],
+            approved=False,
+            retryable=True,
+        )
+
     # ---- ready, but the move was not asked for ----------------------------
     if outcome == "would_approve":
         return Verdict(

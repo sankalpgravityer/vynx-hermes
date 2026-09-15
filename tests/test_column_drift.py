@@ -626,10 +626,14 @@ def test_no_images_means_no_call():
     floor grades certainty and not whether the model had anything to look at.
     """
     from app.llm import care_label
-    assert care_label._read_gemini([]) is None
-    assert care_label._read_openai([]) is None
+    # Each reader answers (reading, status); no images is "no_answer", never an
+    # attempt — and never "api_error", which would count towards the outage
+    # guard for a call that was not made.
+    assert care_label._read_gemini([]) == (None, "no_answer")
+    assert care_label._read_openai([]) == (None, "no_answer")
     out = care_label.read([])
     assert out["error"] and "brand" not in out and "size" not in out
+    assert not out.get("api_failed")
 
 
 def test_openai_needs_the_word_json_in_the_prompt():

@@ -233,6 +233,24 @@ llm:
   # Only spend an LLM call when the rule engine actually asked for evidence.
   evidence_only: true
 
+  # FAIL-FAST ON A PROVIDER OUTAGE — app/llm/health.py.
+  #
+  # Every in-process vision call (care-label read, quality gate) is counted by
+  # outcome over a sliding window of the last `window` calls. Once at least
+  # `min_samples` are in the window and `error_ratio` of them are hard API
+  # errors — 429, 5xx, a rejected key, a timeout; never an "I cannot read this"
+  # answer — the run loop STOPS for `cooldown_s` instead of turning the outage
+  # into a queue of "no brand or size" rejections. The products already judged
+  # keep their verdicts; the one in hand is retried, not judged.
+  #
+  # 6 samples is three products' worth. 0.7 means a working OpenAI fallback
+  # (one Gemini error, one OpenAI success per label) never reads as an outage.
+  health:
+    window: 20
+    min_samples: 6
+    error_ratio: 0.7
+    cooldown_s: 600
+
 # --------------------------------------------------------------------------- #
 # Imagery — the on-model renders and background removal.
 # See docs/IMAGERY-VERIFICATION.md for how these numbers were arrived at.
@@ -442,6 +460,49 @@ imagery:
     # gets the identical answer while doubling the wait.
     max_retries: 2
     retry_backoff_s: 3
+
+# --------------------------------------------------------------------------- #
+# Quality gate — the one look at the LEAD RENDER before a product is approved.
+# app/imaging/quality_gate.py; runs as the `gate` step of repair_product.py,
+# after render and before approve.
+#
+# Every other check reads columns. This one asks a vision model seven things
+# about the picture a shopper will see — model present, face intact, model
+# gender, usable lead, body coherent, what is wrong, front or back — in ONE
+# call, and turns the answer into an action:
+#
+#   ok       approve may proceed
+#   regen    the content is wrong: hold, outcome IMAGE_QUALITY or
+#            MODEL_GENDER_MISMATCH. A re-render is the likely fix.
+#   review   the gate could not decide (provider down, image unreachable):
+#            the product is RETRIED, not held — see llm.health above.
+#
+# Runs in shadow mode too, so a dry run reports what the gate would refuse.
+# Measure its false-block rate on a batch that was approved by hand before
+# trusting it with a tenant.
+# --------------------------------------------------------------------------- #
+quality_gate:
+  enabled: true
+  # When the gate cannot run at all (no GEMINI_API_KEY), block approval rather
+  # than skip it. false = a rules-only deployment approves without the gate,
+  # which is the pre-gate behaviour.
+  required: true
+  # Which render is judged, in order of preference. Only AI renders: the gate
+  # is about the on-model image, and a product with none is refused by the
+  # approval pre-flight anyway ("missing AI_FRONT").
+  lead_views: ["AI_FRONT", "AI_FRONT_34"]
+  # Each of these can be switched off independently. Removing one turns that
+  # finding into a soft flag — recorded, never blocking.
+  block_on: ["no_model", "bad_face", "broken_body", "gender_mismatch"]
+  # Sub-categories legitimately shot without a model. NO MODEL is a soft flag
+  # on these; BAD FACE and BROKEN BODY still block (they cannot fire without a
+  # model, so in practice these pass).
+  accessory_terms:
+    ["cap", "caps", "beanie", "beanies", "hat", "hats", "gloves", "belt",
+     "belts", "scarf", "scarves", "bag", "bags", "backpack", "backpacks",
+     "accessories", "accessory", "wallet", "wallets", "socks", "sunglasses"]
+  # null = llm.model_fast.
+  model: null
 
 # --------------------------------------------------------------------------- #
 # Readability — can the text in a phone photograph actually be read?

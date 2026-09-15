@@ -17,6 +17,7 @@ import httpx
 from google import genai
 from google.genai import types
 
+from app.llm import health
 from app.models import AttributeVerdict, ProductSnapshot, RRPEvidence, VisionAudit
 from app.net import genai_client_args
 
@@ -93,6 +94,11 @@ class GeminiEvidence:
         self.cfg = pol["llm"]
         self.calls = 0
         self.errors: list[str] = []
+        # Why the LAST call returned None: "api" (the provider failed — counted
+        # by app/llm/health.py) or "answer" (it answered, unusably). A caller
+        # that must tell an outage from a bad answer reads this; every other
+        # caller keeps ignoring None as before.
+        self.last_error_kind: str | None = None
 
     # ---------------------------------------------------------------- helpers
     @staticmethod
@@ -136,12 +142,19 @@ class GeminiEvidence:
             resp = self.client.models.generate_content(
                 model=model, contents=contents, config=config,
             )
-            return self._parse(resp.text)
+            parsed = self._parse(resp.text)
         except Exception as exc:  # noqa: BLE001 — evidence is best-effort
             msg = f"{model}: {type(exc).__name__}: {exc}"
             log.warning("gemini call failed (%s)", msg)
             self.errors.append(msg)
+            # Counted towards the outage guard only when the PROVIDER failed —
+            # a 429, a 5xx, a rejected key, a timeout. A parse error is a bad
+            # answer from a live provider and must not look like an outage.
+            self.last_error_kind = "api" if health.record_error(exc, "gemini", self.pol) else "answer"
             return None
+        health.record_ok("gemini", self.pol)
+        self.last_error_kind = None
+        return parsed
 
     def _strip_forbidden(self, verdicts: list[dict[str, Any]]) -> list[AttributeVerdict]:
         blocked = set(self.pol["guardrails"]["llm_forbidden_fields"])
@@ -326,18 +339,26 @@ class GeminiEvidence:
 
     # ------------------------------------------------------------------ utils
     def _fetch_images(self, urls: list[str]) -> list[types.Part]:
+        """Download the images as Parts, in the order given. Never raises.
+
+        Through app.net.fetch_all rather than a bare httpx.Client: that is the
+        client with the IPv4 switch, the phase timeouts and the truncated-body
+        retry. The bare client is exactly the "15s setting that produced a 43s
+        fetch" its docstring describes, and on the calibration run the gate lost
+        one product in twenty-five to a single ConnectError against R2 that a
+        retry would have absorbed.
+        """
+        from app.net import fetch_all
+
+        got = fetch_all(urls, timeout_s=15.0, deadline_s=30.0)
         parts: list[types.Part] = []
-        with httpx.Client(timeout=15, follow_redirects=True) as client:
-            for url in urls:
-                try:
-                    r = client.get(url)
-                    r.raise_for_status()
-                    mime = r.headers.get("content-type", "image/jpeg").split(";")[0]
-                    if not mime.startswith("image/"):
-                        continue
-                    parts.append(types.Part.from_bytes(data=r.content, mime_type=mime))
-                except Exception as exc:  # noqa: BLE001
-                    msg = f"image fetch failed ({url[:60]}): {type(exc).__name__}"
-                    log.warning(msg)
-                    self.errors.append(msg)
+        for url in urls:
+            data = got.get(url)
+            if data is None:
+                msg = f"image fetch failed ({url[:60]})"
+                self.errors.append(msg)
+                continue
+            mime = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else (
+                "image/webp" if data[8:12] == b"WEBP" else "image/jpeg")
+            parts.append(types.Part.from_bytes(data=data, mime_type=mime))
         return parts

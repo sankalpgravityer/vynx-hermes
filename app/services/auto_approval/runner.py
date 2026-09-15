@@ -20,6 +20,7 @@ from psycopg.types.json import Jsonb
 
 from app import product_audit
 from app.config import settings
+from app.llm import health
 from app.services.auto_approval import claim, config as cfgmod, db, events
 from app.services.auto_approval.outcome import Verdict, classify
 from app.services.auto_approval.schedule import in_window, window_from_row
@@ -32,6 +33,15 @@ log = logging.getLogger("auto-approval.runner")
 # served, and Celery's soft time limit fires mid-product. The next tick resumes
 # with no state to carry, because "where it left off" is the table.
 PUMP_BUDGET_S = int(__import__("os").getenv("AUTO_APPROVAL_PUMP_BUDGET_S", "900"))
+
+# How long a tenant stays stopped after the canary trips. Process-local, like
+# the vision-health pause: the next beat tick would otherwise pick the tenant
+# straight back up and spend another product's renders discovering the same
+# thing. No column is written — this is the loop declining, not the tenant
+# being switched off — so a worker restart clears it, which is right: the
+# operator restarting the worker is the operator saying "try again".
+CANARY_PAUSE_S = int(__import__("os").getenv("AUTO_APPROVAL_CANARY_PAUSE_S", "3600"))
+_stopped: dict[str, tuple[float, str]] = {}   # tenant_id -> (until, why)
 
 
 def _load_repair():
@@ -334,8 +344,14 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                ignore_stop: bool = False,
                allow_stage: list[str] | None = None,
                expect_status: str = "IN_PROGRESS",
-               silent: bool = False) -> None:
+               silent: bool = False) -> str | None:
     """One claimed product, start to finish. Never raises.
+
+    RETURNS None, or one sentence saying why the RUN must stop — the canary
+    (a repair write triggered paid regeneration). The product itself is always
+    finished or released before that is returned; the caller's only job is to
+    take no more work. Every caller may ignore the value and lose nothing but
+    the stop.
 
     `ignore_stop` skips the `enabled` re-read described at the approve decision
     below. DEFAULT FALSE, so the Celery path is untouched — the only caller that
@@ -549,6 +565,59 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
 
     verdict = classify(result)
 
+    # THE CANARY. Every step above writes through vnyx-api's own update path,
+    # and that path has hooks: a change to certain fields can re-queue the
+    # product for ANALYSIS, which regenerates its images at a paid call per
+    # view. Nothing in this chain intends that. So repair() reads the product's
+    # generationStatus before and after, and a flip to GENERATING that the
+    # render step did not cause means a repair write is triggering paid
+    # regeneration — for this product and, unchecked, for every one behind it.
+    # This product is finished normally (the flip is on its row); the RUN
+    # stops, and the reason is what this function returns.
+    gen = result.get("generation") or {}
+    abort: str | None = None
+    if gen.get("regeneration_triggered"):
+        abort = (
+            f"canary: {row['productSku']} flipped {gen.get('before')} → "
+            f"{gen.get('after')} during the chain without the render step "
+            f"running — a repair write is triggering paid regeneration. No "
+            f"further product was started."
+        )
+        events.emit(tenant_id, "fail", abort, run_id=row["runId"],
+                    run_product_id=row["id"], product_id=product_id, detail=gen)
+
+    # NOT JUDGED, BECAUSE THE JUDGE WAS ABSENT. `vision_unavailable` names the
+    # steps — care label, gate — whose provider read failed at the API rather
+    # than returning an answer. A hold reached that way says nothing about the
+    # product, so it is put back with a backoff like any other retryable
+    # failure, and only once the attempts are spent is it held, under a code
+    # that names the provider rather than the product. See app/llm/health.py.
+    unavailable = list(result.get("vision_unavailable") or [])
+    if unavailable and verdict.status == "HELD_FOR_HUMAN":
+        where = ", ".join(unavailable)
+        if row["attempts"] < row["maxAttempts"]:
+            claim.release_lease(
+                str(row["id"]),
+                backoff_seconds=claim.backoff_seconds(int(row["attempts"])),
+            )
+            events.emit(
+                tenant_id, "warn",
+                f"{row['productSku']}: vision provider unavailable during {where} "
+                f"— not judged, retrying (attempt {row['attempts']} of "
+                f"{row['maxAttempts']})",
+                run_id=row["runId"], run_product_id=row["id"],
+                product_id=product_id,
+                detail={"vision_unavailable": unavailable, "health": health.snapshot()},
+            )
+            return abort
+        verdict = Verdict(
+            "HELD_FOR_HUMAN", "VISION_UNAVAILABLE",
+            f"The vision provider was unavailable during {where} on every "
+            f"attempt ({row['maxAttempts']}), so the product was not judged. "
+            f"Re-run once the provider is back.",
+            False, False,
+        )
+
     # NO BRAND OR SIZE — decided AFTER the chain, and that ordering is the whole
     # point. Both are read off the care label by the extract and care-label
     # steps, so asking first would reject products the pipeline was about to
@@ -558,7 +627,13 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     # Only converts a HOLD. A product that VERIFIED is approvable and must not
     # be archived over a field the pre-flight was content with; a FAILED one
     # already has its terminal verdict.
-    if (rs.apply and verdict.status == "HELD_FOR_HUMAN"
+    #
+    # AND NEVER WHEN THE READER WAS DOWN. During a provider outage every label
+    # is "not readable", and this rule would archive the queue product by
+    # product — the exact incident the outage guard exists for. A product on
+    # `vision_unavailable` has not had its chance; it is held above, not
+    # rejected here.
+    if (rs.apply and verdict.status == "HELD_FOR_HUMAN" and not unavailable
             and (missing := _missing_attrs(product_id))):
         why = f"{' and '.join(missing)} missing — not readable from the care label"
         events.emit(tenant_id, "warn", f"{row['productSku']} — {why}, rejecting",
@@ -573,7 +648,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                 duration_ms=duration,
                 expect_status=expect_status,
             )
-            return
+            return abort
 
     _finish(
         row,
@@ -586,10 +661,29 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
             "after": result.get("after"),
             "stageBefore": result.get("stage_before"),
             "stageAfter": result.get("stage_after"),
+            "gate": result.get("gate"),
+            "generation": gen or None,
         },
         duration_ms=duration,
         expect_status=expect_status,
     )
+    return abort
+
+
+def stop_reason(abort: str | None = None) -> str | None:
+    """Should the loop take another product? None if yes, else why not.
+
+    The two run-level stops in one place, so the Celery pump and the sheet
+    driver cannot disagree about them: the canary (passed in, from verify_one)
+    and the vision outage (asked of app/llm/health.py). Call BETWEEN products.
+    """
+    if abort:
+        return abort
+    try:
+        health.check()
+    except health.VisionOutage as exc:
+        return f"vision outage — {exc}"
+    return None
 
 
 def pump(tenant_id: str) -> dict[str, Any]:
@@ -607,6 +701,27 @@ def pump(tenant_id: str) -> dict[str, Any]:
     while True:
         if not cfgmod.is_enabled(tenant_id):
             reason = "stopped"
+            break
+
+        # A tenant the canary stopped stays stopped until the pause passes —
+        # otherwise this tick would spend another product's renders finding
+        # the same thing. Checked before claiming so no row is taken for it.
+        until, why = _stopped.get(tenant_id, (0.0, ""))
+        if until > time.monotonic():
+            log.warning("tenant=%s stopped by canary for another %ds: %s",
+                        tenant_id, int(until - time.monotonic()), why)
+            reason = "canary"
+            break
+        _stopped.pop(tenant_id, None)
+
+        # And a provider still in its outage cooldown means nothing would be
+        # judged, so nothing is claimed. Silent here — the event was written
+        # when the outage was detected — and check() clears the window itself
+        # once the cooldown is over.
+        pre_stop = stop_reason()
+        if pre_stop:
+            log.warning("tenant=%s not pumping: %s", tenant_id, pre_stop)
+            reason = "vision outage"
             break
 
         cfg_row = cfgmod.load_config(tenant_id)
@@ -642,10 +757,25 @@ def pump(tenant_id: str) -> dict[str, Any]:
             run and run["configSnapshot"], int(cfg_row["maxAttempts"])
         )
 
-        verify_one(row, rs)
+        abort = verify_one(row, rs)
         processed += 1
 
         claim.close_finished_runs()
+
+        # THE TWO RUN-LEVEL STOPS, asked between products and never inside one.
+        stop = stop_reason(abort)
+        if stop:
+            if abort:
+                _stopped[tenant_id] = (time.monotonic() + CANARY_PAUSE_S, abort)
+                reason = "canary"
+            else:
+                # The outage's own event, once, on the run it interrupted. The
+                # cooldown check at the top of the loop is silent after this.
+                events.emit(tenant_id, "fail", stop, run_id=row["runId"],
+                            detail={"health": health.snapshot()})
+                reason = "vision outage"
+            log.error("tenant=%s run stopped: %s", tenant_id, stop)
+            break
 
         if time.monotonic() - started > PUMP_BUDGET_S:
             reason = "budget"
