@@ -341,6 +341,28 @@ llm:
     error_ratio: 0.7
     cooldown_s: 600
 
+  # VISION RESPONSE CACHE — app/llm/cache.py.
+  #
+  # The answer to "what is in this picture" does not change while the picture
+  # does not, so the gate, the care-label read, the image audit and the
+  # background classifier remember their parsed answers and never send the
+  # same image to the model twice. Keyed on the image (URL with its query
+  # string, or a digest of the bytes), the prompt, the schema and the model —
+  # editing a prompt invalidates every answer given to the old one on its own.
+  # Failures are never stored; neither is an answer computed with an image
+  # missing. The win is on re-runs: --retry after an outage, re-verification
+  # after a repair, calibration sweeps.
+  #
+  # `redis_url` null means one JSON file per answer under `dir` (atomic writes,
+  # safe for --workers). Point it at a spare database of the Celery Redis to
+  # share the cache between the worker and the CLI. Environment for one run:
+  # HERMES_VISION_CACHE=0 (off), HERMES_VISION_CACHE_DIR, HERMES_VISION_CACHE_REDIS.
+  cache:
+    enabled: true
+    ttl_hours: 168
+    dir: ".cache/vision"
+    redis_url: null
+
 # --------------------------------------------------------------------------- #
 # Imagery — the on-model renders and background removal.
 # See docs/IMAGERY-VERIFICATION.md for how these numbers were arrived at.
@@ -594,6 +616,46 @@ quality_gate:
     ["cap", "caps", "beanie", "beanies", "hat", "hats", "gloves", "belt",
      "belts", "scarf", "scarves", "bag", "bags", "backpack", "backpacks",
      "accessories", "accessory", "wallet", "wallets", "socks", "sunglasses"]
+  # null = llm.model_fast.
+  model: null
+
+# --------------------------------------------------------------------------- #
+# Photo audit — what the garment PHOTOGRAPHS say. app/imaging/photo_audit.py
+#
+# The gate above judges the render, which is generated and shows no wear. This
+# is ONE more call per product over the cut-outs and the renders together,
+# answering two of the auditor's checks the port had deferred:
+#
+#   GRADE_SUSPECT  the photographs show wear at least `disagreement_steps`
+#                  WORSE than the record's grade, on the shared Grade.severity
+#                  scale none < minor < moderate < major. Held for a person;
+#                  the defects the model saw are listed. The grade is never
+#                  written. Photos that look BETTER than the grade are a soft
+#                  flag (under-grading costs margin, not trust).
+#   IMAGE_DEFECT   an image is not what its slot says — background left in a
+#                  cut-out, a close-up filed as a front, a render with a
+#                  duplicated garment. Soft by default; `block: true` holds.
+#
+# Two steps is the auditor's calibration: one step apart is the honest
+# disagreement of two people looking at the same jeans. `required: false`
+# means a provider failure here blocks nothing — the gate is the definition of
+# "may this leave Review"; this adds evidence to it.
+# --------------------------------------------------------------------------- #
+photo_audit:
+  enabled: true
+  required: false
+  wear:
+    enabled: true
+    views: ["FRONT", "BACK"]
+    max_images: 2
+    disagreement_steps: 2
+    min_confidence: 0.6
+    block: true
+  gallery:
+    enabled: true
+    views: ["FRONT", "BACK", "AI_FRONT", "AI_BACK", "AI_FRONT_34", "AI_BACK_34", "AI_CLOSEUP"]
+    max_images: 8
+    block: false
   # null = llm.model_fast.
   model: null
 

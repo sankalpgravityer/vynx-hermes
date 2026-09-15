@@ -75,6 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from psycopg.types.json import Jsonb  # noqa: E402
 
+from app.llm import cache as vision_cache  # noqa: E402
 from app.services.auto_approval import (  # noqa: E402
     claim,
     config as cfgmod,
@@ -1470,6 +1471,9 @@ def main() -> int:
 
     print(f"\n{'-' * 58}")
     print(f"verified {ok} · held {held} · failed {failed} · skipped {skipped}")
+    cache_line = vision_cache.summary()
+    if cache_line:
+        print(cache_line)
     print("One Whole-queue run per tenant, still open — run this again and")
     print("the next products join the same run.")
     return 0

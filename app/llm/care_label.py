@@ -44,9 +44,15 @@ from typing import Any
 import httpx
 
 from app.config import policy, settings
-from app.llm import health
+from app.llm import cache, health
 
 log = logging.getLogger("hermes.care-label")
+
+# How many label photographs one read uploads. A product with eight label shots
+# is eight uploads for a question two answer, and the pipeline already pays for
+# a vision call per product. Shared by `_fetch` and the cache key so the two
+# cannot disagree about which pictures an answer was about.
+_FETCH_CAP = 4
 
 # What one provider read attempt came back as. `read()` needs to tell the
 # difference between "asked and got nothing" and "could not ask": a provider
@@ -119,12 +125,8 @@ PROMPT = (
 )
 
 
-def _fetch(urls: list[str], cap: int = 4) -> list[tuple[bytes, str]]:
-    """Download the label images. Skips what it cannot get rather than failing.
-
-    Capped: a product with eight label shots is eight uploads for a question two
-    answer, and the pipeline already pays for a vision call per product.
-    """
+def _fetch(urls: list[str], cap: int = _FETCH_CAP) -> list[tuple[bytes, str]]:
+    """Download the label images. Skips what it cannot get rather than failing."""
     out: list[tuple[bytes, str]] = []
     for url in urls[:cap]:
         try:
@@ -269,6 +271,15 @@ def _read_openai(images: list[tuple[bytes, str]]) -> tuple[dict[str, Any] | None
     return parsed, "ok"
 
 
+def _model_name(provider: str, pol: dict[str, Any]) -> str:
+    """The model a provider's read would use — part of its cache key, so a
+    model change re-asks rather than serving the old model's reading."""
+    llm = pol.get("llm") or {}
+    if provider == "openai":
+        return str(llm.get("openai_vision_model", "gpt-4o-mini"))
+    return str(llm.get("model_fast") or "")
+
+
 def _size_ok(value: str, ladder: list[str] | None) -> bool:
     """Is this a size the product's own sizing guide can actually express?
 
@@ -308,23 +319,47 @@ def read(label_urls: list[str], *, want: tuple[str, ...] = ("brand", "size"),
     tag.
     """
     result: dict[str, Any] = {"tried": [], "rejected": {}, "provider": None,
-                              "unavailable": []}
+                              "unavailable": [], "cached": []}
     if not label_urls:
         result["error"] = "no care-label photograph on the product"
         return result
 
-    images = _fetch(label_urls)
-    if not images:
-        result["error"] = "care-label images could not be downloaded"
-        return result
+    # The pictures `_fetch` would upload, and with them each provider's cache
+    # key. Downloaded LAZILY, on the first provider that actually has to look:
+    # a label already read is answered without a download, and the download is
+    # most of what this step costs.
+    pol = policy()
+    urls = [str(u) for u in label_urls[:_FETCH_CAP]]
+    images: list[tuple[bytes, str]] | None = None
 
     # Providers actually asked, as opposed to listed. A provider with no key
     # was never a chance the label had, so it is neither "tried" nor "down".
     attempted: list[str] = []
     for name, fn in (("gemini", _read_gemini), ("openai", _read_openai)):
-        raw, status = fn(images)
-        if status == "not_configured":
-            continue
+        ckey = cache.key(f"care_label.{name}", urls=urls,
+                         text=[SYSTEM, PROMPT, _model_name(name, pol)])
+        raw = cache.get(ckey, pol)
+        if raw is not None:
+            status = "ok"
+            result["cached"].append(name)
+        else:
+            if images is None:
+                images = _fetch(label_urls)
+                if not images:
+                    if not any(f in result for f in want):
+                        result["error"] = "care-label images could not be downloaded"
+                        return result
+                    # A partial answer from the cache stands; the provider that
+                    # could have completed it cannot be shown the pictures.
+                    break
+            raw, status = fn(images)
+            if status == "not_configured":
+                continue
+            # Only a parsed answer to the WHOLE question is remembered. A
+            # failure is not an answer, and an answer given with a picture
+            # missing was to a different question — see app/llm/cache.py.
+            if status == "ok" and raw and len(images) == len(urls):
+                cache.put(ckey, raw, pol)
         result["tried"].append(name)
         attempted.append(name)
         if status == "api_error":

@@ -133,6 +133,7 @@ class GateVerdict:
     unavailable: bool = False            # the gate could not run; retry, do not judge
     confidence: float | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    cached: bool = False                 # answered from app/llm/cache.py, no call made
 
     @property
     def blocks(self) -> bool:
@@ -156,7 +157,8 @@ class GateVerdict:
             parts.append("soft: " + ", ".join(self.soft))
         if self.lead_view:
             parts.append(f"on {self.lead_view}")
-        return " — ".join(parts[:2]) + (f" ({'; '.join(parts[2:])})" if len(parts) > 2 else "")
+        line = " — ".join(parts[:2]) + (f" ({'; '.join(parts[2:])})" if len(parts) > 2 else "")
+        return line + (" (cached)" if self.cached else "")
 
 
 def config(pol: dict[str, Any] | None) -> dict[str, Any]:
@@ -343,38 +345,55 @@ def judge(media: list[dict[str, Any]], *, gender: Any,
         return GateVerdict("review", "VISION_UNAVAILABLE", [why],
                            lead_url=lead_url, lead_view=lead_view, unavailable=True)
 
-    if evidence is None:
-        from app.config import settings
-
-        key = api_key or settings().gemini_api_key
-        if not key:
-            if cfg["required"]:
-                return unavailable("no GEMINI_API_KEY — the gate cannot run, and "
-                                   "policy says approval must not proceed without it")
-            return GateVerdict("skipped", reasons=["no GEMINI_API_KEY"],
-                               lead_url=lead_url, lead_view=lead_view)
-        try:
-            from app.llm.gemini import GeminiEvidence
-        except ImportError as exc:  # pragma: no cover — SDK optional
-            return unavailable(f"google-genai is not installed ({exc})")
-        evidence = GeminiEvidence(key, pol or {"llm": {"model_fast": "gemini-2.5-flash"}})
-
-    parts = evidence._fetch_images([lead_url])
-    if not parts:
-        return unavailable(f"lead image could not be downloaded ({lead_url[:80]})")
-
     model = cfg.get("model") or (pol or {}).get("llm", {}).get("model_fast") or "gemini-2.5-flash"
-    raw = evidence._generate(model=model, contents=[*parts, PROMPT],
-                             schema=SCHEMA, system=SYSTEM)
-    if raw is None:
-        if getattr(evidence, "last_error_kind", None) == "api":
-            last = (evidence.errors or ["provider error"])[-1]
-            return unavailable(f"vision provider failed ({last[:160]})")
-        # The provider answered and the answer was unusable. Not an outage, and
-        # not a pass either: hold it, and say why.
-        return GateVerdict("review", "IMAGE_QUALITY",
-                           ["the model returned an unreadable answer"],
-                           lead_url=lead_url, lead_view=lead_view)
+
+    # THE CACHE IS ASKED FIRST — before a client is built, a key is required or
+    # a byte is downloaded. A render already judged under this prompt needs
+    # none of those, and the download is where the gate's 8–14 s go. Only the
+    # model's raw answer is remembered; `decide()` still runs on every call, so
+    # a policy change (what blocks, which families are adjacent) applies to
+    # cached answers too.
+    from app.llm import cache
+
+    ckey = cache.key("quality_gate", urls=[lead_url], text=[model, SYSTEM, PROMPT, SCHEMA])
+    raw = cache.get(ckey, pol)
+    hit = raw is not None
+
+    if not hit:
+        if evidence is None:
+            from app.config import settings
+
+            key = api_key or settings().gemini_api_key
+            if not key:
+                if cfg["required"]:
+                    return unavailable("no GEMINI_API_KEY — the gate cannot run, and "
+                                       "policy says approval must not proceed without it")
+                return GateVerdict("skipped", reasons=["no GEMINI_API_KEY"],
+                                   lead_url=lead_url, lead_view=lead_view)
+            try:
+                from app.llm.gemini import GeminiEvidence
+            except ImportError as exc:  # pragma: no cover — SDK optional
+                return unavailable(f"google-genai is not installed ({exc})")
+            evidence = GeminiEvidence(key, pol or {"llm": {"model_fast": "gemini-2.5-flash"}})
+
+        parts = evidence._fetch_images([lead_url])
+        if not parts:
+            return unavailable(f"lead image could not be downloaded ({lead_url[:80]})")
+
+        raw = evidence._generate(model=model, contents=[*parts, PROMPT],
+                                 schema=SCHEMA, system=SYSTEM)
+        if raw is None:
+            if getattr(evidence, "last_error_kind", None) == "api":
+                last = (evidence.errors or ["provider error"])[-1]
+                return unavailable(f"vision provider failed ({last[:160]})")
+            # The provider answered and the answer was unusable. Not an outage, and
+            # not a pass either: hold it, and say why.
+            return GateVerdict("review", "IMAGE_QUALITY",
+                               ["the model returned an unreadable answer"],
+                               lead_url=lead_url, lead_view=lead_view)
+        # A parsed answer, and nothing else, is worth remembering: the two
+        # returns above are the failures the cache must never serve.
+        cache.put(ckey, raw, pol)
 
     from app.rules.gate import resolve_gender
 
@@ -382,4 +401,5 @@ def judge(media: list[dict[str, Any]], *, gender: Any,
                      accessory=is_accessory(subcategory, category, pol=pol), pol=pol,
                      category=category, subcategory=subcategory)
     verdict.lead_url, verdict.lead_view = lead_url, lead_view
+    verdict.cached = hit
     return verdict

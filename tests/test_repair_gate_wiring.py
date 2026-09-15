@@ -24,6 +24,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts import repair_product as rp  # noqa: E402
+from app.imaging import photo_audit as pa  # noqa: E402
 from app.imaging import quality_gate as qg  # noqa: E402
 from app.imaging.quality_gate import GateVerdict  # noqa: E402
 
@@ -79,20 +80,25 @@ def wired(monkeypatch):
         return dict(approve_outcome)
 
     gate_verdict: dict[str, Any] = {"value": GateVerdict("ok")}
+    photo_verdict: dict[str, Any] = {"value": GateVerdict("ok")}
 
     def fake_judge(media, **kw):
         return gate_verdict["value"]
+
+    def fake_photos(media, **kw):
+        return photo_verdict["value"]
 
     monkeypatch.setattr(rp, "needs", fake_needs)
     monkeypatch.setattr(rp, "run_step", fake_run_step)
     monkeypatch.setattr(rp, "approve_check", fake_approve_check)
     monkeypatch.setattr(qg, "judge", fake_judge)
+    monkeypatch.setattr(pa, "judge", fake_photos)
     monkeypatch.setattr(
         rp.product_audit, "audit",
         lambda *a, **k: {"verified_after": True, "remaining": [], "counts": {"issues": 0}},
     )
     return {"calls": calls, "states": states, "approve": approve_outcome,
-            "gate": gate_verdict}
+            "gate": gate_verdict, "photos": photo_verdict}
 
 
 def _repair(apply: bool = False, approve: bool = False) -> dict[str, Any]:
@@ -150,6 +156,60 @@ def test_the_gate_is_skipped_without_a_render(wired):
     r = _repair()
     assert r["gate"]["action"] == "skipped"
     assert r["approval"]["outcome"] == "would_approve"
+
+
+# ------------------------------------------------------------ the photo audit
+
+def test_a_passed_photo_audit_changes_nothing(wired):
+    r = _repair()
+    assert r["photos"]["action"] == "ok"
+    photos_step = next(s for s in r["steps"] if s["step"] == "photos")
+    assert photos_step["ran"] and photos_step["ok"] and photos_step["note"].startswith("passed")
+    assert r["approval"]["outcome"] == "would_approve"
+
+
+def test_grade_suspect_on_a_ready_product_withholds_the_move(wired):
+    wired["photos"]["value"] = GateVerdict(
+        "review", "GRADE_SUSPECT",
+        ["GRADE SUSPECT — the photographs show major wear (hole at cuff) but grade A says none"])
+    r = _repair(apply=True, approve=True)
+    assert wired["calls"]["approve"] == [{"apply": False}]
+    assert r["approval"]["outcome"] == "gate_blocked"
+    assert r["approval"]["gate_code"] == "GRADE_SUSPECT"
+    assert r["approval"]["blockers"] == [
+        "photo audit: GRADE SUSPECT — the photographs show major wear (hole at cuff) but grade A says none"]
+    photos_step = next(s for s in r["steps"] if s["step"] == "photos")
+    assert photos_step["note"].startswith("HELD — GRADE SUSPECT")
+
+
+def test_gate_and_photo_audit_both_refusing_name_the_gate_and_keep_both_reasons(wired):
+    wired["gate"]["value"] = GateVerdict("regen", "IMAGE_QUALITY", ["BAD FACE — corrupted"])
+    wired["photos"]["value"] = GateVerdict("review", "GRADE_SUSPECT", ["GRADE SUSPECT — major vs none"])
+    r = _repair(apply=True, approve=True)
+    assert r["approval"]["outcome"] == "gate_blocked"
+    assert r["approval"]["gate_code"] == "IMAGE_QUALITY"
+    assert r["approval"]["blockers"] == ["image gate: BAD FACE — corrupted",
+                                         "photo audit: GRADE SUSPECT — major vs none"]
+
+
+def test_an_unavailable_gate_beside_a_real_photo_hold_is_a_hold_not_a_retry(wired):
+    wired["gate"]["value"] = GateVerdict(
+        "review", "VISION_UNAVAILABLE", ["vision provider failed (429)"], unavailable=True)
+    wired["photos"]["value"] = GateVerdict("review", "GRADE_SUSPECT", ["GRADE SUSPECT — major vs none"])
+    r = _repair(apply=True, approve=True)
+    assert r["approval"]["outcome"] == "gate_blocked"
+    assert r["approval"]["gate_code"] == "GRADE_SUSPECT"
+
+
+def test_a_required_photo_audit_that_could_not_run_is_recorded_and_never_approves(wired):
+    wired["photos"]["value"] = GateVerdict(
+        "review", "VISION_UNAVAILABLE", ["vision provider failed (429)"], unavailable=True)
+    r = _repair(apply=True, approve=True)
+    assert wired["calls"]["approve"] == [{"apply": False}]
+    assert r["approval"]["outcome"] == "gate_unavailable"
+    assert "photos" in r["vision_unavailable"]
+    photos_step = next(s for s in r["steps"] if s["step"] == "photos")
+    assert photos_step["ok"] is False and "vision unavailable" in photos_step["note"]
 
 
 def test_the_canary_flags_a_flip_the_render_did_not_cause(wired):

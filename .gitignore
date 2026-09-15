@@ -24,6 +24,9 @@ env/
 ENV/
 
 # ── Test / tooling caches ───────────────────────────────────────────────────
+# app/llm/cache.py's file backend: one JSON answer per image the vision model
+# has already judged. Rebuilds itself; never worth committing.
+.cache/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

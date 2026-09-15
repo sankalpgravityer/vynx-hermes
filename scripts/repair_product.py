@@ -12,6 +12,12 @@
     python scripts/repair_product.py --db "..." \
         --from-sheet reports/generated/prod-review.xlsx --limit 10 --apply
 
+    # OFFLINE. The rule engine over a saved product: no database, no network,
+    # nothing written. Save one with --dump-fixture; tests/fixtures/repair/ ships one.
+    python scripts/repair_product.py --fixture tests/fixtures/repair/
+    python scripts/repair_product.py --db "..." --product <uuid> \
+        --dump-fixture reports/fixtures/<sku>.json
+
 Four steps, each SKIPPED when the product does not need it. Nothing here is a new
 implementation: every step shells out to the script that already owns that work,
 so a render produced by this and one produced by the Model images button are the
@@ -115,6 +121,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import product_audit  # noqa: E402
 from app.config import policy, settings  # noqa: E402
+from app.llm import cache as vision_cache  # noqa: E402
 
 # Where the TypeScript half lives. Every write this script causes happens in
 # there, because that is where R2, the ProductMedia invariants, the price mirror
@@ -381,7 +388,15 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
     Uses the audit's own view rather than a second set of queries, so "needs a
     description" here and "description missing" on the sheet cannot disagree.
     """
-    loaded = product_audit.load(dsn, product_id)
+    return needs_from(product_audit.load(dsn, product_id))
+
+
+def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
+    """`needs()` on a product already loaded — from the database or a fixture.
+
+    Split out so `--fixture` judges a file with exactly the predicates the live
+    chain uses; a second copy of "is this view matted" would drift.
+    """
     record, media = loaded["record"], loaded["media"]
 
     live = [m for m in media if m["mediaType"] == "IMAGE"]
@@ -468,6 +483,172 @@ def _generation_in_flight(state: dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------- #
 # The chain
 # --------------------------------------------------------------------------- #
+
+# --------------------------------------------------------------------------- #
+# Offline: fixtures
+# --------------------------------------------------------------------------- #
+FIXTURE_KEYS = ("record", "media", "catalog", "grade_ladder", "imagery_settings", "chart")
+
+
+def dump_fixture(dsn: str, product_id: str, path: Path) -> Path:
+    """Write one product exactly as `product_audit.load()` sees it.
+
+    The file is the rule engine's whole input — the record, the typed media
+    rows, the tenant's option lists, grade ladder, imagery settings and chart
+    facts — so `--fixture` later judges the product the database held at this
+    moment, with no database. It is REAL TENANT DATA (SKU, title, URLs, every
+    attribute): keep it under reports/ unless it has been trimmed for a test,
+    the way tests/fixtures/repair/ was.
+    """
+    loaded = product_audit.load(dsn, product_id)
+    doc: dict[str, Any] = {k: loaded.get(k) for k in FIXTURE_KEYS}
+    doc["_fixture"] = {
+        "source": "scripts/repair_product.py --dump-fixture",
+        "sku": (loaded["record"] or {}).get("sku"),
+        "product_id": product_id,
+        "database": _redact(dsn),
+        "dumped_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=1, default=str, ensure_ascii=False),
+                    encoding="utf-8")
+    return path
+
+
+def run_fixture(path: Path, *,
+                severity_overrides: dict[str, str] | None = None) -> dict[str, Any]:
+    """The rule engine over one fixture file. No database, no network, no writes.
+
+    WHAT RUNS: `needs_from` (which chain steps the product would get) and
+    `approval.run_gate` — every rule, every planner, the price assessment —
+    exactly as the live chain's reconcile step runs them, minus the evidence
+    layer: no model is called, so a finding that wanted a photograph looked at
+    stays a finding. WHAT DOES NOT: the sub-scripts (matte, relabel, extract,
+    render, approve) live in vnyx-api and need its database; the image gate
+    needs the model. This is the auditor's `--fixture` self-test — does the
+    engine run end to end, and what does it say about a product whose answer is
+    known — not a rehearsal of a repair.
+    """
+    from app import approval, twins
+
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("record"), dict):
+        raise ValueError(f"{path}: not a fixture — no 'record'. Write one with --dump-fixture.")
+    loaded: dict[str, Any] = {k: data.get(k) for k in FIXTURE_KEYS}
+    loaded["media"] = loaded["media"] or []
+    state = needs_from(loaded)
+    gate = approval.run_gate({**loaded["record"], "media": loaded["media"]},
+                             catalog=loaded["catalog"],
+                             imagery_settings=loaded["imagery_settings"],
+                             llm=None, severity_overrides=severity_overrides)
+
+    # The chain's own predicates, so the fixture's answer and a live dry run
+    # cannot disagree about the shape of the work. Relabel is left out: its
+    # test is the sub-script's, run against the media rows on the host.
+    would: list[str] = []
+    if twins.parent_sku(state["sku"], policy()):
+        would.append("twin")
+    if state["unmatted"]:
+        would.append("matte")
+    if state["description_missing"] or state["attributes_missing"]:
+        would.append("extract")
+    if state["care_label"] and any(a in ("brand", "size") for a in state["attributes_missing"]):
+        would.append("care label")
+    if gate["repair_plan"]:
+        would.append("reconcile")
+    if state["renders_missing"]:
+        would.append("render")
+
+    return {
+        "fixture": str(path),
+        "sku": state["sku"], "title": state["title"], "tenant": state["tenant"],
+        "stage": state["stage"],
+        "verified": bool(gate["verified"]),
+        "blocking": gate["blocking"],
+        "advisory": gate["advisory"],
+        "findings": gate["findings"],
+        "repair_plan": gate["repair_plan"],
+        "price": gate.get("price"),
+        "would_run": would,
+        "state": {k: state[k] for k in ("description_chars", "care_label", "unmatted",
+                                        "renders", "attributes_missing")},
+        "dumped": data.get("_fixture") or {},
+    }
+
+
+def _fixture_paths(args: list[str]) -> list[Path]:
+    """Files as given; a directory means every *.json in it, sorted."""
+    out: list[Path] = []
+    for a in args:
+        p = Path(a)
+        if p.is_dir():
+            out.extend(sorted(p.glob("*.json")))
+        else:
+            out.append(p)
+    return out
+
+
+def run_fixtures(paths: list[Path], *, out: str | None = None) -> int:
+    """`--fixture`: every file, one report each. Exit 0 when all of them ran —
+    a blocked product is a result, not a failure of the self-test."""
+    print(paint("OFFLINE — fixtures only. No database, no network, nothing written; "
+                "the rules and planners run, the model and the sub-scripts do not.",
+                YELLOW))
+    if not paths:
+        print(paint("  no fixture files found", RED))
+        return 1
+    results: list[dict[str, Any]] = []
+    failed = 0
+    width = len(str(len(paths)))
+    for n, path in enumerate(paths, start=1):
+        head = f'[{str(n).rjust(width)}/{len(paths)}]'
+        try:
+            r = run_fixture(path)
+        except Exception as exc:  # noqa: BLE001 — report it and run the rest
+            failed += 1
+            print(f'{paint(head, BOLD)}  '
+                  f'{paint(f"{path.name}: {type(exc).__name__}: {exc}", RED)}')
+            continue
+        results.append(r)
+        st = r["state"]
+        print(f'{paint(head, BOLD)}  {path.name} {DOT} {r["sku"]} {DOT} '
+              f'{(r["title"] or "")[:60]}')
+        print(paint(f'        {r["tenant"]} {DOT} {r["stage"]} {DOT} '
+                    f'{st["description_chars"]} chars {DOT} care label {st["care_label"]} '
+                    f'{DOT} {st["unmatted"]} unmatted {DOT} {st["renders"]}/5 renders {DOT} '
+                    f'missing {", ".join(st["attributes_missing"]) or "nothing"}', DIM))
+        verdict = (paint("verified", GREEN) if r["verified"]
+                   else paint(f'{len(r["blocking"])} blocking', RED))
+        print(f'        {verdict} {DOT} {len(r["advisory"])} advisory {DOT} '
+              f'{len(r["repair_plan"])} planned action(s)')
+        for f in r["blocking"]:
+            print(f'          - {f["rule_id"]} [{f["severity"]}] {f["message"]}')
+        for f in r["advisory"]:
+            print(paint(f'          · {f["rule_id"]} [{f["severity"]}] {f["message"]}', DIM))
+        for a in r["repair_plan"]:
+            target = a.get("field") or a.get("view") or ""
+            value = a.get("value")
+            shown = f' = {str(value)[:60]}' if value is not None else ""
+            print(paint(f'          plan {a.get("kind")} {target}{shown} ({a.get("reason")})', DIM))
+        if r["would_run"]:
+            print(paint(f'        chain would run: {", ".join(r["would_run"])}', DIM))
+
+    if out:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(
+            json.dumps({"generated": datetime.now(timezone.utc).isoformat(),
+                        "fixtures": results}, indent=2, default=str),
+            encoding="utf-8")
+        print()
+        print(paint("  json: ", DIM) + out)
+
+    ok = sum(1 for r in results if r["verified"])
+    print()
+    print(f'  {len(results)} fixture(s) ran {DOT} {ok} verified {DOT} '
+          f'{len(results) - ok} blocked'
+          + (f' {DOT} {paint(f"{failed} could not run", RED)}' if failed else ''))
+    return 1 if failed else 0
+
 
 def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
                   apply: bool, skip_bin: bool,
@@ -1043,6 +1224,36 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 else "disabled in policy (quality_gate.enabled)")
     step("gate", gate_why, _gate)
 
+    # ---- 4c. photos -------------------------------------------------------
+    #
+    # The other picture: what the garment PHOTOGRAPHS show, which the render
+    # cannot — wear against the grade, and whether each gallery image is what
+    # its slot says. One call for both. Enforced by _approve exactly like the
+    # gate; `photo_audit.required` decides whether "could not run" holds.
+    # See app/imaging/photo_audit.py.
+    photo_verdict: Any = None
+
+    def _photos() -> str:
+        nonlocal photo_verdict
+        from app.imaging import photo_audit
+
+        fresh = needs(dsn, product_id)["loaded"]
+        record = fresh["record"]
+        photo_verdict = photo_audit.judge(
+            fresh["media"],
+            grade_severity=record.get("gradeSeverity"),
+            grade_label=record.get("gradeLabel") or record.get("grade"),
+            pol=policy(),
+        )
+        if photo_verdict.unavailable:
+            vision_unavailable.append("photos")
+            raise StepFailed("vision unavailable — " + "; ".join(photo_verdict.reasons))
+        return photo_audit.summary(photo_verdict)
+
+    photos_why = ("" if (policy().get("photo_audit") or {}).get("enabled", True)
+                  else "disabled in policy (photo_audit.enabled)")
+    step("photos", photos_why, _photos)
+
     # ---- 5. approve -------------------------------------------------------
     #
     # The CHECK always runs; the MOVE needs --approve. See the module docstring:
@@ -1055,7 +1266,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # pre-flight still runs without --apply so the product's readiness is
         # known and recorded; only the move is withheld. `approved` cannot come
         # back from a call that was never allowed to apply.
-        blocked = gate_verdict is not None and gate_verdict.blocks
+        # Two picture verdicts, one rule: either refusing withholds the move.
+        # The gate comes first because it is the definition of "may this leave
+        # Review"; the photo audit is evidence added to it.
+        refusing = [(label, v) for label, v in (("image gate", gate_verdict),
+                                                ("photo audit", photo_verdict))
+                    if v is not None and v.blocks]
+        blocked = bool(refusing)
         # Only ever passes --apply when BOTH flags are set. `--apply` alone
         # repairs; publishing has to be asked for separately.
         verdict = approve_check(vnyx_api, dsn, product_id,
@@ -1063,14 +1280,16 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                                 skip_bin=skip_bin,
                                 quiet=quiet, allow_stage=allow_stage)
         if blocked:
-            gate_problems = [f"image gate: {r}" for r in gate_verdict.reasons]
+            gate_problems = [f"{label}: {r}" for label, v in refusing for r in v.reasons]
+            # A real refusal names its code; only when EVERY refusing verdict is
+            # "could not run" is the outcome the retryable gate_unavailable.
+            real = [v for _, v in refusing if not v.unavailable]
             if verdict.get("outcome") in ("would_approve", "approved"):
                 # Ready by every column check, refused on the picture. A
                 # distinct outcome, so the verdict names the gate rather than
                 # reporting "ready, not moved".
                 verdict = {**verdict,
-                           "outcome": ("gate_unavailable" if gate_verdict.unavailable
-                                       else "gate_blocked"),
+                           "outcome": ("gate_blocked" if real else "gate_unavailable"),
                            "problems": gate_problems}
             else:
                 # Not ready anyway. The gate's reasons ride along so the row
@@ -1078,7 +1297,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 verdict = {**verdict,
                            "problems": [*(verdict.get("problems") or []),
                                         *gate_problems]}
-            verdict["gate_code"] = gate_verdict.code
+            verdict["gate_code"] = (real or [refusing[0][1]])[0].code
         outcome = verdict.get("outcome", "?")
         problems = verdict.get("problems") or []
         if outcome == "approved":
@@ -1087,9 +1306,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         if outcome == "would_approve":
             return "ready — pass --approve to move it"
         if outcome == "gate_blocked":
-            return "NOT approved — the image gate refused: " + "; ".join(problems)
+            return "NOT approved — refused on the pictures: " + "; ".join(problems)
         if outcome == "gate_unavailable":
-            return "NOT approved — the image gate could not run: " + "; ".join(problems)
+            return "NOT approved — the picture check could not run: " + "; ".join(problems)
         if outcome == "skipped_preflight":
             return "NOT ready: " + "; ".join(problems)
         return f'{outcome}: {"; ".join(problems)}' if problems else outcome
@@ -1135,6 +1354,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             "gate_code": verdict.get("gate_code"),
         },
         "gate": gate_verdict.as_dict() if gate_verdict is not None else None,
+        "photos": photo_verdict.as_dict() if photo_verdict is not None else None,
         "vision_unavailable": vision_unavailable,
         # THE CANARY'S EVIDENCE. `regeneration_triggered` is the one fact the
         # runner stops a run on: the status flipped to GENERATING across the
@@ -1191,6 +1411,18 @@ def report(r: dict[str, Any]) -> None:
                  "skipped": "skipped"}.get(action, action)
         print(f'    {"image gate":14} {paint(label, colour)} {paint(text, DIM)}'
               + (f'  {paint("on " + gate["lead_view"], DIM)}' if gate.get("lead_view") else ""))
+
+    # The photo audit's line, same colouring: a hold (GRADE SUSPECT, or an
+    # IMAGE DEFECT when policy blocks on it) is red; soft flags ride in grey.
+    photos = r.get("photos") or {}
+    if photos:
+        action = photos.get("action")
+        text = "; ".join(photos.get("reasons") or []) or action or "?"
+        if photos.get("soft"):
+            text += f'  (soft: {"; ".join(photos["soft"])})'
+        colour = {"review": RED, "ok": DIM}.get(action, DIM)
+        label = {"ok": "passed", "review": "HELD", "skipped": "skipped"}.get(action, action)
+        print(f'    {"photo audit":14} {paint(label, colour)} {paint(text, DIM)}')
 
     ap = r.get("approval") or {}
     if ap.get("outcome") == "approved":
@@ -1471,11 +1703,34 @@ def main() -> int:
     ap.add_argument("--no-sheet", action="store_true")
     ap.add_argument("--quiet", action="store_true",
                     help="hide the sub-scripts' own output.")
+    ap.add_argument(
+        "--fixture", nargs="+", metavar="PATH",
+        help=("OFFLINE SELF-TEST: run the rule engine over fixture file(s) written "
+              "by --dump-fixture. No database, no network, no writes; --out "
+              "writes the verdicts as JSON. A directory means every *.json in it. "
+              "tests/fixtures/repair/ ships one."))
+    ap.add_argument(
+        "--dump-fixture", metavar="PATH",
+        help=("write the one --product as a fixture for --fixture, then stop. "
+              "The file is real tenant data; keep it under reports/."))
     args = ap.parse_args()
+
+    # ---- offline: a fixture, the rules, nothing else ------------------------
+    if args.fixture:
+        return run_fixtures(_fixture_paths(args.fixture), out=args.out)
 
     dsn = args.db or os.getenv("DATABASE_URL") or settings().database_url
     if not dsn:
         sys.exit("No --db, and no DATABASE_URL.")
+
+    if args.dump_fixture:
+        ids = [s.strip() for s in (args.products or "").split(",") if s.strip()]
+        if len(ids) != 1:
+            sys.exit("--dump-fixture takes exactly one --product <uuid>.")
+        path = dump_fixture(dsn, ids[0], Path(args.dump_fixture))
+        print(f'fixture: {path}')
+        print(paint("  real tenant data — keep it under reports/ unless trimmed for a test", DIM))
+        return 0
 
     vnyx_api = Path(args.vnyx_api)
     if vnyx_api_url():
@@ -1525,9 +1780,9 @@ def main() -> int:
         # Not "no model is called" any more: the image gate judges the lead
         # render in dry-run too, one flash call per product, so a shadow pass
         # reports what it would refuse. Nothing generates and nothing is written.
-        print(paint("DRY RUN — nothing is written. One vision call per product "
-                    "(the image gate); no renders, no repairs. Pass --apply to do "
-                    "it.", YELLOW))
+        print(paint("DRY RUN — nothing is written. Up to two vision calls per "
+                    "product (the image gate, the photo audit); no renders, no "
+                    "repairs. Pass --apply to do it.", YELLOW))
     elif args.approve:
         print(paint(
             "--approve: products passing the pre-flight will be MOVED to "
@@ -1631,6 +1886,10 @@ def main() -> int:
     if args.approve and args.apply:
         line += f' {DOT} {moved} moved to APPROVED'
     print(line)
+    # What the vision cache saved this run, when it was consulted at all.
+    cache_line = vision_cache.summary()
+    if cache_line:
+        print(paint(f'  {cache_line}', DIM))
     if ready and not (args.approve and args.apply):
         print(paint('  Add --approve to move the ready ones (publishes to '
                     'Shopify).', DIM))

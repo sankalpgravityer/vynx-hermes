@@ -116,7 +116,8 @@ def classify(result: dict[str, Any]) -> Verdict:
     # spoke. They are tested BEFORE would_approve because they arrive in its
     # place: the pre-flight passed, the move was withheld, and the reason is
     # the render, not a field. `gate_code` names which — IMAGE_QUALITY,
-    # MODEL_GENDER_MISMATCH — so the Review tab can group by cause.
+    # MODEL_GENDER_MISMATCH, CATEGORY_IMAGE_MISMATCH from the gate; GRADE_SUSPECT,
+    # IMAGE_DEFECT from the photo audit — so the Review tab can group by cause.
     if outcome == "gate_blocked":
         return Verdict(
             status="HELD_FOR_HUMAN",
