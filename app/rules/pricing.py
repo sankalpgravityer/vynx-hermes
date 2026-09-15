@@ -398,6 +398,23 @@ def check(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
             detail={"default": pr["default_currency"]},
         ))
 
+    # PRICE.012 — a retail anchor below the floor is not an anchor.
+    #
+    # Every window below is a fraction of retail, so a retail of 2.00 makes a
+    # 1.00 selling price "correct" and a 40.00 one "800% of retail". The retail
+    # field is what is wrong here, not the product; MEDIUM, and reported before
+    # the assessment so a reader sees the cause next to the effect.
+    floor = float(pr.get("retail_floor") or 0)
+    if floor and p.retail_price is not None and 0 < p.retail_price < floor:
+        out.append(Finding(
+            rule_id="PRICE.012", severity=Severity.MEDIUM, fields=["retail_price"],
+            message=(f"Retail price {p.retail_price:.2f} is below the "
+                     f"{floor:.2f} floor; every price window derived from it is "
+                     f"meaningless."),
+            detail={"retail_price": p.retail_price, "floor": floor},
+            needs_evidence=True,
+        ))
+
     a = assess(p, pol)
     payload = a.model_dump(mode="json")
 

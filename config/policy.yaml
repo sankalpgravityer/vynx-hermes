@@ -57,6 +57,7 @@ pricing:
   condition_to_grade:
     "as new": A
     "new": A
+    "brand new": A      # 739 products on the dev copy spell it this way
     "excellent": A
     "good": B
     "very good": B
@@ -92,12 +93,101 @@ pricing:
   # A correction larger than this % is proposed for review, not applied silently.
   auto_apply_max_delta_pct: 60
 
+  # PRICE.012 — a retail anchor below this is not an anchor. Every window above
+  # is a fraction of retail, so a retail of 2.00 makes a selling price of 1.00
+  # "correct" and a 40.00 one "800% of retail". The auditor this was ported from
+  # carried per-brand floors in price_fallbacks.json; one absolute floor is the
+  # honest version until a tenant supplies its own. MEDIUM: the retail field is
+  # wrong, the product may be fine.
+  retail_floor: 5.00
+
+  # CONSIGNMENT. For these tenants the selling price is the consignor's under
+  # contract, not vnyx's to correct: the chain skips the price step, the gate
+  # never plans a price write, and PRICE.002/003 stop blocking approval (they
+  # stay visible as MEDIUM). PRICE.001 — above retail — is an arithmetic
+  # invariant and still blocks. Tenant ids; empty means nobody.
+  consignment_tenants: []
+
 confidence:
   # Below this, a field is treated as unreliable and routed to evidence gathering.
   review_threshold: 0.70
   # LLM verdicts below this can never become an auto-applied patch.
   llm_apply_threshold: 0.85
   placeholders: ["unknown", "n/a", "na", "none", "-", "null", "tbd", ""]
+
+# Copy checks that need a number. Everything else in TEXT.* is a comparison of
+# fields the product already carries.
+copy:
+  # TEXT.005 — `material` is a fibre, not a paragraph. Longer than this and the
+  # extractor pasted the whole composition line ("100% Cotton. Made in Portugal.
+  # Machine wash cold …") into a field the storefront renders as a facet.
+  material_max_chars: 60
+  # TEXT.006 — the title the pipeline writes at creation and replaces when
+  # generation succeeds. Still carrying it means nothing was ever produced; on
+  # one batch that was 35 of 61 products, and every one of them would otherwise
+  # ship under the placeholder. Prefix match, case-insensitive.
+  placeholder_title_prefixes: ["Generating Product"]
+
+completeness:
+  # DATA.003 — vintage is one-of-one. A quantity other than this on a product
+  # about to be approved is a data-entry slip (0: nothing to sell; 3: a duplicate
+  # that will oversell). MEDIUM, so a multi-unit tenant is warned, not blocked;
+  # set to null to switch the rule off for a wholesale catalogue.
+  expected_inventory: 1
+
+# ATTR.005 — the supplier a tenant's products should all name. The auditor
+# carried one canonical supplier per tenant; here it is keyed by tenant id and
+# empty by default, so the rule is silent until somebody fills it in.
+suppliers:
+  canonical_by_tenant: {}
+
+# C-TWINS. A twin (`CBOA-000123`) is the SAME physical garment as its parent
+# (`BOA-000123`), listed a second time under the opposite gender so unisex stock
+# is discoverable in both departments. Duplication copies the images and not the
+# measurements, so twins arrive with blank size / brand and are rejected for it —
+# 9 of 9 in the auditor's rehearsal; on this week's production runs it would
+# have rescued 5. The `twin` step in repair_product.py copies the GENDER-NEUTRAL
+# facts from the parent into blank fields on the twin, before any rule runs.
+#
+# `never_inherit` is documentation of what the step must not touch — everything
+# gender-dependent is recomputed for the twin's own gender by the normal chain.
+twins:
+  prefixes: ["CBOA-", "CKIL-", "CBEV-", "CSKU-", "CBLM-"]
+  inherit_properties:
+    ["brand", "international_size", "waist", "length_size", "material", "fit",
+     "condition", "color"]
+  never_inherit:
+    ["gender", "master_category", "category", "subcategory", "mannequin",
+     "sizing_guide", "eu_size", "title", "description"]
+
+# IMG.040 — does the picture show the kind of garment the category says?
+# The quality gate asks the model to name the garment in the lead render in a
+# word or two; both that word and the product's category are mapped to a family
+# here, and the gate refuses only when the two families are DIFFERENT and NOT
+# adjacent. A word or category that maps to no family decides nothing.
+garment_families:
+  tops:
+    ["shirt", "tee", "t-shirt", "tshirt", "polo", "sweater", "hoodie", "jumper",
+     "knit", "sweatshirt", "blouse", "top", "tank", "cardigan", "vest", "fleece",
+     "pullover", "jersey"]
+  bottoms:
+    ["trouser", "pant", "jean", "denim", "short", "skirt", "legging", "chino",
+     "jogger", "dungaree", "overall", "bottom", "cargo"]
+  dresses: ["dress", "gown", "jumpsuit", "romper", "playsuit"]
+  outerwear:
+    ["jacket", "coat", "blazer", "parka", "puffer", "gilet", "windbreaker",
+     "anorak", "bomber", "trench", "outerwear"]
+  footwear:
+    ["shoe", "sneaker", "boot", "sandal", "heel", "loafer", "trainer", "footwear"]
+  accessories:
+    ["cap", "hat", "beanie", "belt", "bag", "scarf", "backpack", "wallet",
+     "glove", "sock", "accessor"]
+  # Pairs the model routinely conflates; a mismatch between them is not a
+  # finding. Tops/outerwear only: a shirt-jacket reads as either. Dresses are
+  # deliberately NOT adjacent to tops — a gown rendered on a vest listing
+  # (BOA-006114) is exactly the case this exists to catch.
+  adjacent:
+    - ["tops", "outerwear"]
 
 guardrails:
   # Fields the LLM is NEVER allowed to write directly. It may only supply
@@ -232,6 +322,24 @@ llm:
   timeout_s: 45
   # Only spend an LLM call when the rule engine actually asked for evidence.
   evidence_only: true
+
+  # FAIL-FAST ON A PROVIDER OUTAGE — app/llm/health.py.
+  #
+  # Every in-process vision call (care-label read, quality gate) is counted by
+  # outcome over a sliding window of the last `window` calls. Once at least
+  # `min_samples` are in the window and `error_ratio` of them are hard API
+  # errors — 429, 5xx, a rejected key, a timeout; never an "I cannot read this"
+  # answer — the run loop STOPS for `cooldown_s` instead of turning the outage
+  # into a queue of "no brand or size" rejections. The products already judged
+  # keep their verdicts; the one in hand is retried, not judged.
+  #
+  # 6 samples is three products' worth. 0.7 means a working OpenAI fallback
+  # (one Gemini error, one OpenAI success per label) never reads as an outage.
+  health:
+    window: 20
+    min_samples: 6
+    error_ratio: 0.7
+    cooldown_s: 600
 
 # --------------------------------------------------------------------------- #
 # Imagery — the on-model renders and background removal.
@@ -442,6 +550,52 @@ imagery:
     # gets the identical answer while doubling the wait.
     max_retries: 2
     retry_backoff_s: 3
+
+# --------------------------------------------------------------------------- #
+# Quality gate — the one look at the LEAD RENDER before a product is approved.
+# app/imaging/quality_gate.py; runs as the `gate` step of repair_product.py,
+# after render and before approve.
+#
+# Every other check reads columns. This one asks a vision model seven things
+# about the picture a shopper will see — model present, face intact, model
+# gender, usable lead, body coherent, what is wrong, front or back — in ONE
+# call, and turns the answer into an action:
+#
+#   ok       approve may proceed
+#   regen    the content is wrong: hold, outcome IMAGE_QUALITY or
+#            MODEL_GENDER_MISMATCH. A re-render is the likely fix.
+#   review   the gate could not decide (provider down, image unreachable):
+#            the product is RETRIED, not held — see llm.health above.
+#
+# Runs in shadow mode too, so a dry run reports what the gate would refuse.
+# Measure its false-block rate on a batch that was approved by hand before
+# trusting it with a tenant.
+# --------------------------------------------------------------------------- #
+quality_gate:
+  enabled: true
+  # When the gate cannot run at all (no GEMINI_API_KEY), block approval rather
+  # than skip it. false = a rules-only deployment approves without the gate,
+  # which is the pre-gate behaviour.
+  required: true
+  # Which render is judged, in order of preference. Only AI renders: the gate
+  # is about the on-model image, and a product with none is refused by the
+  # approval pre-flight anyway ("missing AI_FRONT").
+  lead_views: ["AI_FRONT", "AI_FRONT_34"]
+  # Each of these can be switched off independently. Removing one turns that
+  # finding into a soft flag — recorded, never blocking. `category_mismatch`
+  # is the one DATA question the picture answers (see garment_families); the
+  # other four are render defects.
+  block_on: ["no_model", "bad_face", "broken_body", "gender_mismatch",
+             "category_mismatch"]
+  # Sub-categories legitimately shot without a model. NO MODEL is a soft flag
+  # on these; BAD FACE and BROKEN BODY still block (they cannot fire without a
+  # model, so in practice these pass).
+  accessory_terms:
+    ["cap", "caps", "beanie", "beanies", "hat", "hats", "gloves", "belt",
+     "belts", "scarf", "scarves", "bag", "bags", "backpack", "backpacks",
+     "accessories", "accessory", "wallet", "wallets", "socks", "sunglasses"]
+  # null = llm.model_fast.
+  model: null
 
 # --------------------------------------------------------------------------- #
 # Readability — can the text in a phone photograph actually be read?

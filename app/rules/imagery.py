@@ -571,6 +571,37 @@ def check_imagery(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
         ))
 
     # --- pipeline state --------------------------------------------------------
+    # --- the gallery's lead image --------------------------------------------
+    #
+    # `p.images` is vnyx-api's own display order (rebuildMediaCache sorts it:
+    # processed before raw, then by view, then position), so images[0] IS what
+    # the storefront leads with. Two things should never be first, and both are
+    # only reachable through a human arrangement (mediaManualOrder) or a cache
+    # the last relabel did not rebuild — which is exactly why they are worth a
+    # rule rather than trust.
+    #
+    # Deliberately NOT a "real photo before render" rule: which of those leads
+    # is vnyx-api's VIEW_RANK decision (renders first), and the auditor's
+    # reversal of it (2026-08-14) is for the product owner to make, not a port.
+    lead_row = next((m for m in live_media(p) if m.url == (p.images or [None])[0]), None)
+    if lead_row is not None:
+        if lead_row.view in ("LABEL", "SIZE_CHART") or is_size_chart(lead_row.url, pol):
+            out.append(Finding(
+                rule_id="IMG.024", severity=Severity.MEDIUM, fields=["images"],
+                message=(f"The gallery leads with a {lead_row.view.lower().replace('_', ' ')}; "
+                         f"a shopper's first picture is a tag, not the garment."),
+                detail={"lead_view": lead_row.view, "lead_url": lead_row.url},
+            ))
+        elif (lead_row in photos and lead_row.processing == "RAW"
+              and any(m.processing != "RAW" for m in photos)):
+            out.append(Finding(
+                rule_id="IMG.023", severity=Severity.LOW, fields=["images"],
+                message=("The gallery leads with an unprocessed photograph while "
+                         "a cut-out of the garment exists."),
+                detail={"lead_view": lead_row.view, "lead_url": lead_row.url},
+            ))
+
+    # --- pipeline state --------------------------------------------------------
     if p.generation_status == "FAILED":
         out.append(Finding(
             rule_id="IMG.012", severity=Severity.MEDIUM, fields=["images"],

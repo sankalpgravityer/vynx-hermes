@@ -737,13 +737,19 @@ class Parallel:
         import queue
         import threading
 
-        self.tally = {"ok": 0, "held": 0, "failed": 0}
+        # `retry` = not judged: the vision provider was unavailable and the
+        # runner put the row back rather than hold it on a silence.
+        self.tally = {"ok": 0, "held": 0, "failed": 0, "retry": 0}
         self.lock = threading.Lock()
         self.rs = cfgmod.settings_from_snapshot(rs_for_run)
         self.stages = stages
         self.reject_attrs = reject_attrs
         self.apply = apply
         self.submitted = 0
+        # Set by the first worker that sees a run-level stop — the canary or
+        # a vision outage. The main loop reads it before every submit and the
+        # in-flight products finish normally; nothing new is started.
+        self.abort: str | None = None
         self.q: Any = queue.Queue()
         self.threads = [
             threading.Thread(target=self._drain, daemon=True)
@@ -811,9 +817,9 @@ class Parallel:
             return
 
         try:
-            runner.verify_one(job["claimed"], rs, ignore_stop=True,
-                              allow_stage=stages, expect_status="QUEUED",
-                              silent=True)
+            abort = runner.verify_one(job["claimed"], rs, ignore_stop=True,
+                                      allow_stage=stages, expect_status="QUEUED",
+                                      silent=True)
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             with lock:
                 tally["failed"] += 1
@@ -860,8 +866,22 @@ class Parallel:
                 tally["ok"] += 1
             elif st == "HELD_FOR_HUMAN":
                 tally["held"] += 1
+            elif st == "QUEUED":
+                # The runner released it: the vision provider was down during
+                # its chain, so it was not judged. On this path the row has no
+                # lease, so it waits for the next invocation rather than a
+                # backoff — see the class docstring on what --workers gives up.
+                tally["retry"] += 1
+                print("           NOT JUDGED — vision provider unavailable; "
+                      "left queued for the next invocation")
             else:
                 tally["failed"] += 1
+
+            stop = runner.stop_reason(abort)
+            if stop and not self.abort:
+                self.abort = stop
+                print(f"\n  RUN STOPPED — {stop}")
+                print("  products already in flight finish; nothing new is started")
 
 
 
@@ -1246,6 +1266,13 @@ def main() -> int:
                       "for this tenant until this finishes\n")
                 pool = Parallel(snap, args.workers, stages,
                                 args.reject_missing_attrs, args.apply)
+            if pool.abort:
+                # A worker saw a run-level stop. The row this iteration just
+                # enqueued would otherwise sit QUEUED with nothing to claim it.
+                release_one(run_id, str(row["id"]), "released: the run was stopped")
+                print(f"    NOT STARTED — {pool.abort}")
+                skipped += 1
+                break
             pool.submit({"row": row, "claimed": queued, "run_id": run_id,
                          "n": n, "total": len(entries)})
             continue
@@ -1356,7 +1383,7 @@ def main() -> int:
         # it, approving one product by hand would require arming the background
         # agent for the whole tenant first — more dangerous than the thing the
         # guard protects against.
-        runner.verify_one(claimed, rs, ignore_stop=True, allow_stage=stages)
+        abort = runner.verify_one(claimed, rs, ignore_stop=True, allow_stage=stages)
 
         after = db.fetch_one(
             'SELECT status, outcome, reason, approved FROM "AutoApprovalRunProduct"'
@@ -1371,6 +1398,27 @@ def main() -> int:
             print(f"       {after['reason']}")
         if (after or {}).get("approved"):
             print("       APPROVED — Shopify upsert enqueued")
+        if st == "QUEUED":
+            print("       NOT JUDGED — vision provider unavailable during its "
+                  "chain; released with a backoff, retried by the next pass")
+
+        # THE TWO RUN-LEVEL STOPS — the canary and a vision outage — asked here,
+        # between products. This product's verdict is counted; the rest of the
+        # sheet is not started.
+        stop = runner.stop_reason(abort)
+        if stop:
+            if st == "VERIFIED":
+                ok += 1
+            elif st == "HELD_FOR_HUMAN":
+                held += 1
+            elif st == "QUEUED":
+                skipped += 1
+            else:
+                failed += 1
+            print(f"\n    RUN STOPPED — {stop}")
+            print("    products already finished keep their verdicts; "
+                  "the rest of the sheet was not started")
+            break
 
         # AFTER the chain, so the care-label and extract steps have had their
         # chance to supply what is missing. See reject_missing_attrs.
@@ -1383,6 +1431,8 @@ def main() -> int:
             ok += 1
         elif st == "HELD_FOR_HUMAN":
             held += 1
+        elif st == "QUEUED":
+            skipped += 1
         else:
             failed += 1
 
@@ -1394,6 +1444,12 @@ def main() -> int:
         t0 = time.perf_counter()
         tally = pool.close()
         ok += tally["ok"]; held += tally["held"]; failed += tally["failed"]
+        skipped += tally.get("retry", 0)
+        if tally.get("retry"):
+            print(f"\n  {tally['retry']} product(s) not judged — vision provider "
+                  f"unavailable; left queued for the next invocation")
+        if pool.abort:
+            print(f"\n  RUN STOPPED — {pool.abort}")
         done = tally["ok"] + tally["held"] + tally["failed"]
         tail = time.perf_counter() - t0
         total = time.perf_counter() - run_started

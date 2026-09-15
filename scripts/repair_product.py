@@ -114,7 +114,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import product_audit  # noqa: E402
-from app.config import settings  # noqa: E402
+from app.config import policy, settings  # noqa: E402
 
 # Where the TypeScript half lives. Every write this script causes happens in
 # there, because that is where R2, the ProductMedia invariants, the price mirror
@@ -425,6 +425,11 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
         "renders": len(renders),
         "render_rows": len(render_rows),
         "renders_missing": 5 - len(renders),
+        # Read before and after the chain by the canary in repair(): a flip to
+        # GENERATING that the render step did not cause means a repair write is
+        # triggering paid regeneration.
+        "generation_status": record.get("generationStatus"),
+        "is_regenerating": bool(record.get("isRegenerating")),
         "attributes_missing": [
             name for name, value in (
                 ("brand", record.get("brand")),
@@ -435,6 +440,29 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
             ) if not value
         ],
     }
+
+
+def _generation_in_flight(state: dict[str, Any]) -> bool:
+    """Is a generation genuinely running for this product right now?
+
+    GENERATING / isRegenerating, AND touched within `imagery.stale_generation_hours`
+    (the same threshold IMG.011 and vnyx-api's generation reaper use). Older than
+    that the flag is a stranded row and must not block a repair forever.
+    """
+    if state.get("generation_status") != "GENERATING" and not state.get("is_regenerating"):
+        return False
+    stamp = state["loaded"]["record"].get("updatedAt")
+    if not stamp:
+        return True
+    try:
+        touched = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        if touched.tzinfo is None:
+            touched = touched.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    hours = float((policy().get("imagery") or {}).get("stale_generation_hours") or 1)
+    age_h = (datetime.now(timezone.utc) - touched).total_seconds() / 3600
+    return age_h < hours
 
 
 # --------------------------------------------------------------------------- #
@@ -504,6 +532,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     state = needs(dsn, product_id)
     steps: list[dict[str, Any]] = []
 
+    # Steps whose VISION READ failed at the provider — an API error, a timeout,
+    # a rejected key — rather than returning an answer. Reported to the caller
+    # because the difference decides a verdict: "the label could not be read"
+    # and "the label reader was down" must not both become "no size". The
+    # runner retries a product on this list instead of judging it.
+    vision_unavailable: list[str] = []
+
     print()
     print(f'{paint(progress, BOLD) + "  " if progress else ""}'
           f'{paint(str(state["title"] or "(no title)"), BOLD)} '
@@ -526,6 +561,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         try:
             note = run()
             ok = True
+            # The in-process steps (twin, care label, gate) have no subprocess
+            # output to show, so their one-line result is printed here — the
+            # same line the run log records as the step's note. Subprocess
+            # steps get their summary echoed too, which costs one dim line.
+            if note:
+                print(f'        {paint(note, DIM)}')
         except StepFailed as exc:
             note, ok = str(exc), False
             print(f'        {paint("FAILED: " + note, RED)}')
@@ -534,6 +575,51 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     common = ["--db", dsn, "--product", product_id]
     live = ["--apply"] if apply else []
+
+    # ---- 0. twin ----------------------------------------------------------
+    #
+    # BEFORE EVERYTHING, because it changes what "missing" means for every step
+    # that follows. A C-twin is the same garment as its parent listed under the
+    # other gender; duplication copied the pictures and not the measurements, so
+    # the twin arrives with blank brand / size and the default rules would
+    # reject it for facts its parent already carries. Gender-neutral fields only
+    # — see app/twins.py for the two lists and why.
+    #
+    # Through apply_plan like the care-label pass: one transaction, guarded on
+    # updatedAt, both copies of a doubled value written.
+    twin_note = ""
+
+    def _twin() -> str:
+        nonlocal state, twin_note
+        from app import twins
+
+        record = state["loaded"]["record"]
+        parent_sku = twins.parent_sku(record.get("sku"), policy())
+        parent = twins.load_parent(dsn, parent_sku or "", str(record["tenantId"]))
+        if parent is None:
+            return f"parent {parent_sku} is not in this tenant — nothing to inherit"
+        plan = twins.inheritance_plan(record, parent, policy())
+        if not plan:
+            return f"parent {parent_sku} holds nothing the twin lacks"
+        summary = ", ".join(f'{a["field"]}={a["value"]!r}' for a in plan)
+        if apply:
+            outcome = product_audit.apply_plan(
+                dsn, product_id, plan, record.get("updatedAt"))
+            if outcome["conflict"]:
+                raise StepFailed(outcome.get("message", "changed mid-repair"))
+            if outcome["skipped"]:
+                raise StepFailed("; ".join(
+                    s.get("why", "?") for s in outcome["skipped"]))
+            # Re-read: the extract / care-label decisions below key off what is
+            # still missing, and that just changed.
+            state = needs(dsn, product_id)
+        twin_note = f'from {parent_sku}: {summary}'
+        return f'{"inherited" if apply else "would inherit"} {summary} from {parent_sku}'
+
+    from app import twins as _twins
+
+    is_twin = _twins.parent_sku(state["sku"], policy()) is not None
+    step("twin", "" if is_twin else "not a C-twin", _twin)
 
     # ---- 1. matte ---------------------------------------------------------
     def _matte() -> str:
@@ -736,6 +822,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         label_read = care_label.read(urls, want=wanted,
                                      min_confidence=min_confidence,
                                      size_ladder=ladder)
+        # THE READER WAS DOWN, not the label illegible. Every provider that
+        # could be asked failed at the API, so nothing about brand or size is
+        # known — and a product must not be rejected on a silence. Marked for
+        # the runner, then recorded as a failed step like any other.
+        if label_read.get("api_failed"):
+            vision_unavailable.append("care label")
         if label_read.get("error"):
             raise StepFailed(label_read["error"])
 
@@ -876,7 +968,15 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         verb = "would set" if not apply else "set"
         return f'{verb} {before} {ARROW} {after} ({row.get("reason") or "clamped"})'
 
-    step("price", "", _price)
+    # CONSIGNMENT: the selling price is the consignor's under contract. The gate
+    # already refuses to plan a price write for these tenants (approval.py); this
+    # keeps the clamp step from doing what the gate declined to.
+    from app.approval import is_consignment
+    price_why = ("consignment tenant — the selling price is the consignor's, "
+                 "not written" if is_consignment(
+                     str(state["loaded"]["record"].get("tenantId") or ""), policy())
+                 else "")
+    step("price", price_why, _price)
 
     # ---- 4. render --------------------------------------------------------
     def _render() -> str:
@@ -890,9 +990,58 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         render_why = "--no-render"
     elif not state["renders_missing"]:
         render_why = "all five views already exist"
+    elif _generation_in_flight(state):
+        # CREDIT-RESUME SAFETY. A generation already running will deliver these
+        # renders; firing a second one pays twice for the same five pictures and
+        # races the first for the rows. backfill-imagery.ts does not check this
+        # itself. Only a LIVE run is respected: past `stale_generation_hours` the
+        # flag is a stranded row, not work in progress, and the render goes ahead.
+        render_why = ("generation already in flight — not paying for a second "
+                      "run while the first is live")
     else:
         render_why = ""
     step("render", render_why, _render)
+
+    # ---- 4b. gate ---------------------------------------------------------
+    #
+    # ONE LOOK AT THE LEAD RENDER before anything is published. Every step
+    # above reads columns; none of them looks at the picture a customer will
+    # see. A render can carry a melted face, a floating leg, no model at all,
+    # or a model of the wrong gender — and pass every rule, because the rules
+    # ask whether AI_FRONT exists, not whether it is any good.
+    #
+    # After render, so it judges what was just produced; before approve, so it
+    # can withhold the move. One Gemini flash call, ~3s. It runs in dry-run
+    # too, so a shadow run reports what the gate WOULD have refused — that is
+    # how its false-block rate is measured before it is allowed to block.
+    #
+    # A gate that could not run (provider down, image unreachable) is not a
+    # refusal: it lands on `vision_unavailable` and the step is recorded as
+    # failed, and the runner retries the product instead of holding it. See
+    # app/imaging/quality_gate.py and app/llm/health.py.
+    gate_verdict: Any = None
+
+    def _gate() -> str:
+        nonlocal gate_verdict
+        from app.imaging import quality_gate
+
+        # Re-read: the render step may have just produced the row this judges.
+        fresh = needs(dsn, product_id)["loaded"]
+        gate_verdict = quality_gate.judge(
+            fresh["media"],
+            gender=fresh["record"].get("gender"),
+            category=fresh["record"].get("category"),
+            subcategory=fresh["record"].get("subCategory"),
+            pol=policy(),
+        )
+        if gate_verdict.unavailable:
+            vision_unavailable.append("gate")
+            raise StepFailed("vision unavailable — " + "; ".join(gate_verdict.reasons))
+        return gate_verdict.summary()
+
+    gate_why = ("" if (policy().get("quality_gate") or {}).get("enabled", True)
+                else "disabled in policy (quality_gate.enabled)")
+    step("gate", gate_why, _gate)
 
     # ---- 5. approve -------------------------------------------------------
     #
@@ -902,11 +1051,34 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     def _approve() -> str:
         nonlocal verdict
+        # THE GATE'S REFUSAL IS ENFORCED HERE, not by skipping the step. The
+        # pre-flight still runs without --apply so the product's readiness is
+        # known and recorded; only the move is withheld. `approved` cannot come
+        # back from a call that was never allowed to apply.
+        blocked = gate_verdict is not None and gate_verdict.blocks
         # Only ever passes --apply when BOTH flags are set. `--apply` alone
         # repairs; publishing has to be asked for separately.
         verdict = approve_check(vnyx_api, dsn, product_id,
-                                apply=apply and approve, skip_bin=skip_bin,
+                                apply=apply and approve and not blocked,
+                                skip_bin=skip_bin,
                                 quiet=quiet, allow_stage=allow_stage)
+        if blocked:
+            gate_problems = [f"image gate: {r}" for r in gate_verdict.reasons]
+            if verdict.get("outcome") in ("would_approve", "approved"):
+                # Ready by every column check, refused on the picture. A
+                # distinct outcome, so the verdict names the gate rather than
+                # reporting "ready, not moved".
+                verdict = {**verdict,
+                           "outcome": ("gate_unavailable" if gate_verdict.unavailable
+                                       else "gate_blocked"),
+                           "problems": gate_problems}
+            else:
+                # Not ready anyway. The gate's reasons ride along so the row
+                # shows everything a human has to fix, not just the first thing.
+                verdict = {**verdict,
+                           "problems": [*(verdict.get("problems") or []),
+                                        *gate_problems]}
+            verdict["gate_code"] = gate_verdict.code
         outcome = verdict.get("outcome", "?")
         problems = verdict.get("problems") or []
         if outcome == "approved":
@@ -914,6 +1086,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                     f'{ARROW} {verdict.get("stageAfter")}, Shopify upsert enqueued')
         if outcome == "would_approve":
             return "ready — pass --approve to move it"
+        if outcome == "gate_blocked":
+            return "NOT approved — the image gate refused: " + "; ".join(problems)
+        if outcome == "gate_unavailable":
+            return "NOT approved — the image gate could not run: " + "; ".join(problems)
         if outcome == "skipped_preflight":
             return "NOT ready: " + "; ".join(problems)
         return f'{outcome}: {"; ".join(problems)}' if problems else outcome
@@ -956,6 +1132,24 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             "blockers": verdict.get("problems") or [],
             "stage_before": verdict.get("stageBefore"),
             "stage_after": verdict.get("stageAfter"),
+            "gate_code": verdict.get("gate_code"),
+        },
+        "gate": gate_verdict.as_dict() if gate_verdict is not None else None,
+        "vision_unavailable": vision_unavailable,
+        # THE CANARY'S EVIDENCE. `regeneration_triggered` is the one fact the
+        # runner stops a run on: the status flipped to GENERATING across the
+        # chain and the render step is not what did it. A flip WITH the render
+        # step running is reported but not acted on — the generation path owns
+        # that transition and this cannot tell an intended one from an accident.
+        "generation": {
+            "before": state["generation_status"],
+            "after": after["generation_status"],
+            "render_ran": any(s.get("step") == "render" and s.get("ran") for s in steps),
+            "regeneration_triggered": (
+                after["generation_status"] == "GENERATING"
+                and state["generation_status"] != "GENERATING"
+                and not any(s.get("step") == "render" and s.get("ran") for s in steps)
+            ),
         },
         "verified": final["verified_after"],
         "remaining": [f["rule_id"] for f in final["remaining"]],
@@ -982,6 +1176,21 @@ def report(r: dict[str, Any]) -> None:
          ", ".join(a["attributes_missing"]) or "none")
     print(f'    {"issues left":14} {r["issues"]}'
           + (f'  ({", ".join(r["remaining"])})' if r["remaining"] else ""))
+
+    # The gate's one line, coloured by what it decided: a refusal is the thing
+    # this block exists to make visible, a pass is quiet, and "could not run"
+    # is neither — it is the provider, not the product.
+    gate = r.get("gate") or {}
+    if gate:
+        action = gate.get("action")
+        text = "; ".join(gate.get("reasons") or []) or action or "?"
+        if gate.get("soft"):
+            text += f'  (soft: {", ".join(gate["soft"])})'
+        colour = {"regen": RED, "review": YELLOW, "ok": DIM}.get(action, DIM)
+        label = {"ok": "passed", "regen": "REFUSED", "review": "could not decide",
+                 "skipped": "skipped"}.get(action, action)
+        print(f'    {"image gate":14} {paint(label, colour)} {paint(text, DIM)}'
+              + (f'  {paint("on " + gate["lead_view"], DIM)}' if gate.get("lead_view") else ""))
 
     ap = r.get("approval") or {}
     if ap.get("outcome") == "approved":
@@ -1313,8 +1522,12 @@ def main() -> int:
         print(paint(f'{available:,} named — running the first {len(ids):,}', DIM))
 
     if not args.apply:
-        print(paint("DRY RUN — nothing is written and no model is called. "
-                    "Pass --apply to do it.", YELLOW))
+        # Not "no model is called" any more: the image gate judges the lead
+        # render in dry-run too, one flash call per product, so a shadow pass
+        # reports what it would refuse. Nothing generates and nothing is written.
+        print(paint("DRY RUN — nothing is written. One vision call per product "
+                    "(the image gate); no renders, no repairs. Pass --apply to do "
+                    "it.", YELLOW))
     elif args.approve:
         print(paint(
             "--approve: products passing the pre-flight will be MOVED to "
