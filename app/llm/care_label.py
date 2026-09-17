@@ -44,8 +44,26 @@ from typing import Any
 import httpx
 
 from app.config import policy, settings
+from app.llm import cache, health
 
 log = logging.getLogger("hermes.care-label")
+
+# How many label photographs one read uploads. A product with eight label shots
+# is eight uploads for a question two answer, and the pipeline already pays for
+# a vision call per product. Shared by `_fetch` and the cache key so the two
+# cannot disagree about which pictures an answer was about.
+_FETCH_CAP = 4
+
+# What one provider read attempt came back as. `read()` needs to tell the
+# difference between "asked and got nothing" and "could not ask": a provider
+# that returned an API error has said nothing about the label, and a product
+# must not be judged on that silence.
+#
+#   ok              a parsed answer
+#   no_answer       the provider spoke, but unusably (parse error, empty)
+#   api_error       the provider failed — counted by app/llm/health.py
+#   not_configured  no key or no SDK; never attempted
+ReadStatus = str
 
 # Only these two. The bulk extractor owns the other fifteen fields and reading
 # them again here would give two sources of truth for the same value.
@@ -107,12 +125,8 @@ PROMPT = (
 )
 
 
-def _fetch(urls: list[str], cap: int = 4) -> list[tuple[bytes, str]]:
-    """Download the label images. Skips what it cannot get rather than failing.
-
-    Capped: a product with eight label shots is eight uploads for a question two
-    answer, and the pipeline already pays for a vision call per product.
-    """
+def _fetch(urls: list[str], cap: int = _FETCH_CAP) -> list[tuple[bytes, str]]:
+    """Download the label images. Skips what it cannot get rather than failing."""
     out: list[tuple[bytes, str]] = []
     for url in urls[:cap]:
         try:
@@ -127,7 +141,7 @@ def _fetch(urls: list[str], cap: int = 4) -> list[tuple[bytes, str]]:
     return out
 
 
-def _read_gemini(images: list[tuple[bytes, str]]) -> dict[str, Any] | None:
+def _read_gemini(images: list[tuple[bytes, str]]) -> tuple[dict[str, Any] | None, ReadStatus]:
     # NEVER call a vision model with no images. Asked to read a care label and
     # given none, Gemini returned brand "JOE FRESH" and size "XL" at confidence
     # 100 — a complete fabrication that the confidence floor waves straight
@@ -135,10 +149,10 @@ def _read_gemini(images: list[tuple[bytes, str]]) -> dict[str, Any] | None:
     # had anything to look at. `read()` guards this too; both guard it, because
     # either one being the only check is one refactor away from silent invention.
     if not images:
-        return None
+        return None, "no_answer"
     key = settings().gemini_api_key
     if not key:
-        return None
+        return None, "not_configured"
     try:
         from google import genai
         from google.genai import types
@@ -157,7 +171,7 @@ def _read_gemini(images: list[tuple[bytes, str]]) -> dict[str, Any] | None:
             "`pip install google-genai` for this interpreter.",
             exc, sys.executable,
         )
-        return None
+        return None, "not_configured"
 
     try:
         args = genai_client_args()
@@ -176,21 +190,25 @@ def _read_gemini(images: list[tuple[bytes, str]]) -> dict[str, Any] | None:
             contents=parts,
             config=types.GenerateContentConfig(**cfg),
         )
-        return GeminiEvidence._parse(resp.text)
+        parsed = GeminiEvidence._parse(resp.text)
     except Exception as exc:  # noqa: BLE001 - fall through to OpenAI
         log.warning("gemini care-label read failed: %s", exc)
-        return None
+        # A provider failure is counted towards the outage guard and reported
+        # as such; a parse failure is an answer nobody could use.
+        return None, ("api_error" if health.record_error(exc, "gemini") else "no_answer")
+    health.record_ok("gemini")
+    return parsed, "ok"
 
 
-def _read_openai(images: list[tuple[bytes, str]]) -> dict[str, Any] | None:
+def _read_openai(images: list[tuple[bytes, str]]) -> tuple[dict[str, Any] | None, ReadStatus]:
     """The second opinion. Same question, same schema, different eyes."""
     if not images:  # see the note in _read_gemini
-        return None
+        return None, "no_answer"
     key = getattr(settings(), "openai_api_key", "") or os.getenv(
         "OPENAI_API_KEY", "")
     if not key:
         log.warning("no OPENAI_API_KEY — no fallback for the care-label read")
-        return None
+        return None, "not_configured"
     try:
         content: list[dict[str, Any]] = [{"type": "text", "text": PROMPT}]
         for data, mime in images:
@@ -232,7 +250,7 @@ def _read_openai(images: list[tuple[bytes, str]]) -> dict[str, Any] | None:
         )
         r.raise_for_status()
         text = r.json()["choices"][0]["message"]["content"]
-        return json.loads(text)
+        parsed = json.loads(text)
     except httpx.HTTPStatusError as exc:
         # The body carries the actual reason and the bare status does not — a
         # 400 here was "'messages' must contain the word 'json'", which the
@@ -244,10 +262,22 @@ def _read_openai(images: list[tuple[bytes, str]]) -> dict[str, Any] | None:
             detail = (exc.response.text or "")[:200]
         log.warning("openai care-label read failed (%s): %s",
                     exc.response.status_code, detail)
-        return None
+        health.record_error(exc, "openai")
+        return None, "api_error"
     except Exception as exc:  # noqa: BLE001
         log.warning("openai care-label read failed: %s", exc)
-        return None
+        return None, ("api_error" if health.record_error(exc, "openai") else "no_answer")
+    health.record_ok("openai")
+    return parsed, "ok"
+
+
+def _model_name(provider: str, pol: dict[str, Any]) -> str:
+    """The model a provider's read would use — part of its cache key, so a
+    model change re-asks rather than serving the old model's reading."""
+    llm = pol.get("llm") or {}
+    if provider == "openai":
+        return str(llm.get("openai_vision_model", "gpt-4o-mini"))
+    return str(llm.get("model_fast") or "")
 
 
 def _size_ok(value: str, ladder: list[str] | None) -> bool:
@@ -288,19 +318,52 @@ def read(label_urls: list[str], *, want: tuple[str, ...] = ("brand", "size"),
     the second is a re-shoot while the first is a better photograph of the same
     tag.
     """
-    result: dict[str, Any] = {"tried": [], "rejected": {}, "provider": None}
+    result: dict[str, Any] = {"tried": [], "rejected": {}, "provider": None,
+                              "unavailable": [], "cached": []}
     if not label_urls:
         result["error"] = "no care-label photograph on the product"
         return result
 
-    images = _fetch(label_urls)
-    if not images:
-        result["error"] = "care-label images could not be downloaded"
-        return result
+    # The pictures `_fetch` would upload, and with them each provider's cache
+    # key. Downloaded LAZILY, on the first provider that actually has to look:
+    # a label already read is answered without a download, and the download is
+    # most of what this step costs.
+    pol = policy()
+    urls = [str(u) for u in label_urls[:_FETCH_CAP]]
+    images: list[tuple[bytes, str]] | None = None
 
+    # Providers actually asked, as opposed to listed. A provider with no key
+    # was never a chance the label had, so it is neither "tried" nor "down".
+    attempted: list[str] = []
     for name, fn in (("gemini", _read_gemini), ("openai", _read_openai)):
+        ckey = cache.key(f"care_label.{name}", urls=urls,
+                         text=[SYSTEM, PROMPT, _model_name(name, pol)])
+        raw = cache.get(ckey, pol)
+        if raw is not None:
+            status = "ok"
+            result["cached"].append(name)
+        else:
+            if images is None:
+                images = _fetch(label_urls)
+                if not images:
+                    if not any(f in result for f in want):
+                        result["error"] = "care-label images could not be downloaded"
+                        return result
+                    # A partial answer from the cache stands; the provider that
+                    # could have completed it cannot be shown the pictures.
+                    break
+            raw, status = fn(images)
+            if status == "not_configured":
+                continue
+            # Only a parsed answer to the WHOLE question is remembered. A
+            # failure is not an answer, and an answer given with a picture
+            # missing was to a different question — see app/llm/cache.py.
+            if status == "ok" and raw and len(images) == len(urls):
+                cache.put(ckey, raw, pol)
         result["tried"].append(name)
-        raw = fn(images)
+        attempted.append(name)
+        if status == "api_error":
+            result["unavailable"].append(name)
         if not raw:
             continue
 
@@ -333,5 +396,23 @@ def read(label_urls: list[str], *, want: tuple[str, ...] = ("brand", "size"),
             # gets a chance at the field this one could not read.
             if all(f in got for f in want):
                 return result
+
+    # NOTHING WAS READ, AND NOBODY LOOKED. Every provider that could be asked
+    # failed at the API — or there was none to ask. That is not "the label is
+    # illegible"; it is "the reader was down", and the two must not share the
+    # verdict "no size". `api_failed` is what repair_product.py turns into a
+    # retry instead of a rejection. See app/llm/health.py for the incident.
+    if not any(f in result for f in want):
+        if not attempted:
+            result["api_failed"] = True
+            result["error"] = ("no vision provider is configured — set "
+                               "GEMINI_API_KEY or OPENAI_API_KEY; the label was "
+                               "never read")
+        elif len(result["unavailable"]) == len(attempted):
+            result["api_failed"] = True
+            result["error"] = (
+                f'vision providers unavailable — {", ".join(attempted)} returned '
+                f"API errors rather than a reading; nothing about this label is known"
+            )
 
     return result

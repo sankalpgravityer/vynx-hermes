@@ -19,9 +19,12 @@ running API, no JWT, no tenant scoping to satisfy.
 Three things it adds that the feed does NOT carry, and which are the reason the
 imagery and size-chart rules have been silent until now:
 
-  media[]              the live `ProductMedia` rows, typed. `imagery.check_imagery`
-                       is a no-op without them, and the feed sends only a count
-                       off the legacy `Product.images` array.
+  media[]              the live `ProductMedia` rows, typed — plus, flagged
+                       `isCurrent: false`, the superseded RAW originals a
+                       cut-out was made from (readiness phase 3: the canvas
+                       check compares the two). `imagery.check_imagery` is a
+                       no-op without them, and the feed sends only a count off
+                       the legacy `Product.images` array.
   size-chart facts     `sizingGuideId` -> `ProductSize.sizeChartImages`, plus the
                        SIZE_CHART rows actually copied onto the product. Five
                        distinct states hide behind "no chart", and who fixes it
@@ -285,6 +288,7 @@ SELECT p.id::text, p."tenantId"::text, p.sku, p."productCode", p.hanger,
        p."reviewStatus"::text, p."currentStage"::text,
        p."generationStatus"::text, p.source::text, p."isRegenerating",
        p."createdAt", p."updatedAt",
+       p."mediaManualOrder", p."imageSettings",
        b.name AS brand_relation,
        t.name AS tenant_name
   FROM "Product" p
@@ -316,21 +320,31 @@ SELECT bl."binCode", bl."binNumber", z.code, w.code, l."lpnCode"
  LIMIT 1
 """
 
-# LIVE media only.
+# LIVE media, plus the superseded RAW originals of the garment views.
 #
 # `isCurrent` is the materialized "nothing derives from this" flag and
 # `deletedAt` is a human having removed the asset — two different facts, both of
 # which take a row out of the gallery. This product carries rows that are
 # isCurrent AND soft-deleted, so testing only the first counts five superseded
 # renders as present and reports a finished product as needing none.
+#
+# THE ARCHIVE COMES TOO (readiness phase 3). A RAW FRONT / BACK / OTHER that a
+# cut-out superseded is loaded with `isCurrent = false`, because the canvas
+# check (IMG.026) compares a cut-out with the photograph it was cut from, and
+# that photograph is, by construction, no longer live. Every consumer that
+# counts pictures ON the product filters on `isCurrent` — `needs_from`, the
+# rules' `live_media`, the gate and the photo audit — and the archived rows
+# exist for the pairing and nothing else. `id`, `width`, `height` and
+# `derivedFromId` are what the pairing and the check read.
 MEDIA_SQL = """
-SELECT url, view::text, origin::text, processing::text, "mediaType"::text,
-       position
+SELECT id::text, url, view::text, origin::text, processing::text, "mediaType"::text,
+       position, width, height, "derivedFromId"::text, "isCurrent"
   FROM "ProductMedia"
  WHERE "productId" = %s::uuid
-   AND "isCurrent" = true
    AND "deletedAt" IS NULL
- ORDER BY position
+   AND ("isCurrent" = true
+        OR (processing = 'RAW' AND view IN ('FRONT', 'BACK', 'OTHER')))
+ ORDER BY "isCurrent" DESC, position
 """
 
 GRADE_SQL = """
@@ -376,10 +390,46 @@ OPTIONS_SQL = {
 
 IMAGERY_SETTINGS_SQL = """
 SELECT "isModelGenerationEnabled", "isRemoveBgEnabled", "isCloseUpEnabled",
-       gender, "defaultShots"
+       gender, "defaultShots", background, "autoApplyBackground"
   FROM "ImageGenerationSettings"
  WHERE "tenantId" = %s::uuid
  LIMIT 1
+"""
+
+# The tenant's working vocabulary: which subcategory values its live products
+# actually carry, and how often. The tree says what MAY be chosen; this says what
+# IS chosen, and when a title names two valid options the planner prefers the
+# one the tenant files under. One GROUP BY per tenant, alongside the other five.
+SUBCATEGORY_USAGE_SQL = """
+SELECT "subCategory", count(*)::int
+  FROM "Product"
+ WHERE "tenantId" = %s::uuid AND "isDeleted" = false
+   AND "subCategory" IS NOT NULL AND "subCategory" <> ''
+ GROUP BY "subCategory"
+"""
+
+# The same vocabulary one level up, for readiness phase 1 (docs/READINESS-PLAN.md
+# §4 step 2): where this tenant files each subcategory (`Master>Category>Sub`)
+# and which sizing guide it puts on each branch (`Master>Category>Guide`). Two
+# more GROUP BYs per tenant, loaded once with the rest of the context.
+BRANCH_USAGE_SQL = """
+SELECT "masterCategory", category, "subCategory", count(*)::int
+  FROM "Product"
+ WHERE "tenantId" = %s::uuid AND "isDeleted" = false
+   AND "masterCategory" IS NOT NULL AND "masterCategory" <> ''
+   AND category IS NOT NULL AND category <> ''
+   AND "subCategory" IS NOT NULL AND "subCategory" <> ''
+ GROUP BY 1, 2, 3
+"""
+
+GUIDE_USAGE_SQL = """
+SELECT "masterCategory", category, "sizingGuide", count(*)::int
+  FROM "Product"
+ WHERE "tenantId" = %s::uuid AND "isDeleted" = false
+   AND "masterCategory" IS NOT NULL AND "masterCategory" <> ''
+   AND category IS NOT NULL AND category <> ''
+   AND "sizingGuide" IS NOT NULL AND "sizingGuide" <> ''
+ GROUP BY 1, 2, 3
 """
 
 
@@ -422,6 +472,15 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
     cur.execute(IMAGERY_SETTINGS_SQL, (tenant_id,))
     imagery_row = cur.fetchone()
 
+    cur.execute(SUBCATEGORY_USAGE_SQL, (tenant_id,))
+    usage = {str(name): int(n) for name, n in cur.fetchall() if name}
+
+    cur.execute(BRANCH_USAGE_SQL, (tenant_id,))
+    branch_usage = {f"{m}>{c}>{s}": int(n) for m, c, s, n in cur.fetchall()}
+
+    cur.execute(GUIDE_USAGE_SQL, (tenant_id,))
+    guide_usage = {f"{m}>{c}>{g}": int(n) for m, c, g, n in cur.fetchall()}
+
     categories: dict[str, dict[str, list[str]]] = {}
     for path, depth in paths:
         parts = path.split(">")
@@ -441,6 +500,9 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
         "colors": options["colors"],
         "materials": options["materials"],
         "brands": options["brands"],
+        "subcategoryUsage": usage,
+        "branchUsage": branch_usage,
+        "guideUsage": guide_usage,
     }
     grade_ladder = [
         {"code": c, "label": lbl, "severity": sev,
@@ -457,6 +519,11 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
             "isCloseUpEnabled": imagery_row[2],
             "gender": imagery_row[3],
             "defaultShots": imagery_row[4],
+            # The backdrop a cut-out should sit on (readiness phase 3, decision
+            # 1): the tenant's setting, white when unset. Read by
+            # app/imaging/cutouts.expected_backdrop.
+            "background": imagery_row[5],
+            "autoApplyBackground": imagery_row[6],
         }
 
     return {
@@ -516,6 +583,7 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
      sizing_guide, sizing_guide_id, international_size, mannequin,
      inventory, images, care_label_images, review_status, stage,
      generation_status, source, is_regenerating, created_at, updated_at,
+     media_manual_order, image_settings,
      brand_relation, tenant_name) = row
 
     guides = ctx["guides"]
@@ -559,13 +627,18 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
 
     # ---- media, and the three facts the feed never carries -----------------
     media = [
-        {"url": url, "view": view, "origin": origin, "processing": processing,
-         "mediaType": media_type, "isCurrent": True, "deletedAt": None,
-         "position": position}
-        for url, view, origin, processing, media_type, position in media_rows
+        {"id": mid, "url": url, "view": view, "origin": origin, "processing": processing,
+         "mediaType": media_type, "isCurrent": bool(is_current), "deletedAt": None,
+         "position": position, "width": width, "height": height,
+         "derivedFromId": derived_from}
+        for (mid, url, view, origin, processing, media_type, position,
+             width, height, derived_from, is_current) in media_rows
     ]
-    chart_media = [m["url"] for m in media if m["view"] == "SIZE_CHART"]
-    care_label_media = [m for m in media if m["view"] == "LABEL"]
+    # What is ON the product. The archived originals ride along in `media` for
+    # the cut-out pairing (see MEDIA_SQL) and count as nothing here.
+    live_rows = [m for m in media if m["isCurrent"]]
+    chart_media = [m["url"] for m in live_rows if m["view"] == "SIZE_CHART"]
+    care_label_media = [m for m in live_rows if m["view"] == "LABEL"]
 
     guide = next((g for g in guides if g[0] == str(sizing_guide_id or "")), None)
     chart = {
@@ -664,14 +737,26 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
         "generationStatus": generation_status,
         "isRegenerating": bool(is_regenerating),
         "source": source,
+        # Readiness phase 5: a gallery a person arranged is never re-ordered
+        # (IMG.025 stays silent), and the product's own render settings carry
+        # the build the pictures were made with (`imageSettings.bodyType`).
+        "mediaManualOrder": bool(media_manual_order),
+        "imageSettings": image_settings if isinstance(image_settings, dict) else {},
         "createdAt": created_at.isoformat() if created_at else None,
         "updatedAt": updated_at.isoformat() if updated_at else None,
 
         # The count IMG.030 reads. From ProductMedia, not the legacy column.
         "careLabelCount": len(care_label_media),
         "legacyCareLabelCount": len(care_label_images or []),
-        "imageCount": len([m for m in media if m["mediaType"] == "IMAGE"]),
+        "imageCount": len([m for m in live_rows if m["mediaType"] == "IMAGE"]),
         "legacyImageCount": len(images or []),
+        # THE GALLERY CACHE ITSELF (readiness phase 5). `Product.images` is
+        # vnyx-api's display order, and IMG.025 compares it with the order the
+        # rows imply; IMG.023 / IMG.024 read its first entry. Until now the
+        # record carried only its COUNT, so on a product loaded from the
+        # database those three rules were silent — the review feed sends the
+        # list, the loader did not.
+        "images": [str(u) for u in (images or []) if u],
 
         # Chart facts. Flattened onto the record so a future rule can read them
         # off the snapshot without a second argument.
@@ -720,14 +805,17 @@ SELECT "productId"::text, "basePrice", "baseCurrency"
  WHERE "productId" = ANY(%s::uuid[]) AND "isDefault" = true
 """
 
+# The same rows as MEDIA_SQL, for many products — live, plus the superseded RAW
+# garment originals flagged `isCurrent = false` (readiness phase 3).
 MEDIA_BATCH_SQL = """
-SELECT "productId"::text, url, view::text, origin::text, processing::text,
-       "mediaType"::text, position
+SELECT "productId"::text, id::text, url, view::text, origin::text, processing::text,
+       "mediaType"::text, position, width, height, "derivedFromId"::text, "isCurrent"
   FROM "ProductMedia"
  WHERE "productId" = ANY(%s::uuid[])
-   AND "isCurrent" = true
    AND "deletedAt" IS NULL
- ORDER BY "productId", position
+   AND ("isCurrent" = true
+        OR (processing = 'RAW' AND view IN ('FRONT', 'BACK', 'OTHER')))
+ ORDER BY "productId", "isCurrent" DESC, position
 """
 
 PLACEMENTS_BATCH_SQL = """
@@ -1174,7 +1262,7 @@ def write_workbook(result: dict[str, Any], record: dict[str, Any],
         ("Size chart", loaded["chart"]["state"]),
         ("Sizing guide", loaded["chart"]["sizingGuideName"] or "— none selected"),
         ("Care label images", record["careLabelCount"]),
-        ("Live media rows", len(loaded["media"])),
+        ("Live media rows", len([m for m in loaded["media"] if m.get("isCurrent", True)])),
         ("", ""),
         ("Edit URL", result["edit_url"]),
     ]
@@ -1317,6 +1405,8 @@ def write_workbook(result: dict[str, Any], record: dict[str, Any],
     ws.append(["Live media", ""])
     ws.cell(row=ws.max_row, column=1).font = Font(bold=True)
     for m in loaded["media"]:
+        if not m.get("isCurrent", True):
+            continue  # the archived originals are evidence, not gallery
         ws.append([m["view"], f'{m["origin"]} / {m["processing"]}', m["url"], ""])
 
     target = Path(path) if path else (

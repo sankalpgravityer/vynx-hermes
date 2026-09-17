@@ -57,6 +57,7 @@ pricing:
   condition_to_grade:
     "as new": A
     "new": A
+    "brand new": A      # 739 products on the dev copy spell it this way
     "excellent": A
     "good": B
     "very good": B
@@ -92,12 +93,101 @@ pricing:
   # A correction larger than this % is proposed for review, not applied silently.
   auto_apply_max_delta_pct: 60
 
+  # PRICE.012 — a retail anchor below this is not an anchor. Every window above
+  # is a fraction of retail, so a retail of 2.00 makes a selling price of 1.00
+  # "correct" and a 40.00 one "800% of retail". The auditor this was ported from
+  # carried per-brand floors in price_fallbacks.json; one absolute floor is the
+  # honest version until a tenant supplies its own. MEDIUM: the retail field is
+  # wrong, the product may be fine.
+  retail_floor: 5.00
+
+  # CONSIGNMENT. For these tenants the selling price is the consignor's under
+  # contract, not vnyx's to correct: the chain skips the price step, the gate
+  # never plans a price write, and PRICE.002/003 stop blocking approval (they
+  # stay visible as MEDIUM). PRICE.001 — above retail — is an arithmetic
+  # invariant and still blocks. Tenant ids; empty means nobody.
+  consignment_tenants: []
+
 confidence:
   # Below this, a field is treated as unreliable and routed to evidence gathering.
   review_threshold: 0.70
   # LLM verdicts below this can never become an auto-applied patch.
   llm_apply_threshold: 0.85
   placeholders: ["unknown", "n/a", "na", "none", "-", "null", "tbd", ""]
+
+# Copy checks that need a number. Everything else in TEXT.* is a comparison of
+# fields the product already carries.
+copy:
+  # TEXT.005 — `material` is a fibre, not a paragraph. Longer than this and the
+  # extractor pasted the whole composition line ("100% Cotton. Made in Portugal.
+  # Machine wash cold …") into a field the storefront renders as a facet.
+  material_max_chars: 60
+  # TEXT.006 — the title the pipeline writes at creation and replaces when
+  # generation succeeds. Still carrying it means nothing was ever produced; on
+  # one batch that was 35 of 61 products, and every one of them would otherwise
+  # ship under the placeholder. Prefix match, case-insensitive.
+  placeholder_title_prefixes: ["Generating Product"]
+
+completeness:
+  # DATA.003 — vintage is one-of-one. A quantity other than this on a product
+  # about to be approved is a data-entry slip (0: nothing to sell; 3: a duplicate
+  # that will oversell). MEDIUM, so a multi-unit tenant is warned, not blocked;
+  # set to null to switch the rule off for a wholesale catalogue.
+  expected_inventory: 1
+
+# ATTR.005 — the supplier a tenant's products should all name. The auditor
+# carried one canonical supplier per tenant; here it is keyed by tenant id and
+# empty by default, so the rule is silent until somebody fills it in.
+suppliers:
+  canonical_by_tenant: {}
+
+# C-TWINS. A twin (`CBOA-000123`) is the SAME physical garment as its parent
+# (`BOA-000123`), listed a second time under the opposite gender so unisex stock
+# is discoverable in both departments. Duplication copies the images and not the
+# measurements, so twins arrive with blank size / brand and are rejected for it —
+# 9 of 9 in the auditor's rehearsal; on this week's production runs it would
+# have rescued 5. The `twin` step in repair_product.py copies the GENDER-NEUTRAL
+# facts from the parent into blank fields on the twin, before any rule runs.
+#
+# `never_inherit` is documentation of what the step must not touch — everything
+# gender-dependent is recomputed for the twin's own gender by the normal chain.
+twins:
+  prefixes: ["CBOA-", "CKIL-", "CBEV-", "CSKU-", "CBLM-"]
+  inherit_properties:
+    ["brand", "international_size", "waist", "length_size", "material", "fit",
+     "condition", "color"]
+  never_inherit:
+    ["gender", "master_category", "category", "subcategory", "mannequin",
+     "sizing_guide", "eu_size", "title", "description"]
+
+# IMG.040 — does the picture show the kind of garment the category says?
+# The quality gate asks the model to name the garment in the lead render in a
+# word or two; both that word and the product's category are mapped to a family
+# here, and the gate refuses only when the two families are DIFFERENT and NOT
+# adjacent. A word or category that maps to no family decides nothing.
+garment_families:
+  tops:
+    ["shirt", "tee", "t-shirt", "tshirt", "polo", "sweater", "hoodie", "jumper",
+     "knit", "sweatshirt", "blouse", "top", "tank", "cardigan", "vest", "fleece",
+     "pullover", "jersey"]
+  bottoms:
+    ["trouser", "pant", "jean", "denim", "short", "skirt", "legging", "chino",
+     "jogger", "dungaree", "overall", "bottom", "cargo"]
+  dresses: ["dress", "gown", "jumpsuit", "romper", "playsuit"]
+  outerwear:
+    ["jacket", "coat", "blazer", "parka", "puffer", "gilet", "windbreaker",
+     "anorak", "bomber", "trench", "outerwear"]
+  footwear:
+    ["shoe", "sneaker", "boot", "sandal", "heel", "loafer", "trainer", "footwear"]
+  accessories:
+    ["cap", "hat", "beanie", "belt", "bag", "scarf", "backpack", "wallet",
+     "glove", "sock", "accessor"]
+  # Pairs the model routinely conflates; a mismatch between them is not a
+  # finding. Tops/outerwear only: a shirt-jacket reads as either. Dresses are
+  # deliberately NOT adjacent to tops — a gown rendered on a vest listing
+  # (BOA-006114) is exactly the case this exists to catch.
+  adjacent:
+    - ["tops", "outerwear"]
 
 guardrails:
   # Fields the LLM is NEVER allowed to write directly. It may only supply
@@ -147,13 +237,19 @@ taxonomy:
     Accessories: [Hats, Bags]
 
 # Which mannequin rigs are valid for a given gender+category.
+#
+# "Bottom" (no gender word) is the rig the edit screen's dropdown offers for
+# bottoms and the one readiness derives (vnyx-ui formatters.ts MannequinType);
+# approve-products.ts reads it as a bottom rig of no gender and accepts it.
 mannequin_map:
-  "Men|Bottoms": ["Men Bottom", "Men Bottoms"]
+  "Men|Bottoms": ["Men Bottom", "Men Bottoms", "Bottom"]
   "Men|Tops": ["Men Top", "Men Tops"]
   "Men|Outerwear": ["Men Top", "Men Outerwear"]
-  "Women|Bottoms": ["Women Bottom", "Women Bottoms"]
+  "Women|Bottoms": ["Women Bottom", "Women Bottoms", "Bottom"]
   "Women|Tops": ["Women Top", "Women Tops"]
-  "Women|Dresses": ["Women Dress", "Women Full"]
+  # "Women Top" is what the edit screen offers for a dress (policy sizing.sides
+  # files `dress` on the upper ladder); the two older names stay accepted.
+  "Women|Dresses": ["Women Top", "Women Dress", "Women Full"]
   "Women|Outerwear": ["Women Top", "Women Outerwear"]
 
 sizing:
@@ -232,6 +328,46 @@ llm:
   timeout_s: 45
   # Only spend an LLM call when the rule engine actually asked for evidence.
   evidence_only: true
+
+  # FAIL-FAST ON A PROVIDER OUTAGE — app/llm/health.py.
+  #
+  # Every in-process vision call (care-label read, quality gate) is counted by
+  # outcome over a sliding window of the last `window` calls. Once at least
+  # `min_samples` are in the window and `error_ratio` of them are hard API
+  # errors — 429, 5xx, a rejected key, a timeout; never an "I cannot read this"
+  # answer — the run loop STOPS for `cooldown_s` instead of turning the outage
+  # into a queue of "no brand or size" rejections. The products already judged
+  # keep their verdicts; the one in hand is retried, not judged.
+  #
+  # 6 samples is three products' worth. 0.7 means a working OpenAI fallback
+  # (one Gemini error, one OpenAI success per label) never reads as an outage.
+  health:
+    window: 20
+    min_samples: 6
+    error_ratio: 0.7
+    cooldown_s: 600
+
+  # VISION RESPONSE CACHE — app/llm/cache.py.
+  #
+  # The answer to "what is in this picture" does not change while the picture
+  # does not, so the gate, the care-label read, the image audit and the
+  # background classifier remember their parsed answers and never send the
+  # same image to the model twice. Keyed on the image (URL with its query
+  # string, or a digest of the bytes), the prompt, the schema and the model —
+  # editing a prompt invalidates every answer given to the old one on its own.
+  # Failures are never stored; neither is an answer computed with an image
+  # missing. The win is on re-runs: --retry after an outage, re-verification
+  # after a repair, calibration sweeps.
+  #
+  # `redis_url` null means one JSON file per answer under `dir` (atomic writes,
+  # safe for --workers). Point it at a spare database of the Celery Redis to
+  # share the cache between the worker and the CLI. Environment for one run:
+  # HERMES_VISION_CACHE=0 (off), HERMES_VISION_CACHE_DIR, HERMES_VISION_CACHE_REDIS.
+  cache:
+    enabled: true
+    ttl_hours: 168
+    dir: ".cache/vision"
+    redis_url: null
 
 # --------------------------------------------------------------------------- #
 # Imagery — the on-model renders and background removal.
@@ -442,6 +578,306 @@ imagery:
     # gets the identical answer while doubling the wait.
     max_retries: 2
     retry_backoff_s: 3
+
+# --------------------------------------------------------------------------- #
+# Quality gate — the one look at the LEAD RENDER before a product is approved.
+# app/imaging/quality_gate.py; runs as the `gate` step of repair_product.py,
+# after render and before approve.
+#
+# Every other check reads columns. This one asks a vision model seven things
+# about the picture a shopper will see — model present, face intact, model
+# gender, usable lead, body coherent, what is wrong, front or back — in ONE
+# call, and turns the answer into an action:
+#
+#   ok       approve may proceed
+#   regen    the content is wrong: hold, outcome IMAGE_QUALITY or
+#            MODEL_GENDER_MISMATCH. A re-render is the likely fix.
+#   review   the gate could not decide (provider down, image unreachable):
+#            the product is RETRIED, not held — see llm.health above.
+#
+# Runs in shadow mode too, so a dry run reports what the gate would refuse.
+# Measure its false-block rate on a batch that was approved by hand before
+# trusting it with a tenant.
+# --------------------------------------------------------------------------- #
+quality_gate:
+  enabled: true
+  # When the gate cannot run at all (no GEMINI_API_KEY), block approval rather
+  # than skip it. false = a rules-only deployment approves without the gate,
+  # which is the pre-gate behaviour.
+  required: true
+  # Which render is judged, in order of preference. Only AI renders: the gate
+  # is about the on-model image, and a product with none is refused by the
+  # approval pre-flight anyway ("missing AI_FRONT").
+  lead_views: ["AI_FRONT", "AI_FRONT_34"]
+  # Each of these can be switched off independently. Removing one turns that
+  # finding into a soft flag — recorded, never blocking. `category_mismatch`
+  # is the one DATA question the picture answers (see garment_families); the
+  # other four are render defects.
+  # `body_size_mismatch` (readiness phase 4): the model's build two bands from
+  # the garment's size regenerates the set; thresholds under readiness.body_size.
+  # `cropped_model`: a model cut at the knees / waist on a view that must show
+  # the whole figure (MODEL_CROPPED) re-renders that view. Anatomy alone did
+  # not catch it — a clean knee crop is a coherent body (MID-000247).
+  # `bad_composition`: a render whose FIGURE does not fill its frame — an empty
+  # band below the model, or a model a fraction of the frame's height — is
+  # re-rendered on its own (IMAGE_COMPOSITION). A pixel test over every view,
+  # not only the lead; see `composition` below and app/imaging/composition.py.
+  block_on: ["no_model", "bad_face", "broken_body", "gender_mismatch",
+             "category_mismatch", "body_size_mismatch", "cropped_model",
+             "bad_composition"]
+  composition:
+    enabled: true
+    views: ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK", "AI_CLOSEUP"]
+    # Calibrated on 189 approved renders (39 products): the widest empty band on
+    # a good render is 0.10 and the shortest figure 0.87 of the frame;
+    # MID-000247's bad three-quarter left 0.22 empty and stood 0.76. Midway.
+    max_bottom_margin: 0.15
+    min_height_fill: 0.82
+    # A pixel this far (RGB) from the backdrop colour is figure; the vnyx.ai
+    # badge in the bottom-right corner is masked out.
+    backdrop_tolerance: 28
+    badge_width: 0.24
+    badge_height: 0.10
+  # The views that must show the model head to feet. NOT the three-quarter
+  # views — the prompt asks for those "knee-up, feet cropped out of frame, NOT
+  # a full-body shot", so a knee crop there is the design (and they lead the
+  # gallery: VIEW_RANK puts front¾ first). The close-up is a detail; footwear
+  # (knee-to-floor) and accessories (head-and-shoulders) are exempt whatever
+  # the view.
+  full_body_views: ["AI_FRONT", "AI_BACK"]
+  # Below this confidence a crop is a soft flag, not a re-render.
+  framing_min_confidence: 0.7
+  # Sub-categories legitimately shot without a model. NO MODEL is a soft flag
+  # on these; BAD FACE and BROKEN BODY still block (they cannot fire without a
+  # model, so in practice these pass).
+  accessory_terms:
+    ["cap", "caps", "beanie", "beanies", "hat", "hats", "gloves", "belt",
+     "belts", "scarf", "scarves", "bag", "bags", "backpack", "backpacks",
+     "accessories", "accessory", "wallet", "wallets", "socks", "sunglasses"]
+  # null = llm.model_fast.
+  model: null
+
+# --------------------------------------------------------------------------- #
+# Photo audit — what the garment PHOTOGRAPHS say. app/imaging/photo_audit.py
+#
+# The gate above judges the render, which is generated and shows no wear. This
+# is ONE more call per product over the cut-outs and the renders together,
+# answering two of the auditor's checks the port had deferred:
+#
+#   GRADE_SUSPECT  the photographs show wear at least `disagreement_steps`
+#                  WORSE than the record's grade, on the shared Grade.severity
+#                  scale none < minor < moderate < major. Held for a person;
+#                  the defects the model saw are listed. The grade is never
+#                  written. Photos that look BETTER than the grade are a soft
+#                  flag (under-grading costs margin, not trust).
+#   IMAGE_DEFECT   a PHOTOGRAPH or cut-out is not what its slot says —
+#                  background left in a cut-out, a close-up filed as a front.
+#                  Soft by default; `gallery.block: true` holds. Nothing can
+#                  re-take a photograph.
+#   RENDER_DEFECT  an AI RENDER the model calls defective — a smeared limb,
+#                  duplicated garments, clutter, text in the scene. The gate
+#                  judges the lead only; the other four renders are seen HERE
+#                  (MID-000253: knees blurred to white on the AI_FRONT_34, the
+#                  AI_FRONT beside it passed the gate). `render_defects: regen`
+#                  re-renders THAT VIEW through the chain's regen step, same
+#                  model identity (the renderer is handed the stored personality
+#                  and the AI_FRONT as reference); `hold` makes it a person's
+#                  IMAGE_DEFECT; `soft` records it and nothing follows.
+#
+# Two steps is the auditor's calibration: one step apart is the honest
+# disagreement of two people looking at the same jeans. `required: false`
+# means a provider failure here blocks nothing — the gate is the definition of
+# "may this leave Review"; this adds evidence to it.
+# --------------------------------------------------------------------------- #
+photo_audit:
+  enabled: true
+  required: false
+  wear:
+    enabled: true
+    views: ["FRONT", "BACK"]
+    max_images: 2
+    disagreement_steps: 2
+    min_confidence: 0.6
+    block: true
+  gallery:
+    enabled: true
+    views: ["FRONT", "BACK", "AI_FRONT", "AI_BACK", "AI_FRONT_34", "AI_BACK_34", "AI_CLOSEUP"]
+    # EVERY live cut-out of a garment view goes (a flat lay and a booth shot
+    # are two FRONT cut-outs — MID-000569's broken one was the second), plus
+    # the five renders.
+    max_images: 10
+    block: false
+    # regen | hold | soft — what a defective AI render becomes (see above).
+    # The re-render is paid and counts against readiness.max_regenerations_per_run.
+    # Also fired when one render shows a DIFFERENT person than the others
+    # (the `same_model` question): that view is re-rendered against them.
+    render_defects: regen
+    # rematte | hold | soft — what a defective CUT-OUT becomes: a collar or
+    # sleeve the mask cut away, a stand or hand left in (MID-000569: the
+    # sweater's neckband missing from both FRONT cut-outs). `rematte` re-cuts
+    # it from the raw archive through the chain's rematte step (CUTOUT_DEFECT —
+    # a flag while readiness.cutouts.hold is soft, a hold once it is block).
+    cutout_defects: rematte
+  # null = llm.model_fast.
+  model: null
+
+# --------------------------------------------------------------------------- #
+# Readiness — the master category is the anchor. docs/READINESS-PLAN.md, phase 1.
+#
+# Every field a product's approval hangs off is settled FROM the master category:
+# the gender property follows it, category and subcategory must sit under it in
+# the tenant's tree, the sizing guide follows gender + side + ladder, and the
+# mannequin rig is DERIVED from it and written, never read (decision 6 — TAX.005
+# no longer rewrites the master to match the rig).
+#
+# One switch per check is added as later phases land (cut-outs, renders, order,
+# copy). `enabled: false` restores the WP3 behaviour for everything in this block.
+# --------------------------------------------------------------------------- #
+readiness:
+  enabled: true
+  master:
+    # What a root implies for the gender property. Roots not listed imply
+    # nothing — the property stands on its own there (decision 4: Unisex keeps
+    # the property, Kids is rendered from it).
+    gender_by_root: {Men: men, Women: women}
+    genderless_roots: [Unisex, Kids]
+    # The photo audit now says which gender the GARMENT photographs suggest.
+    # `soft` records a contradiction as a flag; `hold` makes it
+    # MASTER_CATEGORY_MISMATCH. Soft until the shadow run has measured it —
+    # the phase 1 exit criterion. The render never votes either way.
+    photo_check: soft
+    photo_min_confidence: 0.85
+  # Unisex master: the gender property picks the model and the guide.
+  unisex_gender_source: property
+  mannequin:
+    # The rig vocabulary the edit screen offers (vnyx-ui formatters.ts). A
+    # derived rig must be one of these or the dropdown renders blank.
+    upper: {men: "Men Top", women: "Women Top", any: "Top"}
+    bottom: "Bottom"
+    kids: "Kids"
+  # A house choice (a category, a guide) wins a tie only when the tenant uses it
+  # at least this many times more often than the runner-up.
+  usage_tiebreak_ratio: 2
+
+  # --- phase 4: the renders (docs/READINESS-PLAN.md §4 step 5) ----------------
+  #
+  # The gate refuses a render (wrong gender, wrong build, no model, broken
+  # body); the chain re-renders what the refusal names — the whole set for a
+  # gender or build problem, the one view for a defect — through the render
+  # step's `views` option, and judges the result once more. See
+  # app/imaging/quality_gate.py (size_band, regen_views).
+  #
+  # One paid regeneration per product per run. A second refusal holds; credits
+  # are spent once, never in a loop.
+  max_regenerations_per_run: 1
+  # Decision 4: Kids products are rendered with a child model, never held for
+  # being Kids. `hold` leaves their renders to a person.
+  kids_renders: generate
+  # Decision 8: a product nothing can repair — no garment photograph
+  # (NO_GARMENT_PHOTO), every image model declining the print (RENDER_REFUSED)
+  # — is rejected with its reason through the reject step, which archives any
+  # listing. `hold` keeps it in Review for a person instead.
+  unfixable: reject
+  # Roots that mean a child model, judged against no adult build.
+  kids_roots: [Kids, Kid, Children, Child]
+  # The model's build against the garment's size. The gate's one call gains a
+  # `model_build` field (slim | average | plus | unknown); the size maps to a
+  # band through `bands`, a waist through `waist_bands` (bottoms with a
+  # gender), and the two are compared.
+  body_size:
+    enabled: true
+    # Below this confidence a two-band gap is a soft flag, not a re-render.
+    min_confidence: 0.7
+    # Slim on an XL regenerates; average against plus is a soft flag.
+    block_on_band_gap: 2
+    bands: {xs: slim, s: slim, m: average, l: average, xl: plus, xxl: plus}
+    # Decision 9 as shipped in vnyx-api services/body-type.ts: waist inches →
+    # letter, per gender, continuous from 20 to 60.
+    waist_bands:
+      men:   {xs: [20, 29], s: [30, 31], m: [32, 33], l: [34, 37], xl: [38, 41], xxl: [42, 60]}
+      women: {xs: [20, 25], s: [26, 27], m: [28, 29], l: [30, 31], xl: [32, 33], xxl: [34, 60]}
+
+  # --- phase 5: the gallery order and the copy (§4 steps 7 and 8) -------------
+  gallery:
+    enabled: true
+    # `soft`: IMG.025 (the cache is out of the catalog order) is a flag;
+    # `block`: it holds. The chain's `order` step rebuilds the cache through
+    # vnyx-api either way; a gallery a person arranged is never touched.
+    hold: soft
+    # Decisions 2 and 3 for every tenant, mirrored from vnyx-api ORIGIN_RANK:
+    # renders → uploads (manual, web) → photobooth front/back → decision-portal
+    # front/back → label → size chart; cut-outs before raws. Inside the garment
+    # band the origin leads; the bands and views are the schema's own.
+    origin_order: [AI, MANUAL, WEB, PHOTOBOOTH, DECISION, SIZE_GUIDE]
+    # Leave a gallery flagged `mediaManualOrder` as it is? The flag's intent is
+    # an operator's drag-and-drop — but vnyx-api's updateProduct sets it on
+    # EVERY save that carries `images` (the edit screen's Save always does), so
+    # on production 1,538 of 4,877 approved products carry it in the machine's
+    # own old order (MID-000247). It marks a gallery that was saved, not one a
+    # person chose. NOT trusted: IMG.025 judges those galleries too and the
+    # order step rebuilds them (vnyx-api reorder step, `--include-manual`).
+    # vnyx-api now sets the flag only when the asserted order actually differs
+    # from the cache (deploy ①); once the flags have been re-earned, `true`.
+    respect_manual: false
+  copy:
+    enabled: true
+    # The `copy` step regenerates the title and description from the CURRENT
+    # record when this run changed any of these (the title template's inputs)…
+    trigger_fields: [gender, masterCategory, category, subCategory, size, color, brand]
+    # …or when the copy already disagrees with the record. TEXT.008 is new:
+    # the title's own size or garment word contradicts the record.
+    trigger_rules: [TEXT.002, TEXT.003, TEXT.006, TEXT.007, TEXT.008]
+
+  # --- phase 3: the cut-outs (docs/READINESS-PLAN.md §4 step 3) ---------------
+  #
+  # Each live FRONT/BACK cut-out is measured against the original it was cut
+  # from and the backdrop the tenant wants. A wrong one is re-matted through
+  # `backfill-bg-removal.ts --replace` (Hermes segmenter, source canvas,
+  # tenant backdrop) and measured again. See app/imaging/cutouts.py.
+  cutouts:
+    enabled: true
+    # `soft`: a cut-out still wrong after the re-matte is a flag on the run.
+    # `block`: it holds the product as CUTOUT_UNFIXABLE. Soft until the shadow
+    # run over approved products has reported the false-hold rate — the
+    # phase 3 exit criterion. Flip here, no code change.
+    hold: soft
+    # The cut-out's ASPECT RATIO may differ from the original's by this
+    # fraction. The ratio and not the size: the Gemini segmenter returns a
+    # fixed ~1 MP canvas (896×1195 for a 3:4 photograph), a uniform downscale
+    # of the whole frame with the garment in the same place — looked at on
+    # BOA-006175, -006127, -006166 before this was settled. That is not zoom.
+    # A crop to the garment changes the ratio, and is.
+    canvas_tolerance: 0.02
+    # A cut-out whose garment touches this many of its four edges (outermost
+    # pixel line, `edge_touch_min_fraction` of it) was cut to its bounding box.
+    crop_edges_touched: 4
+    edge_touch_min_fraction: 0.01
+    # A pixel on that line is garment only this far (RGB) from the backdrop:
+    # edge vignetting and compression noise sit 15-25 off it and are not a hem.
+    edge_rgb_tolerance: 40
+    # Decision 1: the tenant's `background` setting wins; this when unset.
+    # Mirrors vnyx-api's resolveMatteBackdrop, which is what the re-matte
+    # applies — the check and the fix must agree.
+    background_default: "#FFFFFF"
+    # CIE76 ΔE between the border's median colour and the tenant's hex.
+    # #FFFFFF against #EBEBEB is ΔE ≈ 7, so this sits well under it.
+    color_tolerance: 4.0
+    # Fraction of the opaque border that must be the backdrop colour. Low on
+    # purpose: a composited cut-out is exactly the backdrop wherever it is not
+    # garment, so sleeves at the frame edge (BOA-006127, 84%) still pass and a
+    # stockroom wall (near 0%) does not.
+    backdrop_min_fraction: 0.5
+    # Per-pixel RGB distance that still counts as "the backdrop colour".
+    rgb_tolerance: 12
+    # Fraction of the border that must be fully transparent to call a cut-out
+    # transparent (the tenant setting `transparent` only); above
+    # `partial_transparent_min` on a colour tenant the backdrop was applied to
+    # part of the picture only.
+    transparent_border_min: 0.85
+    partial_transparent_min: 0.15
+    border_fraction: 0.06
+    fetch_timeout_s: 15
+    fetch_deadline_s: 40
 
 # --------------------------------------------------------------------------- #
 # Readability — can the text in a phone photograph actually be read?

@@ -47,6 +47,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from app.imaging import cutouts as cutout_checks
 from app.models import (
     AiViewReport, Finding, GenerationPlan, MediaAsset, ProductSnapshot, Severity,
     SourceImage,
@@ -205,6 +206,48 @@ def needs_matting_for_generation(
         m for m in photos
         if m.processing == "RAW" and m.view not in matted_views
     ]
+
+
+def cutout_pairs(
+    p: ProductSnapshot, pol: dict[str, Any]
+) -> list[tuple[str, MediaAsset, MediaAsset | None]]:
+    """Each live FRONT/BACK cut-out with the original it was cut from.
+
+    Readiness phase 3. `derivedFromId` names the original when the cut-out was
+    written through `replaceWithDerived` (1,069 of the 2,341 approved cut-outs
+    locally); otherwise the RAW of the same view AND ORIGIN stands in — the
+    SUPERSEDED one first, since that is what a cut-out replaces, then a live
+    RAW beside it. Same origin, because a WEB cut-out next to a PHOTOBOOTH
+    and a DECISION original (BLM-000408) is three photographs, and comparing
+    the shape of one with another would flag a defect that is not there. None
+    when no original is on file — a C-twin carries only its parent's cut-outs —
+    and then the backdrop can still be judged, the canvas cannot. Never pairs
+    across views, and a cut-out filed under OTHER is not a FRONT (see
+    `orphan_cutouts`).
+    """
+    views = set(_cfg(pol).get("matte_views") or ["FRONT", "BACK"])
+    by_id = {m.id: m for m in p.media if m.id}
+    cutouts = [m for m in garment_photos(p, pol)
+               if m.view in views and m.processing != "RAW"]
+    out: list[tuple[str, MediaAsset, MediaAsset | None]] = []
+    for cut in cutouts:
+        raw = by_id.get(cut.derived_from_id) if cut.derived_from_id else None
+        if raw is not None and raw.processing != "RAW":
+            # Derived from an earlier cut-out (a re-matte of a re-matte). The
+            # loader carries only RAW archive rows, so fall back to the view.
+            raw = None
+        if raw is None:
+            cands = [
+                m for m in p.media
+                if m.view == cut.view and m.processing == "RAW"
+                and m.media_type == "IMAGE" and not m.deleted_at
+                and not is_size_chart(m.url, pol)
+                and (not cut.origin or not m.origin or m.origin == cut.origin)
+            ]
+            cands.sort(key=lambda m: (m.is_current, -m.position))
+            raw = cands[0] if cands else None
+        out.append((cut.view, cut, raw))
+    return out
 
 
 def needs_segmenter(p: ProductSnapshot, pol: dict[str, Any]) -> list[MediaAsset]:
@@ -413,6 +456,89 @@ def source_images(p: ProductSnapshot, pol: dict[str, Any]) -> list[SourceImage]:
     ]
 
 
+# --------------------------------------------------------------------------- #
+# The gallery order — readiness phase 5 (docs/READINESS-PLAN.md §4 step 7)
+# --------------------------------------------------------------------------- #
+#
+# `Product.images` is vnyx-api's display order, rebuilt from the rows by
+# compareForDisplay: processed before raw; then the BAND — renders, garment
+# photography, video, labels, size charts; inside the garment band the ORIGIN
+# leads (decision 2: uploads, then the booth's front and back, then the portal's
+# front and back), inside every other band the view leads; then position. This
+# is that comparator, reproduced so IMG.025 can say whether a cached order is
+# the catalog's. The fix is never a position write from Hermes: the cache is
+# rebuilt by vnyx-api (`rebuild-media-cache.ts`, the chain's `order` step).
+
+_GALLERY_VIEW_RANK: dict[str, int] = {
+    "AI_FRONT_34": 0, "AI_BACK_34": 1, "AI_FRONT": 2, "AI_BACK": 3, "AI_CLOSEUP": 4,
+    "FRONT": 10, "BACK": 11, "OTHER": 12, "VIDEO_TURNTABLE": 15, "LABEL": 20, "SIZE_CHART": 30,
+}
+_GALLERY_BAND: dict[str, int] = {
+    "AI_FRONT_34": 0, "AI_BACK_34": 0, "AI_FRONT": 0, "AI_BACK": 0, "AI_CLOSEUP": 0,
+    "FRONT": 1, "BACK": 1, "OTHER": 1, "VIDEO_TURNTABLE": 2, "LABEL": 3, "SIZE_CHART": 4,
+}
+_GARMENT_BAND = 1
+
+
+def gallery_config(pol: dict[str, Any] | None) -> dict[str, Any]:
+    from app import readiness
+
+    return dict(readiness.config(pol).get("gallery") or {})
+
+
+def gallery_enabled(pol: dict[str, Any] | None) -> bool:
+    from app import readiness
+
+    return readiness.enabled(pol) and bool(gallery_config(pol).get("enabled", True))
+
+
+def gallery_key(m: MediaAsset, pol: dict[str, Any] | None) -> tuple[int, ...]:
+    """vnyx-api's compareForDisplay, as a sort key."""
+    origins = [str(o).upper() for o in (gallery_config(pol).get("origin_order") or [])]
+    origin = str(m.origin or "").upper()
+    origin_rank = origins.index(origin) if origin in origins else len(origins)
+    band = _GALLERY_BAND.get(m.view, 5)
+    view = _GALLERY_VIEW_RANK.get(m.view, 99)
+    inner = (origin_rank, view) if band == _GARMENT_BAND else (view, origin_rank)
+    return (0 if m.processing != "RAW" else 1, band, *inner, m.position)
+
+
+def gallery_label(m: MediaAsset) -> str:
+    return f"{m.view}/{m.origin or '?'}" + ("/raw" if m.processing == "RAW" else "")
+
+
+def gallery_order(p: ProductSnapshot, pol: dict[str, Any] | None) -> list[MediaAsset]:
+    """The live images in the catalog order."""
+    return sorted(live_media(p), key=lambda m: gallery_key(m, pol))
+
+
+def gallery_divergence(actual_urls: list[str],
+                       expected: list[MediaAsset]) -> dict[str, Any] | None:
+    """Where the cached order first departs from the catalog order, or None.
+
+    Compared over the urls both sides know: a cache entry with no live row
+    (legacy) and a row the cache has not caught up with are not an ORDER
+    problem, and saying so would send the fix at the wrong thing.
+    """
+    by_url = {m.url: m for m in expected}
+    seen: list[str] = []
+    for u in actual_urls:
+        if u in by_url and u not in seen:
+            seen.append(u)
+    known = set(seen)
+    want = [m.url for m in expected if m.url in known]
+    if seen == want:
+        return None
+    index = next((i for i, (a, b) in enumerate(zip(seen, want)) if a != b), 0)
+    return {
+        "index": index,
+        "actual": gallery_label(by_url[seen[index]]),
+        "expected": gallery_label(by_url[want[index]]),
+        "actual_sequence": [gallery_label(by_url[u]) for u in seen],
+        "expected_sequence": [gallery_label(by_url[u]) for u in want],
+    }
+
+
 def _stale(p: ProductSnapshot, pol: dict[str, Any]) -> bool:
     if not p.updated_at:
         return False
@@ -569,6 +695,120 @@ def check_imagery(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
             detail={"raw": [m.url for m in raw],
                     "cutouts": [m.url for m in orphans]},
         ))
+
+    # --- the cut-outs themselves (readiness phase 3) -------------------------
+    #
+    # IMG.026 canvas and IMG.027 backdrop, from evidence already ON the rows:
+    # stored `width/height` for the canvas, and the border measurement
+    # app/imaging/cutouts.judge writes back after looking at the file. Silent
+    # without either — a rule set that runs on every review-queue page must
+    # not fetch — so on the chain they fire after the matte step has measured,
+    # and in the audit after the images have been measured. The severity
+    # follows `readiness.cutouts.hold`: LOW (a flag) while soft, HIGH once the
+    # shadow run has earned the right to block.
+    if cutout_checks.enabled(pol):
+        cut_cfg = cutout_checks.config(pol)
+        hold_sev = Severity.HIGH if cut_cfg.get("hold") == "block" else Severity.LOW
+        expected = cutout_checks.expected_backdrop(p.imagery_settings, cut_cfg)
+        tolerance = float(cut_cfg.get("canvas_tolerance") or 0.02)
+        for view, cut, raw in cutout_pairs(p, pol):
+            # IMG.026: the shape. The aspect ratio against the original when
+            # both are known, and — from the border measurement — the garment
+            # cut to its bounding box. Either is the zoom the requirement
+            # forbids; a same-ratio downscale of the whole frame is not.
+            frame_problems: list[str] = []
+            if cut.width and cut.height and raw is not None and raw.width and raw.height:
+                why = cutout_checks.canvas_mismatch(
+                    (cut.width, cut.height), (raw.width, raw.height), tolerance)
+                if why:
+                    frame_problems.append(why)
+            if cut.border:
+                why = cutout_checks.frame_mismatch(cut.border, cut_cfg)
+                if why:
+                    frame_problems.append(why)
+            if frame_problems:
+                out.append(Finding(
+                    rule_id="IMG.026", severity=hold_sev, fields=["images"],
+                    message=(
+                        f"The {view} cut-out is not the photograph's frame: "
+                        f"{'; '.join(frame_problems)}. Next to the original it reads as "
+                        f"zoomed in. Re-matte from the original on the source canvas."
+                    ),
+                    detail={"view": view, "url": cut.url,
+                            "original": raw.url if raw else None,
+                            "canvas": [cut.width, cut.height],
+                            "original_canvas": ([raw.width, raw.height]
+                                                if raw and raw.width and raw.height else None),
+                            "edges_touched": (cut.border or {}).get("edges_touched"),
+                            "hold": cut_cfg.get("hold")},
+                ))
+            if cut.border:
+                why = cutout_checks.background_mismatch(cut.border, expected, cut_cfg)
+                if why:
+                    out.append(Finding(
+                        rule_id="IMG.027", severity=hold_sev, fields=["images"],
+                        message=(
+                            f"The {view} cut-out is not on the tenant's backdrop: {why}. "
+                            f"Re-matte on {expected.describe()}."
+                        ),
+                        detail={"view": view, "url": cut.url, "border": cut.border,
+                                "expected": expected.as_dict(),
+                                "hold": cut_cfg.get("hold")},
+                    ))
+
+    # --- the gallery order (readiness phase 5) --------------------------------
+    #
+    # IMG.025: `Product.images` against the catalog order the rows imply. Silent
+    # for a gallery a person arranged, when the cache is empty, and when the
+    # rows were not supplied. LOW while `readiness.gallery.hold` is soft, HIGH
+    # once it is block — the fix is a cache rebuild, and the chain runs it.
+    g_cfg = gallery_config(pol) if gallery_enabled(pol) else {}
+    respected = bool(p.media_manual_order and g_cfg.get("respect_manual", True))
+    if p.images and gallery_enabled(pol) and not respected:
+        divergence = gallery_divergence(p.images, gallery_order(p, pol))
+        if divergence:
+            out.append(Finding(
+                rule_id="IMG.025",
+                severity=Severity.HIGH if g_cfg.get("hold") == "block" else Severity.LOW,
+                fields=["images"],
+                message=(
+                    f"The gallery is out of the catalog order: position "
+                    f"{divergence['index'] + 1} shows {divergence['actual']} where "
+                    f"{divergence['expected']} belongs. Now: "
+                    f"{' > '.join(divergence['actual_sequence'])}. Rebuild the media cache."
+                ),
+                detail={**divergence, "hold": g_cfg.get("hold")},
+            ))
+
+    # --- the gallery's lead image --------------------------------------------
+    #
+    # `p.images` is vnyx-api's own display order (rebuildMediaCache sorts it:
+    # processed before raw, then by view, then position), so images[0] IS what
+    # the storefront leads with. Two things should never be first, and both are
+    # only reachable through a human arrangement (mediaManualOrder) or a cache
+    # the last relabel did not rebuild — which is exactly why they are worth a
+    # rule rather than trust.
+    #
+    # Deliberately NOT a "real photo before render" rule: which of those leads
+    # is vnyx-api's VIEW_RANK decision (renders first), and the auditor's
+    # reversal of it (2026-08-14) is for the product owner to make, not a port.
+    lead_row = next((m for m in live_media(p) if m.url == (p.images or [None])[0]), None)
+    if lead_row is not None:
+        if lead_row.view in ("LABEL", "SIZE_CHART") or is_size_chart(lead_row.url, pol):
+            out.append(Finding(
+                rule_id="IMG.024", severity=Severity.MEDIUM, fields=["images"],
+                message=(f"The gallery leads with a {lead_row.view.lower().replace('_', ' ')}; "
+                         f"a shopper's first picture is a tag, not the garment."),
+                detail={"lead_view": lead_row.view, "lead_url": lead_row.url},
+            ))
+        elif (lead_row in photos and lead_row.processing == "RAW"
+              and any(m.processing != "RAW" for m in photos)):
+            out.append(Finding(
+                rule_id="IMG.023", severity=Severity.LOW, fields=["images"],
+                message=("The gallery leads with an unprocessed photograph while "
+                         "a cut-out of the garment exists."),
+                detail={"lead_view": lead_row.view, "lead_url": lead_row.url},
+            ))
 
     # --- pipeline state --------------------------------------------------------
     if p.generation_status == "FAILED":

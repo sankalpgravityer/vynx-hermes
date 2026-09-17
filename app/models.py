@@ -80,6 +80,23 @@ class TenantCatalog(BaseModel):
     colors: list[str] = Field(default_factory=list)
     materials: list[str] = Field(default_factory=list)
     brands: list[str] = Field(default_factory=list)
+    # How often this tenant's OTHER products use each subcategory value — the
+    # tenant's working vocabulary, counted from its catalogue rather than read
+    # from its tree. A tie-breaker only: when a title names several valid
+    # subcategories, the one the tenant already files things under wins. Empty
+    # means not supplied, and the planner decides nothing on it.
+    subcategory_usage: dict[str, int] = Field(
+        default_factory=dict, alias="subcategoryUsage"
+    )
+    # The tenant's filing, one level up: how many live products sit on each
+    # `Master>Category>Sub` path. Readiness phase 1 reads it when a category is
+    # not under its master and several branches could take the subcategory —
+    # the one this tenant already files under wins, at >= 2x the runner-up.
+    branch_usage: dict[str, int] = Field(default_factory=dict, alias="branchUsage")
+    # Which sizing guide the tenant puts on each `Master>Category` branch, as
+    # `Master>Category>Guide` -> n. Breaks a tie between two charts that both
+    # fit a product's gender, side and size ("Men Uppers" vs "Men DressShirts").
+    guide_usage: dict[str, int] = Field(default_factory=dict, alias="guideUsage")
 
     def eu_for_size(self, guide: str | None, size: str | None) -> str | None:
         """The EU size this guide pairs with `size`, or None if it cannot say.
@@ -128,6 +145,20 @@ class MediaAsset(BaseModel):
     # opposite meanings for whether the asset should ever come back.
     deleted_at: str | None = None
     position: int = 0
+
+    # --- what the row knows about its own pixels (readiness phase 3) ---------
+    # The row's id, so a cut-out's `derived_from_id` can be followed to the
+    # original it was cut from — the pairing the canvas check (IMG.026) needs.
+    id: str | None = None
+    # Stored on 1% of rows today. The chain fills them from the file header
+    # before the canvas check, and the matte path stores them as it works.
+    width: int | None = None
+    height: int | None = None
+    derived_from_id: str | None = None
+    # A border measurement app/imaging/cutouts.judge writes back after looking
+    # at the file: {"transparent": fraction, "rgb": [r, g, b], "coverage":
+    # fraction, "stddev": float}. Evidence for IMG.027; never stored.
+    border: dict[str, Any] | None = None
 
     @property
     def live(self) -> bool:
@@ -240,6 +271,10 @@ class ProductSnapshot(BaseModel):
     supplier: str | None = None
 
     images: list[str] = Field(default_factory=list)
+    # A person dragged the gallery into shape (`Product.mediaManualOrder`). Their
+    # order is respected everywhere in vnyx-api and IMG.025 respects it too
+    # (readiness phase 5).
+    media_manual_order: bool = False
 
     # The typed `ProductMedia` rows behind `images` above, when the caller sent
     # them. `images` is VNYX's own denormalized cache of the same assets and stays

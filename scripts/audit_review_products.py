@@ -168,34 +168,65 @@ def select_explicit(cur, ids: list[str], limit: int | None) -> list[str]:
     return ordered[:limit] if limit else ordered
 
 
-def read_sheet_ids(path: Path) -> list[str]:
-    """Product ids from a generated sheet, in sheet order.
+_ID_HEADERS = {"product id", "productid", "product_id", "product uuid",
+               "product", "id", "uuid"}
+_UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
-    Same convention as audit_taxonomy_mismatch.py: find the header row carrying
-    "Product ID" and read down that column. Sheet order IS gap order — the
-    Products sheet is written worst-first — so `--from-sheet x.xlsx --limit 5`
-    means the five worst, which is what someone looking at the top of the sheet
-    is asking for.
+
+def read_sheet_ids(path: Path) -> list[str]:
+    """Product ids from any sheet that carries a column of them, in sheet order.
+
+    Sheet order IS gap order — an audit's Products sheet is written worst-first
+    — so `--from-sheet x.xlsx --limit 5` means the five worst, which is what
+    someone looking at the top of the sheet is asking for.
+
+    THE HEADER IS MATCHED LOOSELY, and every value is checked against the uuid
+    shape. This used to demand the exact string "Product ID"; a sheet somebody
+    exported with "Product id" (the approved-window workbook writes exactly
+    that) matched nothing and the run died with "Pass --product or
+    --from-sheet" while pointing at a perfectly good file. The uuid test is
+    what makes the loose match safe: a column that is not ids yields nothing
+    rather than nonsense. With no recognisable header at all, the column
+    holding the most uuids wins — which is what makes a hand-made list work.
     """
     import openpyxl
 
-    wb = openpyxl.load_workbook(path, read_only=True)
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
     ids: list[str] = []
-    for ws in wb.worksheets:
-        rows = list(ws.iter_rows(values_only=True))
-        header = next(
-            (i for i, r in enumerate(rows)
-             if r and any(str(c).strip() == "Product ID"
-                          for c in r if c is not None)),
-            None,
-        )
-        if header is None:
-            continue
-        col = [str(c).strip() if c is not None else "" for c in rows[header]] \
-            .index("Product ID")
-        ids += [str(r[col]).strip() for r in rows[header + 1:]
-                if r and len(r) > col and r[col]]
-    wb.close()
+    try:
+        for ws in wb.worksheets:
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            col: int | None = None
+            start = 0
+            # A header sits at the top; an audit workbook puts a title and a
+            # few summary lines above it, never twenty-five.
+            for i, row in enumerate(rows[:25]):
+                for j, cell in enumerate(row or ()):
+                    if (cell is not None
+                            and str(cell).strip().lower().replace("-", "_") in _ID_HEADERS):
+                        col, start = j, i + 1
+                        break
+                if col is not None:
+                    break
+            if col is None:
+                counts: dict[int, int] = {}
+                for row in rows:
+                    for j, cell in enumerate(row or ()):
+                        if cell and _UUID.match(str(cell).strip()):
+                            counts[j] = counts.get(j, 0) + 1
+                if not counts:
+                    continue
+                col = max(counts, key=lambda k: counts[k])
+            for row in rows[start:]:
+                if row and len(row) > col and row[col]:
+                    value = str(row[col]).strip()
+                    if _UUID.match(value):
+                        ids.append(value)
+    finally:
+        wb.close()
     return list(dict.fromkeys(ids))
 
 
