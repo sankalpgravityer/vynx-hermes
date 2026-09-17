@@ -608,6 +608,45 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
     return out
 
 
+def frame_problem(m: dict[str, Any] | None, cfg: dict[str, Any], *,
+                  derived: bool) -> tuple[str | None, bool]:
+    """A sentence when the cut-out is not the photograph's FRAMING, and whether
+    a re-cut can fix it.
+
+    THE SAME-RATIO ZOOM, which every other check is blind to. KLE-000028's
+    FRONT cut-out is 896×1195 against a 3000×4000 photograph — the identical
+    0.750 ratio, so `canvas_mismatch` passes it — and the trousers stand 1.4×
+    larger in it than in the photograph. `frame_mismatch` misses it too: the
+    segmenter cropped to the garment and `fitToCanvas` then PADDED that crop
+    back out to the source ratio, so the garment no longer touches any edge.
+    Ratio and edges both look right; only the content moved.
+
+    What catches it is `overlap`: the fraction of the cut-out's garment that
+    lands on garment in the photograph at the same coordinates. Measured over
+    six real pairs, a correct cut-out scores 0.988–1.000 and this one 0.519 —
+    the widest margin any of these checks has.
+
+    ONLY WHEN THE TWO ARE REALLY THE SAME PICTURE. With a `derivedFromId` edge
+    they are, by construction. Without one the pairing is a guess from view and
+    origin (imagery.cutout_pairs), and two different photographs of the same
+    view disagree for an honest reason — so that is a note, never a defect.
+    """
+    gc = {**(DEFAULTS.get("garment_check") or {}), **(cfg.get("garment_check") or {})}
+    if not m or m.get("aligned") is not False:
+        return None, False
+    overlap = m.get("overlap")
+    if overlap is None:
+        return None, False
+    floor = float(gc.get("min_overlap") or 0.9)
+    text = (f"framing: only {overlap:.0%} of the cut-out's garment sits where the "
+            f"photograph has garment (a correct cut-out scores over {floor:.0%}) — "
+            f"the cut-out is zoomed or shifted against the photograph it was cut from")
+    if not derived:
+        return (text + "; the original was matched by view, not by a derivation "
+                "edge, so the two may simply be different photographs"), False
+    return text + ". Re-cut it from the original on the source canvas.", True
+
+
 def hole_problem(m: dict[str, Any] | None, cfg: dict[str, Any]) -> tuple[str | None, bool]:
     """A sentence about the neckline hole, and whether a re-cut can fix it.
 
@@ -787,17 +826,28 @@ def judge(p: Any, pol: dict[str, Any] | None, *,
         check["flaws"] = []
         rdata = raws.get(raw.url) if (raw is not None and gc_on) else None
         if rdata is not None:
-            hole = garment_hole(data, rdata, cfg)
-            if hole is not None:
-                check["hole"] = hole
-                cut.border["hole"] = hole
-                why, fixable = hole_problem(hole, cfg)
+            measured_garment = garment_hole(data, rdata, cfg)
+            if measured_garment is not None:
+                check["garment"] = measured_garment
+                cut.border["garment"] = measured_garment
+                # THE FRAMING FIRST. A cut-out that is not the photograph's
+                # frame cannot be asked about its neckline: the neckline
+                # window would be measured over the wrong part of the picture.
+                derived = bool(cut.derived_from_id and raw.id
+                               and cut.derived_from_id == raw.id)
+                why, fixable = frame_problem(measured_garment, cfg, derived=derived)
                 if why and fixable:
                     check["problems"].append(why)
                 elif why:
-                    check["flaws"].append(why.replace("{view}", view))
+                    check["note"] = why
+                else:
+                    why, fixable = hole_problem(measured_garment, cfg)
+                    if why and fixable:
+                        check["problems"].append(why)
+                    elif why:
+                        check["flaws"].append(why.replace("{view}", view))
         elif raw is not None and gc_on:
-            check["hole_note"] = "photograph could not be downloaded — garment not compared"
+            check["garment_note"] = "photograph could not be downloaded — garment not compared"
 
         if check["problems"]:
             if view not in bad_views:

@@ -463,11 +463,69 @@ def test_a_real_neck_opening_and_a_whole_garment_have_nothing_to_say():
     assert cutouts.garment_hole(*neck_pair("backdrop"), CFG)["opening"] > 0.05
 
 
-def test_two_pictures_that_do_not_cover_the_same_frame_are_not_compared():
+def test_two_pictures_that_do_not_cover_the_same_frame_are_not_asked_about_a_neckline():
     m = cutouts.garment_hole(*neck_pair("form", shift=120), CFG)
     assert m["aligned"] is False and cutouts.hole_problem(m, CFG) == (None, False)
     assert cutouts.hole_problem(None, CFG) == (None, False)
     assert cutouts.garment_hole(b"not a png", b"nor this", CFG) is None
+
+
+# --------------------------------------------------------------------------- #
+# The same-ratio zoom (KLE-000028)
+# --------------------------------------------------------------------------- #
+#
+# The cut-out keeps the photograph's aspect ratio and touches no edge, so both
+# older tests pass it; the garment inside stands 1.4x larger. Measured on the
+# real pair: a correct cut-out overlaps its photograph 0.988-1.000, that one
+# 0.519.
+
+def zoomed_pair(scale: float = 1.45) -> tuple[bytes, bytes]:
+    """The same garment, cut out at `scale` and padded back to the frame's ratio."""
+    raw = Image.new("RGB", (300, 400), (180, 176, 174))
+    ImageDraw.Draw(raw).rectangle((105, 60, 195, 290), fill=(60, 60, 90))
+    cut = Image.new("RGBA", (300, 400), (255, 255, 255, 255))
+    w, h = int(90 * scale), int(230 * scale)
+    ImageDraw.Draw(cut).rectangle((150 - w // 2, 175 - h // 2, 150 + w // 2, 175 + h // 2),
+                                  fill=(60, 60, 90, 255))
+    return _png(cut), _png(raw)
+
+
+def test_a_cutout_zoomed_inside_the_right_ratio_is_named_and_re_cut():
+    m = cutouts.garment_hole(*zoomed_pair(), CFG)
+    assert m["aligned"] is False and m["overlap"] < 0.9
+    why, fixable = cutouts.frame_problem(m, CFG, derived=True)
+    assert why and "zoomed or shifted" in why and "Re-cut it" in why and fixable
+    # The ratio test and the edge test, which is why this had to be measured.
+    assert cutouts.canvas_mismatch((896, 1195), (3000, 4000), 0.02) is None
+
+
+def test_the_same_framing_says_nothing_about_framing():
+    m = cutouts.garment_hole(*zoomed_pair(scale=1.0), CFG)
+    assert m["aligned"] is True
+    assert cutouts.frame_problem(m, CFG, derived=True) == (None, False)
+    assert cutouts.frame_problem(None, CFG, derived=True) == (None, False)
+
+
+def test_a_guessed_pairing_is_a_note_never_a_defect():
+    """With no derivation edge the original was matched by view and origin, and
+    two different photographs of the same view disagree honestly."""
+    m = cutouts.garment_hole(*zoomed_pair(), CFG)
+    why, fixable = cutouts.frame_problem(m, CFG, derived=False)
+    assert why and "may simply be different photographs" in why and not fixable
+
+
+def test_judge_re_cuts_a_zoomed_cutout_and_says_which_view():
+    raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg",
+                width=3000, height=4000)
+    cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png",
+                width=896, height=1195)
+    c, r = zoomed_pair()
+    fetch, read_dims = fake_io({"https://r2/cut.png": c, "https://r2/raw.jpg": r})
+    v = cutouts.judge(snap([cut, raw]), POL, fetch=fetch, read_dims=read_dims)
+    assert v.action == "bad" and v.bad_views == ["FRONT"] and v.unfixable_views == []
+    assert any("framing:" in reason for reason in v.reasons)
+    # And the rules report the same thing from the measurement left on the row.
+    assert "IMG.026" in ids(snap([cut, raw]))
 
 
 def test_judge_reports_the_forms_neck_as_a_flaw_no_re_cut_fixes_and_the_lost_collar_as_a_re_cut():
@@ -486,7 +544,7 @@ def test_judge_reports_the_forms_neck_as_a_flaw_no_re_cut_fixes_and_the_lost_col
     assert v.unfixable_reasons == [r for r in v.reasons if r.startswith("FRONT: neckline")]
     assert "use the flat-lay cut-out as the FRONT" in v.unfixable_reasons[0]
     assert any(r.startswith("BACK: neckline") and "cut away" in r for r in v.reasons)
-    assert cut.border["hole"]["residue"] > 0.05          # the measurement rides on the row
+    assert cut.border["garment"]["residue"] > 0.05       # the measurement rides on the row
 
 
 def test_judge_names_the_zoomed_view_and_writes_the_evidence_back():

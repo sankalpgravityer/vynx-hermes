@@ -726,6 +726,16 @@ def check_imagery(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
                 why = cutout_checks.frame_mismatch(cut.border, cut_cfg)
                 if why:
                     frame_problems.append(why)
+                # The same-ratio zoom, from the measurement `cutouts.judge`
+                # attached after comparing the cut-out with its photograph.
+                # Neither test above can see it: the ratio matches and the
+                # padded crop touches no edge (see cutouts.frame_problem).
+                why, fixable = cutout_checks.frame_problem(
+                    cut.border.get("garment"), cut_cfg,
+                    derived=bool(cut.derived_from_id and raw is not None
+                                 and raw.id and cut.derived_from_id == raw.id))
+                if why and fixable:
+                    frame_problems.append(why)
             if frame_problems:
                 out.append(Finding(
                     rule_id="IMG.026", severity=hold_sev, fields=["images"],
