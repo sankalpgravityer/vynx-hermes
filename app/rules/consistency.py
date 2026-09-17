@@ -117,6 +117,11 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
     # more than one gender (unisex stock legitimately sits under either), OR the
     # master category is itself Unisex.
     if p.gender and p.master_category:
+        # Imported here: readiness imports rules/gate, which the rules package
+        # initialiser reaches through this module — a module-level import would
+        # be a cycle at startup.
+        from app.readiness import is_genderless_root, root_gender
+
         genders = {
             g.strip().lower() for g in str(p.gender).split(",") if g.strip()
         }
@@ -126,6 +131,11 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
             or len(genders) > 1
             or master == "unisex"
             or "unisex" in genders
+            # A root that implies no gender (Unisex, Kids — see
+            # readiness.master.genderless_roots) legitimately holds either. 98
+            # approved Kids products carried a gender the old test called a
+            # contradiction.
+            or is_genderless_root(p.master_category, pol)
         )
         if not agrees:
             out.append(Finding(
@@ -133,7 +143,10 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
                 fields=["gender", "master_category"],
                 message=f"Gender '{p.gender}' disagrees with master category "
                         f"'{p.master_category}'.",
-                detail={"gender": sorted(genders), "master_category": master},
+                detail={"gender": sorted(genders), "master_category": master,
+                        # The master is the anchor (readiness phase 1): what the
+                        # property should become. The planner writes it.
+                        "gender_should_be": root_gender(p.master_category, pol)},
                 needs_evidence=True,
             ))
 
@@ -160,27 +173,51 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
     # so it works on any tenant's tree.
     mannequin_flagged = False
     if p.mannequin and p.master_category and p.category:
+        from app.readiness import derive_rig
+
         key = f"{p.master_category}|{p.category}"
         allowed = pol["mannequin_map"].get(key)
         if allowed and p.mannequin.strip() not in allowed:
             mannequin_flagged = True
+            # The derived rig, if the map admits it; otherwise nothing to
+            # suggest and the planner escalates.
+            derived = derive_rig(p.master_category, p.gender, p.category,
+                                 p.subcategory, pol)
             out.append(Finding(
                 rule_id="TAX.005", severity=Severity.HIGH, fields=["mannequin"],
                 message=f"Mannequin '{p.mannequin}' is wrong for {key.replace('|', ' > ')}; "
                         f"expected one of {allowed}.",
-                detail={"allowed": allowed, "basis": "policy_map"},
+                detail={"allowed": allowed, "basis": "policy_map",
+                        "mannequin": p.mannequin,
+                        "suggested": derived if derived in allowed else None},
             ))
 
     if p.mannequin and not mannequin_flagged:
         # Imported here rather than at module scope: gate.py is the approval-only
         # rule set and importing it eagerly from the shared registry would invert
         # the dependency the note at the top of that file describes.
+        from app.readiness import derive_rig, is_genderless_root, root_gender
         from app.rules.gate import _side_of, resolve_gender
 
         want_side = _side_of(p.subcategory, pol) or _side_of(p.category, pol)
         have_side = _side_of(p.mannequin, pol)
         rig_gender = resolve_gender(p.mannequin)
-        master_gender = resolve_gender(p.master_category)
+        # THE MASTER CATEGORY IS THE ANCHOR (readiness phase 1, decision 6).
+        #
+        # Men/Women imply a gender; a genderless root (Unisex, Kids) leaves it
+        # to the gender property. The rig's own gender is what is being judged
+        # and is never the reference.
+        #
+        # This reverses the WP1-era rule, which made the rig the anchor and
+        # rewrote masterCategory and the gender property to match it. The
+        # requirement is explicit that the mannequin is never an input, and the
+        # local clone shows why: the rig disagrees with the master on hundreds
+        # of approved products (`Women Top` on 52 men's products, `WomenTop` on
+        # 119 unisex ones), so anchoring on it moved the wrong three fields.
+        master_gender = root_gender(p.master_category, pol) or (
+            resolve_gender(p.gender)
+            if is_genderless_root(p.master_category, pol) else None
+        )
 
         problems: list[str] = []
         if rig_gender and master_gender and rig_gender != master_gender:
@@ -192,83 +229,48 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
                 f"'{p.subcategory or p.category}' is a {want_side}")
 
         if problems:
-            # THE RIG IS THE ANCHOR FOR GENDER. The side still comes from the
-            # garment.
-            #
-            # This used to be `gender = master_category or rig_gender`, so a
-            # Women Top rig on a product the extractor had filed under Men was
-            # "fixed" by rewriting the RIG to Men Top. That is backwards on the
-            # evidence:
-            #
-            #   the rig     an operator physically selected it in the booth and
-            #               photographed the garment on it. A human action about
-            #               the item in their hands.
-            #   masterCategory
-            #               the extraction model's choice of category BRANCH,
-            #               made from photographs. For a genuinely unisex
-            #               garment the prompt even instructs it to treat the
-            #               item as the Men branch while reporting gender
-            #               "Unisex" — so Men here is frequently an artefact of
-            #               that instruction rather than a judgement.
-            #
-            # Preferring the branch over the rig produced exactly one coherent
-            # field and three incoherent ones: CBOA-006175 ended up a Men Top
-            # rig, gender women, masterCategory Men, a Women Uppers size chart
-            # and female renders — and it APPROVED, because rewriting the rig is
-            # what made TAX.005 pass. Four fields describing two different
-            # garments, published.
-            #
-            # So the rig decides the gender, and masterCategory and the gender
-            # property are brought to it. The side is a separate question — top
-            # vs bottom is about the garment type, so it still comes from the
-            # subcategory.
-            side = want_side or have_side
-            gender = rig_gender or master_gender
-            suggested = None
-            if side and gender:
-                suggested = f"{gender.capitalize()} " + (
-                    "Top" if side == "upper" else "Bottom")
-
-            # WHAT THE OTHER TWO FIELDS SHOULD BECOME, and whether the tenant's
-            # own taxonomy can actually hold it.
-            #
-            # Checked against `catalog.categories`, never assumed: a men's
-            # category path is not guaranteed to exist under Women. If it does
-            # not, the switch is NOT planned — a product with a valid path and a
-            # wrong master category is recoverable, one pointing at a branch
-            # that does not exist is not, and the finding still reports the
-            # disagreement for a human.
-            master_should_be = None
-            taxonomy_ok = False
-            if rig_gender and master_gender and rig_gender != master_gender:
-                candidate = rig_gender.capitalize()
-                subs = (p.catalog.categories.get(candidate) or {}).get(
-                    p.category or ""
-                )
-                taxonomy_ok = bool(subs) and (
-                    p.subcategory is None or p.subcategory in subs
-                )
-                if taxonomy_ok:
-                    master_should_be = candidate
-
+            # The rig the master and the garment's side call for, in the
+            # vocabulary the edit screen offers (readiness.derive_rig).
+            suggested = derive_rig(p.master_category, p.gender, p.category,
+                                   p.subcategory, pol)
             out.append(Finding(
                 rule_id="TAX.005", severity=Severity.HIGH, fields=["mannequin"],
                 message=(f"Mannequin '{p.mannequin}' and "
                          f"{p.master_category} > {p.category} disagree: "
-                         + "; ".join(problems) + "."
-                         + (f" The rig is the anchor, so master category "
-                            f"becomes '{master_should_be}'."
-                            if master_should_be else "")
-                         + (f" '{suggested}' is the matching rig."
-                            if suggested and suggested != p.mannequin else "")),
+                         + "; ".join(problems) + ". The master category is the "
+                         "anchor"
+                         + (f"; '{suggested}' is the matching rig."
+                            if suggested and suggested != p.mannequin else ".")),
                 detail={"mannequin": p.mannequin, "suggested": suggested,
                         "product_side": want_side, "rig_side": have_side,
                         "product_gender": master_gender, "rig_gender": rig_gender,
-                        "master_category_should_be": master_should_be,
-                        "gender_should_be": rig_gender if master_should_be else None,
-                        "taxonomy_supports_switch": taxonomy_ok,
+                        "anchor": "master_category",
                         "basis": "derived"},
             ))
+
+    # TAX.007 — no mannequin rig at all (readiness phase 1).
+    #
+    # approve-products.ts refuses these with "no mannequin selected", so the
+    # product was held by the pre-flight with nothing planned. The rig is
+    # arithmetic over the master category and the garment's side — the same
+    # derivation vnyx-api's inferMannequinType performs — so it is derived and
+    # written rather than waited for. Silent when nothing can be derived, and
+    # when readiness is switched off.
+    if not p.mannequin:
+        from app.readiness import derive_rig, enabled as readiness_enabled
+
+        if readiness_enabled(pol):
+            derived = derive_rig(p.master_category, p.gender, p.category,
+                                 p.subcategory, pol)
+            if derived:
+                out.append(Finding(
+                    rule_id="TAX.007", severity=Severity.HIGH, fields=["mannequin"],
+                    message=(f"No mannequin rig selected; '{derived}' follows from "
+                             f"{p.master_category or 'the category'} > "
+                             f"{p.subcategory or p.category or '?'}."),
+                    detail={"suggested": derived, "mannequin": None,
+                            "basis": "derived"},
+                ))
 
     # TAX.006 — the sizing guide must be one the tenant actually configured.
     #
@@ -653,6 +655,43 @@ def check_copy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
             detail={},
         ))
 
+    # TEXT.008 — the title CONTRADICTS the record (readiness phase 5).
+    #
+    # TEXT.002 asks whether the title mentions the record; this asks whether it
+    # says something ELSE. Two tokens can: the letter size the template puts
+    # last ("… Men XL" on a size M), and the garment word ("Hoodie" in the
+    # title of a product filed under T-Shirts). Either means the title was
+    # written before the cascade settled the record, and is the trigger for
+    # the chain's `copy` step. Only a contradiction fires: a missing token is
+    # TEXT.002, a numeric size is TEXT.003, and families the model routinely
+    # conflates (tops / outerwear) are not one.
+    tokens = title.split()
+    title_size = _LETTER_SIZES.get(_alnum(tokens[-1])) if tokens else None
+    record_size = _LETTER_SIZES.get(_alnum(str(p.size or "").lower()))
+    if title_size and record_size and title_size != record_size:
+        out.append(Finding(
+            rule_id="TEXT.008", severity=Severity.MEDIUM, fields=["title", "size"],
+            message=(f"Title ends in size '{tokens[-1].upper()}' but the size field "
+                     f"says '{p.size}'."),
+            detail={"title_size": title_size, "record_size": record_size},
+        ))
+    filed_under = p.subcategory or p.category
+    if filed_under and not _is_placeholder(filed_under, pol):
+        from app.imaging.quality_gate import garment_family
+
+        fam_title = garment_family(title, pol)
+        fam_record = garment_family(filed_under, pol)
+        if (fam_title and fam_record and fam_title != fam_record
+                and not _adjacent_families(fam_title, fam_record, pol)):
+            out.append(Finding(
+                rule_id="TEXT.008", severity=Severity.MEDIUM,
+                fields=["title", "subcategory"],
+                message=(f"Title reads as {fam_title} but the product is filed under "
+                         f"'{filed_under}' ({fam_record})."),
+                detail={"title_family": fam_title, "record_family": fam_record,
+                        "filed_under": filed_under},
+            ))
+
     if not (p.description or "").strip():
         out.append(Finding(
             rule_id="TEXT.004", severity=Severity.MEDIUM, fields=["description"],
@@ -679,6 +718,18 @@ def check_copy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
 _MEN_WORDS = {"men", "men's", "mens", "man", "man's", "male", "gents"}
 _WOMEN_WORDS = {"women", "women's", "womens", "woman", "woman's", "female",
                 "ladies", "ladies'"}
+
+# Letter sizes onto one scale, so "2XL" and "XXL" compare equal (TEXT.008).
+_LETTER_SIZES: dict[str, str] = {
+    "xxxs": "xs", "xxs": "xs", "xs": "xs", "s": "s", "m": "m", "l": "l",
+    "xl": "xl", "xxl": "xxl", "2xl": "xxl", "xxxl": "xxl", "3xl": "xxl", "4xl": "xxl",
+}
+
+
+def _adjacent_families(a: str, b: str, pol: dict[str, Any]) -> bool:
+    """Families the model routinely conflates (policy `garment_families.adjacent`)."""
+    pairs = (pol.get("garment_families") or {}).get("adjacent") or []
+    return any({a, b} == {str(x) for x in pair} for pair in pairs if len(pair) == 2)
 
 
 def _gender_side(value: Any) -> str | None:

@@ -39,7 +39,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 log = logging.getLogger("hermes.quality-gate")
 
@@ -60,6 +60,13 @@ SCHEMA: dict[str, Any] = {
         "gender": {"type": "string", "enum": ["Men", "Women", "Unknown"],
                    "description": "How the model presents. Unknown if no model "
                                   "or androgynous."},
+        "model_build": {
+            "type": "string", "enum": ["slim", "average", "plus", "unknown"],
+            "description": "The model's body build as visibly shown: slim (lean or "
+                           "petite frame), average (standard frame), plus (full-"
+                           "figured or plus-size). unknown if no model is present or "
+                           "the build cannot be told.",
+        },
         "lead_ok": {
             "type": "boolean",
             "description": "A usable primary image. false ONLY for a tag or label "
@@ -78,6 +85,18 @@ SCHEMA: dict[str, Any] = {
         "body_issue": {"type": "string",
                        "description": "At most six words naming the break, else "
                                       "empty."},
+        "framing": {
+            "type": "string",
+            "enum": ["full_body", "cropped_legs", "upper_body", "head_and_shoulders",
+                     "close_up", "unknown"],
+            "description": "How much of the model the frame holds. full_body: the "
+                           "model is shown from head to feet, shoes or feet visible "
+                           "at the bottom edge. cropped_legs: the frame cuts the legs "
+                           "anywhere above the ankles (knees, thighs). upper_body: the "
+                           "frame ends around the waist or hips. head_and_shoulders: a "
+                           "portrait crop. close_up: a garment detail with no figure. "
+                           "unknown: no model.",
+        },
         "view": {"type": "string", "enum": ["front", "back"],
                  "description": "front unless the model clearly faces away."},
         "garment": {
@@ -88,8 +107,8 @@ SCHEMA: dict[str, Any] = {
         },
         "confidence": {"type": "number", "description": "0.0 to 1.0."},
     },
-    "required": ["model_present", "face_ok", "gender", "lead_ok",
-                 "body_coherent", "body_issue", "view", "garment", "confidence"],
+    "required": ["model_present", "face_ok", "gender", "model_build", "lead_ok",
+                 "body_coherent", "body_issue", "framing", "view", "garment", "confidence"],
 }
 
 SYSTEM = (
@@ -110,7 +129,18 @@ _DEFAULTS: dict[str, Any] = {
     "required": True,
     "lead_views": ["AI_FRONT", "AI_FRONT_34"],
     "block_on": ["no_model", "bad_face", "broken_body", "gender_mismatch",
-                 "category_mismatch"],
+                 "category_mismatch", "body_size_mismatch", "cropped_model",
+                 "bad_composition"],
+    # The views that must show the WHOLE model, head to feet. A model cut at
+    # the knees on one of these is a framing defect (MODEL_CROPPED) and the
+    # view is re-rendered. NOT the three-quarter views: nanobanana.py asks for
+    # them as "three-quarter-length (knee-up) — feet cropped out of frame, NOT
+    # a full-body shot", so a knee crop there is the design (MID-000247's lead
+    # is its AI_FRONT_34, knee-up by intent, while its AI_FRONT is full body).
+    # The close-up is a detail; footwear and accessories are framed
+    # differently on purpose and are exempt whatever the view.
+    "full_body_views": ["AI_FRONT", "AI_BACK"],
+    "framing_min_confidence": 0.7,
     "accessory_terms": [
         "cap", "caps", "beanie", "beanies", "hat", "hats", "gloves", "belt",
         "belts", "scarf", "scarves", "bag", "bags", "backpack", "backpacks",
@@ -123,11 +153,25 @@ _DEFAULTS: dict[str, Any] = {
 @dataclass
 class GateVerdict:
     action: str                          # ok | regen | review | skipped
-    code: str | None = None              # IMAGE_QUALITY | MODEL_GENDER_MISMATCH | VISION_UNAVAILABLE
+    code: str | None = None              # IMAGE_QUALITY | MODEL_GENDER_MISMATCH | BODY_SIZE_MISMATCH | VISION_UNAVAILABLE
     reasons: list[str] = field(default_factory=list)
     soft: list[str] = field(default_factory=list)
     gender_seen: str | None = None       # men | women | None
     view_seen: str | None = None
+    # The model's build as the picture shows it, and the band the garment's
+    # size calls for (readiness phase 4). None when not judged.
+    build_seen: str | None = None        # slim | average | plus | None
+    build_expected: str | None = None
+    # How much of the model the frame holds, as the picture shows it.
+    framing_seen: str | None = None      # full_body | cropped_legs | upper_body | … | None
+    # The renders whose FIGURE does not fill the frame (app/imaging/composition):
+    # a pixel test over every view, not only the lead. These are re-rendered
+    # one by one; `composition` carries the measurements.
+    bad_views: list[str] = field(default_factory=list)
+    composition: dict[str, Any] | None = None
+    # The CUT-OUTS the photo audit calls defective — a collar the mask ate, a
+    # stand left in — re-cut by the chain's rematte step. Photo audit only.
+    bad_cutouts: list[str] = field(default_factory=list)
     lead_url: str | None = None
     lead_view: str | None = None
     unavailable: bool = False            # the gate could not run; retry, do not judge
@@ -246,19 +290,166 @@ def _adjacent(a: str, b: str, pol: dict[str, Any] | None) -> bool:
     return any({a, b} == {str(x) for x in pair} for pair in pairs if len(pair) == 2)
 
 
+# --------------------------------------------------------------------------- #
+# The model's build against the garment's size — readiness phase 4
+# --------------------------------------------------------------------------- #
+#
+# The requirement is plain: an XL garment cannot be shown on a small model.
+# Phase 2 made every generation path ask for the size-matched build; this is
+# the check that the picture actually came back with it. The gate's one call
+# gains one field — `model_build` — and `decide()` compares the band the
+# picture shows with the band the size implies. Two bands apart (slim on an XL,
+# plus on an XS) is a wrong render and regenerates the set with the right
+# build; one band apart is a soft flag, because "average" against "plus" is a
+# judgement no two people make the same way. Unknown size, Kids, footwear and
+# accessories are never judged: there is no build to expect.
+
+_BUILD_ORDER = ["slim", "average", "plus"]
+
+# Letter sizes onto the six-build scale the prompt knows; wider labels collapse
+# onto the ends. Mirrors LETTER_TO_BODY_TYPE in vnyx-api services/body-type.ts.
+_LETTER_ALIASES: dict[str, str] = {
+    "xxxs": "xs", "xxs": "xs", "xs": "xs", "s": "s", "m": "m", "l": "l",
+    "xl": "xl", "xxl": "xxl", "2xl": "xxl", "xxxl": "xxl", "3xl": "xxl", "4xl": "xxl",
+}
+
+_WAIST_RE = re.compile(r"^w?\s*(\d{2})(?:\.\d+)?(?:\s*[/x]\s*\d{2})?$", re.IGNORECASE)
+
+
+def body_size_config(pol: dict[str, Any] | None) -> dict[str, Any]:
+    """`readiness.body_size` with its defaults (app/readiness.py owns them)."""
+    from app import readiness
+
+    return dict(readiness.config(pol).get("body_size") or {})
+
+
+def size_band(size: Any, *, gender: str | None = None, bottoms: bool = False,
+              pol: dict[str, Any] | None = None) -> str | None:
+    """'slim' | 'average' | 'plus' for a garment size, or None when nothing follows.
+
+    A letter size maps through `readiness.body_size.bands`. A waist in inches
+    maps through the per-gender waist table — bottoms only, and only with a
+    gender, because W32 is a medium man and a plus-size woman. Anything else
+    (a bare EU/US number, `Unknown`, empty) is None: the tenant default was
+    used to render it and there is nothing to hold it against.
+    """
+    cfg = body_size_config(pol)
+    bands = {str(k).lower(): str(v).lower() for k, v in (cfg.get("bands") or {}).items()}
+    text = str(size or "").strip().lower()
+    if not text or text == "unknown":
+        return None
+    letter = _LETTER_ALIASES.get(text.replace(" ", "").replace("-", ""))
+    if letter:
+        band = bands.get(letter)
+        return band if band in _BUILD_ORDER else None
+    if bottoms and gender in ("men", "women"):
+        m = _WAIST_RE.match(text)
+        if m:
+            inches = int(m.group(1))
+            table = (cfg.get("waist_bands") or {}).get(gender) or {}
+            for letter, span in table.items():
+                try:
+                    lo, hi = int(span[0]), int(span[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if lo <= inches <= hi:
+                    band = bands.get(str(letter).lower())
+                    return band if band in _BUILD_ORDER else None
+    return None
+
+
+def _build_word(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    return text if text in _BUILD_ORDER else None
+
+
+def regen_views(verdict: GateVerdict, pol: dict[str, Any] | None) -> list[str]:
+    """Which views a refusal should re-render.
+
+    Gender and build are properties of the MODEL, and one model carries the
+    whole set — regenerating one view would put a different person in it. So
+    those two re-render every view. A defect on the lead (no model, a broken
+    face or body) is a property of that picture, and only it is redone. A
+    `review` verdict — the gate could not decide, or the category disagrees
+    with the picture — regenerates nothing: a person decides.
+    """
+    if verdict.action != "regen":
+        return []
+    all_views = list(((pol or {}).get("imagery") or {}).get("all_views")
+                     or ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK", "AI_CLOSEUP"])
+    if verdict.code in ("MODEL_GENDER_MISMATCH", "BODY_SIZE_MISMATCH"):
+        return all_views
+    # A defect of one picture: the lead the vision gate refused, and every view
+    # whose figure does not fill its frame — each re-rendered on its own. The
+    # two codes that name OTHER views (the frame test; the photo audit's render
+    # defect, whose `lead` is a cut-out) never drag the lead in with them.
+    wanted = set(verdict.bad_views)
+    if verdict.lead_view and verdict.code not in ("IMAGE_COMPOSITION", "RENDER_DEFECT"):
+        wanted.add(verdict.lead_view)
+    return [v for v in all_views if v in wanted] + sorted(v for v in wanted if v not in all_views)
+
+
+def with_composition(verdict: GateVerdict, comp: Any, pol: dict[str, Any] | None) -> GateVerdict:
+    """Fold the frame test's findings into the vision verdict.
+
+    A set refusal (gender, build) already re-renders every view and stands as
+    it is. Otherwise a view whose figure does not fill the frame is a defect
+    of that picture: it joins the refusal — or becomes one, `IMAGE_COMPOSITION`
+    — and `regen_views` re-renders it. Behind `bad_composition` in block_on;
+    off, it is a soft flag. A frame test that could not download anything says
+    so softly and never holds: the vision gate has its own unavailability.
+    """
+    if comp is None:
+        return verdict
+    verdict.composition = comp.as_dict()
+    if getattr(comp, "unavailable", False):
+        verdict.soft.append("frame test: no render could be downloaded")
+        return verdict
+    bad = list(comp.bad_views)
+    if not bad:
+        return verdict
+    if "bad_composition" not in set(config(pol)["block_on"]):
+        verdict.soft.extend(f"frame: {r}" for r in comp.reasons)
+        return verdict
+    if verdict.code in ("MODEL_GENDER_MISMATCH", "BODY_SIZE_MISMATCH"):
+        return verdict
+    verdict.bad_views = bad
+    if verdict.action == "regen":
+        verdict.reasons.extend(f"FRAME — {r}" for r in comp.reasons)
+    else:
+        verdict.action, verdict.code = "regen", "IMAGE_COMPOSITION"
+        verdict.reasons = [f"FRAME — {r}" for r in comp.reasons]
+    return verdict
+
+
+_CROPPED = {
+    "cropped_legs": "the legs are cut by the frame",
+    "upper_body": "the frame ends at the waist",
+    "head_and_shoulders": "only the head and shoulders are in frame",
+    "close_up": "it is a close-up, not a figure",
+}
+
+
 def decide(raw: dict[str, Any], *, product_gender: str | None,
            accessory: bool, pol: dict[str, Any] | None,
-           category: Any = None, subcategory: Any = None) -> GateVerdict:
+           category: Any = None, subcategory: Any = None,
+           product_build: str | None = None, product_size: Any = None,
+           expect_full_body: bool = False) -> GateVerdict:
     """The pure decision, separated from the call so it can be tested cold.
 
     Order matters and follows the auditor's: NO MODEL first (nothing else can
     be judged without one), then the gender the picture shows against the
-    gender the record claims, then face, then body — the render defects —
-    then the one DATA question the picture can answer: is this the kind of
-    garment the category says? Soft flags never block.
+    gender the record claims, then the build against the size (readiness
+    phase 4), then face, then body — the render defects — then the framing
+    (a model cut at the knees on a view that must show the whole figure), then
+    the one DATA question the picture can answer: is this the kind of garment
+    the category says? Soft flags never block.
     """
-    block_on = set(config(pol)["block_on"])
+    cfg = config(pol)
+    block_on = set(cfg["block_on"])
     seen = _gender_word(raw.get("gender"))
+    build_seen = _build_word(raw.get("model_build"))
+    framing = str(raw.get("framing") or "").strip().lower() or None
     soft: list[str] = []
     try:
         confidence: float | None = float(raw.get("confidence"))
@@ -268,6 +459,8 @@ def decide(raw: dict[str, Any], *, product_gender: str | None,
 
     def verdict(action: str, code: str | None, reasons: list[str]) -> GateVerdict:
         return GateVerdict(action, code, reasons, soft, seen, view,
+                           build_seen=build_seen, build_expected=product_build,
+                           framing_seen=framing,
                            confidence=confidence, raw=raw)
 
     if raw.get("model_present") is False:
@@ -285,6 +478,25 @@ def decide(raw: dict[str, Any], *, product_gender: str | None,
                        [f"the model presents as {seen} but the product is listed "
                         f"as {product_gender}"])
 
+    # THE BUILD AGAINST THE SIZE (readiness phase 4). Before the face and body
+    # defects for the same reason the gender is: a wrong build re-renders the
+    # whole set and fixes a bad face with it, so the code should name the fix.
+    body_cfg = body_size_config(pol)
+    if (product_build and build_seen and body_cfg.get("enabled", True)
+            and raw.get("model_present") is not False):
+        gap = abs(_BUILD_ORDER.index(build_seen) - _BUILD_ORDER.index(product_build))
+        sure = confidence is None or confidence >= float(body_cfg.get("min_confidence") or 0.7)
+        size_text = f"size {product_size}" if product_size else "its size"
+        if (gap >= int(body_cfg.get("block_on_band_gap") or 2) and sure
+                and "body_size_mismatch" in block_on):
+            return verdict("regen", "BODY_SIZE_MISMATCH",
+                           [f"the model's build reads as {build_seen} but the garment is "
+                            f"{size_text} ({product_build})"])
+        if gap >= 1:
+            soft.append(f"build one band off — model {build_seen}, garment "
+                        f"{size_text} ({product_build})"
+                        + ("" if sure else f", confidence {confidence:.2f}"))
+
     if raw.get("face_ok") is False and "bad_face" in block_on:
         return verdict("regen", "IMAGE_QUALITY",
                        ["BAD FACE — the model's face is AI-corrupted"])
@@ -293,6 +505,21 @@ def decide(raw: dict[str, Any], *, product_gender: str | None,
         issue = str(raw.get("body_issue") or "").strip()[:60]
         return verdict("regen", "IMAGE_QUALITY",
                        [f"BROKEN BODY — {issue or 'the body is anatomically broken'}"])
+
+    # THE FRAMING. A model cleanly cut at the knees is anatomically coherent,
+    # so nothing above catches it — and on a view that is meant to show the
+    # whole figure it is a defect a shopper sees at once (MID-000247: the lead
+    # render ends mid-thigh). Only where a full body is expected: the close-up
+    # is a detail by design, footwear is framed knee-to-floor, accessories
+    # head-and-shoulders — the caller says which, this only judges.
+    if (expect_full_body and framing in _CROPPED and raw.get("model_present") is not False):
+        sure = confidence is None or confidence >= float(cfg.get("framing_min_confidence") or 0.7)
+        where = _CROPPED[framing]
+        if sure and "cropped_model" in block_on:
+            return verdict("regen", "MODEL_CROPPED",
+                           [f"CROPPED — {where}; this view must show the model head to feet"])
+        soft.append(f"framing {framing} — {where}"
+                    + ("" if sure else f", confidence {confidence:.2f}"))
 
     # CATEGORY vs PICTURE (the auditor's CATEGORY_IMAGE_MISMATCH). Not a render
     # defect — the render may be perfect — so it is `review`, not `regen`: a
@@ -325,16 +552,30 @@ def decide(raw: dict[str, Any], *, product_gender: str | None,
 def judge(media: list[dict[str, Any]], *, gender: Any,
           category: Any = None, subcategory: Any = None,
           pol: dict[str, Any] | None = None,
-          evidence: Any = None, api_key: str | None = None) -> GateVerdict:
-    """Judge the product's lead render. Never raises.
+          evidence: Any = None, api_key: str | None = None,
+          size: Any = None, kids: bool = False,
+          frames: Callable[..., dict[str, bytes | None]] | None = None) -> GateVerdict:
+    """Judge the product's lead render — and the frame of every render. Never raises.
 
     `gender` is whatever the record holds — a string, a list, a JSON string —
     and is resolved through the same function the rules use, so the gate cannot
     disagree with GENDER.001 about what the record says.
+
+    `size` is the garment's final size (readiness phase 4): it becomes the
+    build the model should have, unless the product is Kids, footwear or an
+    accessory, or the size implies no build. `kids` says the master category
+    is a Kids root — a child model has no adult build to be held against.
+
+    `frames` fetches the renders for the frame test (app/imaging/composition);
+    None means the network. When a vision double is injected (`evidence`) and
+    no fetcher is, the frame test is skipped — a test owns its I/O.
     """
     cfg = config(pol)
     if not cfg["enabled"]:
         return GateVerdict("skipped", reasons=["disabled in policy (quality_gate.enabled)"])
+    # Remembered NOW: on a cache miss the real provider is assigned to the same
+    # name below, and the frame test must not mistake it for a test double.
+    injected = evidence is not None
 
     lead = pick_lead(media, pol)
     if lead is None:
@@ -395,11 +636,50 @@ def judge(media: list[dict[str, Any]], *, gender: Any,
         # returns above are the failures the cache must never serve.
         cache.put(ckey, raw, pol)
 
-    from app.rules.gate import resolve_gender
+    from app.rules.gate import _side_of, resolve_gender
+    from app.rules.imagery import is_footwear
 
-    verdict = decide(raw, product_gender=resolve_gender(gender),
-                     accessory=is_accessory(subcategory, category, pol=pol), pol=pol,
-                     category=category, subcategory=subcategory)
+    product_gender = resolve_gender(gender)
+    accessory = is_accessory(subcategory, category, pol=pol)
+    # The build the size calls for — or None, and then nothing is expected.
+    product_build: str | None = None
+    if not kids and not accessory and not is_footwear(str(category or ""), str(subcategory or "")):
+        # (footwear is tested again below for the framing; cheap, and keeps the
+        # two exemptions readable on their own.)
+        bottoms = (_side_of(str(subcategory or ""), pol or {})
+                   or _side_of(str(category or ""), pol or {})) == "bottom"
+        product_build = size_band(size, gender=product_gender, bottoms=bottoms, pol=pol)
+
+    # KIDS: a child model, and the model's "Men / Women" reading of a child is
+    # not a fact to hold a product on (a girl in a boys' hoodie read as
+    # "women" on the phase 4 shadow). Decision 4 says Kids are never held for
+    # being Kids, so the gender is recorded as a flag rather than judged; the
+    # render defects (no model, face, body) still apply.
+    judged_gender = None if kids else product_gender
+    # A full figure is expected on the four body views, for garments worn on
+    # the body. Footwear renders knee-to-floor and accessories head-and-
+    # shoulders on purpose (nanobanana.py framing); the close-up is a detail.
+    footwear = is_footwear(str(category or ""), str(subcategory or ""))
+    expect_full_body = (lead_view in set(cfg.get("full_body_views") or [])
+                        and not accessory and not footwear)
+    verdict = decide(raw, product_gender=judged_gender,
+                     accessory=accessory, pol=pol,
+                     category=category, subcategory=subcategory,
+                     product_build=product_build, product_size=size,
+                     expect_full_body=expect_full_body)
+    if kids and product_gender and verdict.gender_seen and verdict.gender_seen != product_gender:
+        verdict.soft.append(f"Kids — model reads as {verdict.gender_seen}, record says "
+                            f"{product_gender}; not judged on a child")
     verdict.lead_url, verdict.lead_view = lead_url, lead_view
     verdict.cached = hit
+
+    # THE FRAME OF EVERY RENDER, from the pixels. The vision call above looks
+    # at one picture; MID-000247's defect was on the view it never looks at.
+    # Runs on the real path always (cache hit or miss) and for a test double
+    # only when the test hands over a fetcher.
+    if frames is not None or not injected:
+        from app.imaging import composition
+
+        if composition.config(pol).get("enabled", True):
+            verdict = with_composition(verdict, composition.check(media, pol, fetch=frames), pol)
     return verdict

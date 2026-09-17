@@ -73,6 +73,20 @@ def test_a_value_the_twin_already_holds_is_never_overwritten():
     assert {a["field"]: a["value"] for a in plan} == {"color": "Blue"}
 
 
+def test_a_size_held_in_properties_under_a_placeholder_column_is_not_blank():
+    """CBOA-006107, 15 Sep 2026: `properties.international_size` said 'L' while
+    the `internationalSize` column said 'Unknown'. That is DRIFT.001's repair;
+    the twin step must not write the parent's size over the twin's own."""
+    twin = _record(sku="CBOA-1", size="L", internationalSize="Unknown")
+    parent = _record(size="M", internationalSize="M", color="Blue")
+    plan = twins.inheritance_plan(twin, parent, POL)
+    assert {a["field"]: a["value"] for a in plan} == {"color": "Blue"}
+    # and a parent that holds the size only in its column still contributes it
+    twin = _record(sku="CBOA-1", size=None, internationalSize=None)
+    parent = _record(size=None, internationalSize="M")
+    assert {a["field"]: a["value"] for a in twins.inheritance_plan(twin, parent, POL)} == {"size": "M"}
+
+
 def test_a_parent_blank_or_placeholder_contributes_nothing():
     twin = _record(sku="CBOA-1")
     parent = _record(brand="Unknown", internationalSize="", color="n/a")

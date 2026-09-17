@@ -308,6 +308,37 @@ def _has_care_label(product_id: str) -> bool:
     return bool(r and r["n"])
 
 
+def unfixable_rejection(result: dict[str, Any], verdict: Verdict,
+                        unavailable: list[str], *, apply: bool,
+                        pol: dict[str, Any] | None = None) -> tuple[str, str] | None:
+    """(code, reason) when this product should be REJECTED for a defect no
+    re-run can clear — readiness phase 4, decision 8 — else None.
+
+    Pure, so the guards are testable cold. The chain names the defect
+    (`result["unfixable"]`: NO_GARMENT_PHOTO, RENDER_REFUSED); this decides
+    whether the agent acts on it, and it acts only when
+
+      * the repairs were allowed to write — a shadow pass archives nothing;
+      * `readiness.unfixable` is `reject` (the default), not `hold`;
+      * the product is HELD — a VERIFIED product is approvable and is never
+        archived over a picture the pre-flight was content with; a FAILED one
+        already has its terminal verdict;
+      * no vision provider was down during the run — a refusal decided while
+        the judge was absent has not had its chance (the outage guard).
+    """
+    from app import readiness
+    from app.config import policy
+
+    unfix = result.get("unfixable") or {}
+    code = str(unfix.get("code") or "").strip()
+    if not (apply and code) or verdict.status != "HELD_FOR_HUMAN" or unavailable:
+        return None
+    if str(readiness.config(pol if pol is not None else policy()).get("unfixable") or "reject") != "reject":
+        return None
+    reason = str(unfix.get("reason") or code)
+    return code, reason
+
+
 def _missing_attrs(product_id: str) -> list[str]:
     """Which of brand / size the product still lacks. Placeholders count.
 
@@ -650,6 +681,29 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
             )
             return abort
 
+    # UNFIXABLE BY ANY RE-RUN (readiness phase 4, decision 8). The chain has
+    # named a defect no step can clear — no garment photograph to render
+    # from, or a print every image model declines — and the product is held.
+    # Same guards as the brand/size rule above (see unfixable_rejection), same
+    # reject step, same terminal verdict shape, and the code the chain chose.
+    rejection = unfixable_rejection(result, verdict, unavailable, apply=rs.apply)
+    if rejection is not None:
+        code, why = rejection
+        events.emit(tenant_id, "warn", f"{row['productSku']} — {why}, rejecting",
+                    run_id=row["runId"], run_product_id=row["id"],
+                    product_id=product_id)
+        if _archive(row, why):
+            _finish(
+                row,
+                Verdict("FAILED", code, why, False, False),
+                blocking_rules=list(result.get("remaining") or []),
+                steps=steps,
+                deltas={"gate": result.get("gate"), "regeneration": result.get("regeneration")},
+                duration_ms=duration,
+                expect_status=expect_status,
+            )
+            return abort
+
     _finish(
         row,
         verdict,
@@ -663,6 +717,10 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
             "stageAfter": result.get("stage_after"),
             "gate": result.get("gate"),
             "photos": result.get("photos"),
+            "cutouts": result.get("cutouts"),
+            "regeneration": result.get("regeneration"),
+            "order": result.get("order"),
+            "copy": result.get("copy"),
             "generation": gen or None,
         },
         duration_ms=duration,

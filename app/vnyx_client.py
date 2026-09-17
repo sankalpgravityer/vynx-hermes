@@ -270,6 +270,7 @@ def to_snapshot(
             img if isinstance(img, str) else img.get("url", "")
             for img in (raw.get("images") or [])
         ],
+        media_manual_order=bool(_first(raw, "mediaManualOrder", "media_manual_order") or False),
 
         # The typed ProductMedia rows behind `images` above, when the caller sent
         # them. Both spellings are accepted for the same reason every other field
@@ -288,6 +289,13 @@ def to_snapshot(
                 is_current=bool(m.get("isCurrent", m.get("is_current", True))),
                 deleted_at=_str(_first(m, "deletedAt", "deleted_at")),
                 position=int(m.get("position") or 0),
+                # Readiness phase 3: what the loader now carries so a cut-out
+                # can be paired with, and measured against, its original.
+                id=_str(_first(m, "id")),
+                width=int(m["width"]) if m.get("width") else None,
+                height=int(m["height"]) if m.get("height") else None,
+                derived_from_id=_str(_first(m, "derivedFromId", "derived_from_id")),
+                border=m.get("border") if isinstance(m.get("border"), dict) else None,
             )
             for m in (raw.get("media") or raw.get("productMedia") or [])
             if isinstance(m, dict) and _first(m, "url")

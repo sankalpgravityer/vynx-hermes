@@ -34,6 +34,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
+import struct
 import time
 
 import httpx
@@ -158,4 +159,178 @@ def fetch_all(
     got = sum(1 for v in out.values() if v is not None)
     log.info("fetched %d/%d images in %.1fs", got, len(urls),
              time.perf_counter() - started)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Image dimensions from the file header — readiness phase 3
+# --------------------------------------------------------------------------- #
+#
+# The canvas check (IMG.026) compares a cut-out with the photograph it was cut
+# from, and the photograph is a 3-6 MB JPEG on a rate-limited host. Its width
+# and height sit in the first few hundred bytes, so a ranged read of the head
+# of the file answers the question at ~1% of the cost of a download — which is
+# what lets the check run on every product of a batch rather than on one.
+#
+# `ProductMedia.width/height` are stored on 1% of rows today; the matte path
+# now fills them as it works (phase 2), so over time this reader is the
+# fallback rather than the rule.
+
+_HEADER_BYTES = 65_536
+# A JPEG with a large embedded ICC profile or EXIF thumbnail can push its SOF
+# marker past 64 KB. Rare; one wider read before giving up.
+_HEADER_BYTES_MAX = 1_048_576
+
+# Every JPEG "start of frame" marker: baseline, progressive, lossless, the
+# arithmetic-coded variants. The frame header carries the dimensions.
+_JPEG_SOF = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+             0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+
+
+def dims_from_header(data: bytes) -> tuple[int, int] | None:
+    """Width and height from the head of a PNG, JPEG, WebP or GIF file.
+
+    None when the bytes are not one of those, are too short to say, or the
+    JPEG frame header lies beyond what was read. Never raises — a garbled file
+    is "unknown", the same answer as "not fetched".
+    """
+    if not data or len(data) < 10:
+        return None
+
+    # PNG: the IHDR chunk is always first, at offset 8; width/height big-endian.
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        if len(data) >= 24 and data[12:16] == b"IHDR":
+            w, h = struct.unpack(">II", data[16:24])
+            return (w, h) if w and h else None
+        return None
+
+    # GIF: logical screen size straight after the signature, little-endian.
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        w, h = struct.unpack("<HH", data[6:10])
+        return (w, h) if w and h else None
+
+    # WebP: RIFF container, then one of three bitstream chunks.
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 30:
+        chunk = data[12:16]
+        if chunk == b"VP8X":
+            # Extended: 24-bit canvas width-1 / height-1 after a flags byte and
+            # three reserved bytes.
+            w = 1 + int.from_bytes(data[24:27], "little")
+            h = 1 + int.from_bytes(data[27:30], "little")
+            return (w, h)
+        if chunk == b"VP8 ":
+            # Lossy: 3-byte frame tag, the start code 9d 01 2a, then 14-bit
+            # width and height (the top two bits of each are a scale factor).
+            if data[23:26] != b"\x9d\x01\x2a":
+                return None
+            w = int.from_bytes(data[26:28], "little") & 0x3FFF
+            h = int.from_bytes(data[28:30], "little") & 0x3FFF
+            return (w, h) if w and h else None
+        if chunk == b"VP8L":
+            # Lossless: signature byte 0x2f, then 14 bits width-1, 14 bits
+            # height-1 packed little-endian.
+            if data[20] != 0x2F:
+                return None
+            bits = int.from_bytes(data[21:25], "little")
+            return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+        return None
+
+    # JPEG: walk the marker segments until a start-of-frame.
+    if data[:2] == b"\xff\xd8":
+        i = 2
+        n = len(data)
+        while i + 4 <= n:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker == 0xFF:          # fill byte
+                i += 1
+                continue
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                i += 2                  # standalone markers carry no length
+                continue
+            if marker in (0xD9, 0xDA):  # end of image / start of scan: no SOF seen
+                return None
+            seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+            if seg_len < 2:
+                return None
+            if marker in _JPEG_SOF:
+                if i + 9 > n:
+                    return None         # the frame header was cut off
+                h = int.from_bytes(data[i + 5:i + 7], "big")
+                w = int.from_bytes(data[i + 7:i + 9], "big")
+                return (w, h) if w and h else None
+            i += 2 + seg_len
+        return None
+
+    return None
+
+
+def _read_prefix(http: httpx.Client, url: str, limit: int) -> bytes | None:
+    """The first `limit` bytes of a URL, via a Range request; None on any failure.
+
+    A host that ignores `Range` sends the whole file; the stream is closed as
+    soon as enough has arrived, so the cost is bounded either way.
+    """
+    try:
+        with http.stream("GET", url, headers={"Range": f"bytes=0-{limit - 1}"}) as resp:
+            if resp.status_code >= 400:
+                return None
+            buf = bytearray()
+            for chunk in resp.iter_bytes():
+                buf += chunk
+                if len(buf) >= limit:
+                    break
+            return bytes(buf[:limit])
+    except Exception as exc:  # noqa: BLE001 — "unknown" is the honest answer
+        log.info("header read failed for %s: %s", url[:70], type(exc).__name__)
+        return None
+
+
+def image_dims(url: str, client: httpx.Client | None = None,
+               timeout_s: float = 10.0) -> tuple[int, int] | None:
+    """Width and height of a remote image from its header. Never raises."""
+    own = client is None
+    http = client or make_client(timeout_s)
+    try:
+        for limit in (_HEADER_BYTES, _HEADER_BYTES_MAX):
+            head = _read_prefix(http, url, limit)
+            if head is None:
+                return None
+            dims = dims_from_header(head)
+            if dims:
+                return dims
+            if len(head) < limit:
+                return None             # the whole file was read and still nothing
+        return None
+    finally:
+        if own:
+            http.close()
+
+
+def image_dims_all(urls: list[str], timeout_s: float = 10.0,
+                   deadline_s: float = 30.0,
+                   client: httpx.Client | None = None
+                   ) -> dict[str, tuple[int, int] | None]:
+    """`image_dims` for many URLs at once, under one deadline. Never raises."""
+    if not urls:
+        return {}
+    own = client is None
+    http = client or make_client(timeout_s)
+    out: dict[str, tuple[int, int] | None] = {u: None for u in urls}
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
+            futures = {pool.submit(image_dims, u, http): u for u in urls}
+            done, pending = concurrent.futures.wait(futures, timeout=deadline_s)
+            for future in done:
+                try:
+                    out[futures[future]] = future.result()
+                except Exception:  # noqa: BLE001
+                    pass
+            for future in pending:
+                future.cancel()
+    finally:
+        if own:
+            http.close()
     return out

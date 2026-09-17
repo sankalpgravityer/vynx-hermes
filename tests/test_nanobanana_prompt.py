@@ -249,6 +249,17 @@ def test_any_is_never_sent_as_a_literal_trait():
     assert "hair" not in prompt.split("IMPORTANT STYLING")[0]
 
 
+def test_identity_from_a_reference_render_leaves_the_traits_out_of_the_prompt():
+    """A trait in words that differs from the person in the reference picture
+    is an instruction to draw someone else (MID-000569)."""
+    s = apply_personality(cast_settings(), CAST[0])
+    prompt = build_prompt("closeup", ctx(settings=s, gender="female", identity_from_reference=True), True)
+    assert "fair skin tone" not in prompt and "long sleek straight hair" not in prompt
+    assert "EXACT SAME" in prompt                       # the reference carries the identity
+    # Without the flag the same settings describe the model, as before.
+    assert "fair skin tone" in build_prompt("closeup", ctx(settings=s, gender="female"), True)
+
+
 def test_kids_get_no_personality_traits():
     s = apply_personality(cast_settings(), CAST[0])
     prompt = build_prompt("front", ctx(settings=s, mannequin_type="Kids"), False)

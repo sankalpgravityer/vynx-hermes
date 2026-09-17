@@ -35,6 +35,19 @@ not trust.
 The gallery check is a soft flag by default (`gallery.block: false`): a
 background not fully removed or a close-up filed as a front is worth knowing
 and not, on its own, worth stopping an approval the pre-flight already passed.
+
+A RENDER DEFECT IS DIFFERENT, AND IT IS FIXED, NOT FLAGGED. The gate judges one
+render — the lead — and the other four are seen only here. MID-000253 (Midtex,
+production, 17 Sep 2026): the AI_FRONT_34 had the model's knees smeared into a
+white blur, plain to anyone who opened the edit screen; the gate passed the
+AI_FRONT beside it and this audit wrote "IMAGE DEFECT — AI_FRONT_34 render: AI
+artifact on legs" as a soft flag nobody acted on. So an AI render the model
+calls defective is `RENDER_DEFECT`, carries the view in `bad_views`, and the
+chain's regen step re-renders THAT VIEW ONLY — the same model identity, because
+the renderer is handed the product's stored personality and its AI_FRONT as the
+reference (`gallery.render_defects: regen`; `hold` makes it a person's decision,
+`soft` the old flag). A cut-out or photograph that is not what its slot says
+stays `IMAGE_DEFECT` under `gallery.block`: nothing re-renders a photograph.
 """
 from __future__ import annotations
 
@@ -82,12 +95,65 @@ SCHEMA: dict[str, Any] = {
                     "ok": {"type": "boolean"},
                     "issue": {"type": "string",
                               "description": "At most eight words when not ok, else empty."},
+                    # Asked part by part, because "does it match its expectation"
+                    # let a sweater with its neckband cut away through (MID-000569).
+                    "missing_parts": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": (
+                            "For a GARMENT PHOTOGRAPH with the background removed only: "
+                            "each part of the garment that is missing or cut off — "
+                            "'collar', 'neckband', 'left sleeve', 'cuff', 'hem', 'strap', "
+                            "'waistband'. Check the neckline, both sleeves and the hem "
+                            "one by one. Empty when the garment is complete; always "
+                            "empty for a render or an unprocessed photograph."
+                        ),
+                    },
                 },
-                "required": ["index", "ok", "issue"],
+                "required": ["index", "ok", "issue", "missing_parts"],
             },
         },
+        # Readiness phase 1: the master category is confirmed against the
+        # GARMENT photographs — never against the render, which is the thing
+        # under judgement. Same call, three more fields.
+        "garment_gender": {
+            "type": "string",
+            "enum": ["men", "women", "unisex", "unknown"],
+            "description": (
+                "Who the GARMENT itself is cut for, judged from the garment "
+                "photographs only (cut, fit, closures, styling): men, women, "
+                "unisex when it could honestly be either (a plain tee, a hoodie), "
+                "unknown when the photographs cannot show it. Ignore the model "
+                "in any AI render."
+            ),
+        },
+        "garment_type": {
+            "type": "string",
+            "description": "The kind of garment in one or two words: 'denim jacket', "
+                           "'midi dress', 'jeans', 'polo shirt'.",
+        },
+        "garment_confidence": {"type": "number", "description": "0.0 to 1.0 for garment_gender."},
+        # 17 Sep 2026, MID-000569: a close-up re-rendered beside four renders of
+        # a blonde woman came back with a dark-haired one. Every render is in
+        # this one call, so the question costs nothing extra.
+        "same_model": {
+            "type": "boolean",
+            "description": (
+                "true when every AI RENDER in the list shows the SAME person: the "
+                "same face, hair colour and style, skin tone and build. true when "
+                "there are fewer than two renders. false when one or more renders "
+                "show a different person than the others."
+            ),
+        },
+        "odd_renders": {
+            "type": "array", "items": {"type": "integer"},
+            "description": "When same_model is false: the 1-based index(es) of the "
+                           "render(s) showing a DIFFERENT person than the majority. "
+                           "Empty otherwise.",
+        },
     },
-    "required": ["wear", "defects", "wear_confidence", "images"],
+    "required": ["wear", "defects", "wear_confidence", "images",
+                 "garment_gender", "garment_type", "garment_confidence",
+                 "same_model", "odd_renders"],
 }
 
 SYSTEM = (
@@ -103,7 +169,21 @@ SYSTEM = (
     "A small logo badge or watermark in a corner of a render is placed there by "
     "the platform on purpose and is NOT a defect. Text is a defect only when it "
     "is generated into the scene itself — on the garment, the body or the "
-    "background. Wear on the garment is never an image defect."
+    "background. Wear on the garment is never an image defect.\n"
+    "Separately, say who the GARMENT is cut for from the garment photographs "
+    "alone — never from the person in a render. Answer unisex whenever a garment "
+    "could honestly be worn by either; reserve men or women for a cut, closure or "
+    "styling that plainly belongs to one.\n"
+    # MID-000569 (17 Sep 2026): a sweater's ribbed neckband was cut away by the
+    # background removal on both FRONT cut-outs and nothing said so.
+    "For a background-removed cut-out, a PART OF THE GARMENT MISSING is a "
+    "defect: a collar or neckband cut away, a sleeve, cuff or hem eaten by the "
+    "mask, a strap gone. The garment's own openings (the neck hole, the space "
+    "between sleeve and body) are not. A stand, hanger or hand left in the "
+    "picture is a defect too.\n"
+    "Finally, look across ALL the AI renders together and say whether they show "
+    "the same person; when one shows a different person than the rest, name it "
+    "in odd_renders."
 )
 
 _DEFAULTS: dict[str, Any] = {
@@ -123,17 +203,37 @@ _DEFAULTS: dict[str, Any] = {
     "gallery": {
         "enabled": True,
         "views": ["FRONT", "BACK", "AI_FRONT", "AI_BACK", "AI_FRONT_34", "AI_BACK_34", "AI_CLOSEUP"],
-        "max_images": 8,
+        # Two cut-outs per garment view (flat lay + booth) and five renders.
+        "max_images": 10,
+        # A cut-out or photograph that is not what its slot says: IMAGE_DEFECT
+        # holds when true, else a soft flag.
         "block": False,
+        # An AI RENDER the model calls defective (artefacts, a smeared limb,
+        # duplicated garments, clutter): `regen` re-renders that view through
+        # the chain's regen step (RENDER_DEFECT); `hold` is IMAGE_DEFECT for a
+        # person; `soft` records it and nothing follows.
+        "render_defects": "regen",
+        # A CUT-OUT the model calls defective (a collar the mask ate, a stand
+        # left in): `rematte` re-cuts it from the raw archive through the
+        # chain's rematte step (CUTOUT_DEFECT — a flag while
+        # `readiness.cutouts.hold` is soft, a hold once it is block); `hold` is
+        # a person's IMAGE_DEFECT; `soft` records it and nothing follows.
+        "cutout_defects": "rematte",
     },
     "model": None,
 }
 
+# The five on-model views in the renderer's order — the order re-rendered
+# views are named in. Mirrors `imagery.all_views` in policy.yaml.
+_ALL_VIEWS = ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK", "AI_CLOSEUP"]
+
 # What a correct image in each slot looks like — the sentence the model is
 # given for each picture. Keyed by view; processing decides photo vs cut-out.
-_EXPECT_CUTOUT = ("a garment photograph with the background removed: the whole "
-                  "garment in frame and sharp, background fully removed, no hands, "
-                  "hangers or props, not a label or tag close-up")
+_EXPECT_CUTOUT = ("a garment photograph with the background removed: the WHOLE "
+                  "garment in frame and sharp with nothing cut away — collar or "
+                  "neckband, both sleeves and cuffs, hem all present — background "
+                  "fully removed, no hands, hangers, stands or props, not a label "
+                  "or tag close-up")
 _EXPECT_PHOTO = ("a garment photograph as taken: the whole garment in frame and "
                  "sharp, not a label or tag close-up")
 _EXPECT_RENDER = {
@@ -205,12 +305,22 @@ def select_images(media: list[dict[str, Any]], pol: dict[str, Any] | None
         for view in cfg["gallery"]["views"]:
             if len(chosen) >= int(cfg["gallery"]["max_images"]):
                 break
-            m = best(view)
-            if m is None:
-                continue
             if view in _EXPECT_RENDER:
-                add(m, "render", _EXPECT_RENDER[view] + _RENDER_TAIL)
-            else:
+                m = best(view)
+                if m is not None:
+                    add(m, "render", _EXPECT_RENDER[view] + _RENDER_TAIL)
+                continue
+            # EVERY live cut-out of a garment view, not the first by position.
+            # A product photographed twice — the flat lay and the booth — has
+            # two FRONT cut-outs in its gallery, and MID-000569's broken one
+            # (the form's neck and the ribbed collar cut away together) was the
+            # second: the audit never saw it and called every cut-out whole.
+            rows = [m for m in live if m.get("view") == view]
+            rows.sort(key=lambda m: (0 if m.get("processing") == "BG_REMOVED" else 1, m.get("position") or 0))
+            cutouts = [m for m in rows if m.get("processing") == "BG_REMOVED"] or rows[:1]
+            for m in cutouts:
+                if len(chosen) >= int(cfg["gallery"]["max_images"]):
+                    break
                 add(m, "photo", _EXPECT_CUTOUT if m.get("processing") == "BG_REMOVED" else _EXPECT_PHOTO)
     return chosen, photos
 
@@ -235,12 +345,18 @@ def prompt_for(images: list[dict[str, Any]], photos: int) -> str:
 # --------------------------------------------------------------------------- #
 def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
            grade_severity: Any, grade_label: Any = None,
-           pol: dict[str, Any] | None = None) -> GateVerdict:
+           pol: dict[str, Any] | None = None,
+           product_gender: Any = None) -> GateVerdict:
     """The model's answer → a verdict, with no call involved so it tests cold.
 
     Wear first: the photographs at least `disagreement_steps` WORSE than the
     grade is the finding this module exists for. Then the gallery. Soft flags
     never block; which of the two blocks is policy (`wear.block`, `gallery.block`).
+
+    `product_gender` is the gender the MASTER CATEGORY implies ('men' | 'women'),
+    or None for a root that implies none. When the garment photographs say the
+    other gender with enough confidence, `readiness.master.photo_check` decides
+    whether that is a soft flag or a MASTER_CATEGORY_MISMATCH hold.
     """
     cfg = config(pol)
     soft: list[str] = []
@@ -287,11 +403,24 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
                             f"({seen} wear seen, {SEVERITY_SCALE[grade_idx]} graded) — conservative")
 
     # ---- the gallery -------------------------------------------------------
+    #
+    # Two kinds of picture, two fates. A PHOTOGRAPH or cut-out that is not what
+    # its slot says (`issues`) is IMAGE_DEFECT under `gallery.block`: nothing
+    # can re-take a photograph. An AI RENDER the model calls defective
+    # (`render_issues`) is a picture the chain can make again — RENDER_DEFECT,
+    # the view in `bad_views`, that view alone re-rendered (see the module
+    # docstring; `gallery.render_defects`).
     gal_cfg = cfg["gallery"]
+    bad_views: list[str] = []
+    bad_cutouts: list[str] = []
+    render_reasons: list[str] = []
     if gal_cfg["enabled"]:
-        issues: list[str] = []
+        photo_issues: list[str] = []
+        cutout_issues: list[str] = []
+        render_issues: list[str] = []
+        renders = [i for i, im in enumerate(images, start=1) if im.get("kind") == "render"]
         for entry in raw.get("images") or []:
-            if not isinstance(entry, dict) or entry.get("ok") is not False:
+            if not isinstance(entry, dict):
                 continue
             try:
                 idx = int(entry.get("index"))
@@ -300,20 +429,178 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
             if not 1 <= idx <= len(images):
                 continue
             im = images[idx - 1]
-            what = ("cut-out" if im.get("processing") == "BG_REMOVED" else
-                    "render" if im.get("kind") == "render" else "photo")
-            issue = str(entry.get("issue") or "does not match its slot").strip()[:80]
-            issues.append(f"{im.get('view')} {what}: {issue}")
-        if issues:
+            view = str(im.get("view") or "")
+            is_cutout = im.get("kind") != "render" and im.get("processing") == "BG_REMOVED"
+            # A garment part the mask ate counts on a cut-out even when the
+            # model still called the picture "ok" — the part-by-part question
+            # is the one it answers honestly.
+            missing = ([str(p).strip() for p in (entry.get("missing_parts") or []) if str(p).strip()]
+                       if is_cutout else [])
+            if entry.get("ok") is not False and not missing:
+                continue
+            issue = str(entry.get("issue") or "").strip()[:80]
+            if missing:
+                issue = (f"{issue}; " if issue else "") + f"{', '.join(missing[:3])} missing"
+            issue = issue or "does not match its slot"
+            if im.get("kind") == "render":
+                render_issues.append(f"{view} render: {issue}")
+                if view and view not in bad_views:
+                    bad_views.append(view)
+                continue
+            if is_cutout:
+                cutout_issues.append(f"{view} cut-out: {issue}")
+                if view and view not in bad_cutouts:
+                    bad_cutouts.append(view)
+                continue
+            photo_issues.append(f"{view} photo: {issue}")
+
+        # ONE PERSON ACROSS THE RENDERS. The gate judges the lead alone and
+        # cannot see that the close-up shows somebody else (MID-000569). A
+        # render that shows a different person than the majority is a render
+        # defect of THAT view — re-rendered against the others as reference.
+        # Needs a majority to compare with: three renders or more, and the odd
+        # ones fewer than the rest.
+        if raw.get("same_model") is False and len(renders) >= 3:
+            odd: list[int] = []
+            for o in raw.get("odd_renders") or []:
+                try:
+                    o = int(o)
+                except (TypeError, ValueError):
+                    continue
+                if o in renders and o not in odd:
+                    odd.append(o)
+            if odd and len(odd) * 2 < len(renders):
+                for o in odd:
+                    view = str(images[o - 1].get("view") or "")
+                    if view in bad_views:
+                        continue                 # already refused on its own answer
+                    render_issues.append(f"{view} render: a different model than the other renders")
+                    if view:
+                        bad_views.append(view)
+            else:
+                soft.append("the renders may not all show the same model (which one is unclear)")
+
+        if photo_issues:
             if gal_cfg["block"]:
                 code = code or "IMAGE_DEFECT"
-                reasons.extend("IMAGE DEFECT — " + i for i in issues)
+                reasons.extend("IMAGE DEFECT — " + i for i in photo_issues)
             else:
-                soft.extend("IMAGE DEFECT — " + i for i in issues)
+                soft.extend("IMAGE DEFECT — " + i for i in photo_issues)
+
+        if cutout_issues:
+            # A cut-out the chain can make again: re-cut from the raw archive
+            # (the rematte step). Whether it HOLDS meanwhile follows the
+            # cut-out policy of phase 3, `readiness.cutouts.hold` — soft until
+            # the per-tenant shadow says otherwise.
+            mode = str(gal_cfg.get("cutout_defects") or "rematte").lower()
+            if mode == "rematte":
+                from app.imaging import cutouts as _cutouts
+
+                if str(_cutouts.config(pol).get("hold") or "soft").lower() == "block":
+                    code = code or "CUTOUT_DEFECT"
+                    reasons.extend("CUTOUT DEFECT — " + i for i in cutout_issues)
+                else:
+                    soft.extend("CUTOUT DEFECT — " + i for i in cutout_issues)
+            elif mode == "hold":
+                code = code or "IMAGE_DEFECT"
+                reasons.extend("IMAGE DEFECT — " + i for i in cutout_issues)
+                bad_cutouts = []
+            else:
+                soft.extend("IMAGE DEFECT — " + i for i in cutout_issues)
+                bad_cutouts = []
+
+        if render_issues:
+            mode = str(gal_cfg.get("render_defects") or "regen").lower()
+            if mode == "regen":
+                # Named LAST (below), after every hold has had its say: a
+                # render defect only names the verdict when nothing holds it
+                # for a person.
+                render_reasons = ["RENDER DEFECT — " + i for i in render_issues]
+            elif mode == "hold":
+                code = code or "IMAGE_DEFECT"
+                reasons.extend("IMAGE DEFECT — " + i for i in render_issues)
+                bad_views = []
+            else:
+                soft.extend("IMAGE DEFECT — " + i for i in render_issues)
+                bad_views = []
+    head["bad_views"] = bad_views
+    head["bad_cutouts"] = bad_cutouts
+
+    # ---- the master category, against the garment photographs ----------------
+    #
+    # Readiness phase 1. Only a plain contradiction counts: the master says one
+    # gender, the photographs say the OTHER (never unisex or unknown), at or
+    # above the policy floor, and only from garment photographs — with no photo
+    # in the set the model was looking at renders and its answer is ignored.
+    # The render never votes on the record it is judged by.
+    from app.readiness import config as readiness_config
+
+    m_cfg = readiness_config(pol)["master"]
+    seen_gender = str(raw.get("garment_gender") or "unknown").strip().lower()
+    try:
+        g_conf: float | None = float(raw.get("garment_confidence"))
+    except (TypeError, ValueError):
+        g_conf = None
+    if (photos and product_gender in ("men", "women") and seen_gender in ("men", "women")
+            and seen_gender != product_gender and g_conf is not None
+            and g_conf >= float(m_cfg.get("photo_min_confidence") or 0.85)):
+        kind = str(raw.get("garment_type") or "").strip()
+        text = (f"the garment photographs look like a {seen_gender}'s "
+                + (f"{kind} " if kind else "garment ")
+                + f"but the master category says {product_gender}")
+        if str(m_cfg.get("photo_check") or "soft").lower() == "hold":
+            code = code or "MASTER_CATEGORY_MISMATCH"
+            reasons.append("MASTER CATEGORY — " + text)
+        else:
+            soft.append("MASTER CATEGORY — " + text)
+
+    # ---- the render defects, last -------------------------------------------
+    #
+    # A render defect alone is `regen`: the chain re-renders the view and looks
+    # again. Beside a hold for a person (the grade, a photograph, the master)
+    # the hold names the verdict, the render reasons ride along, and the views
+    # still sit in `bad_views` — regen_views() reads those, whatever the action.
+    if render_reasons:
+        code = code or "RENDER_DEFECT"
+        reasons.extend(render_reasons)
 
     if reasons:
-        return GateVerdict("review", code, reasons, soft, **head)
+        return GateVerdict("regen" if code == "RENDER_DEFECT" else "review", code, reasons, soft, **head)
     return GateVerdict("ok", None, [], soft, **head)
+
+
+def regen_views(verdict: GateVerdict, pol: dict[str, Any] | None = None) -> list[str]:
+    """The renders this verdict asks the chain to make again — each named view
+    on its own, in the renderer's order, never the whole set.
+
+    A render defect is a property of ONE picture: the model, the gender and the
+    build were judged fine on the lead by the gate, so the other views stay and
+    the renderer is handed the product's stored personality and its AI_FRONT as
+    the identity reference. Empty unless policy says `regen`, or when the audit
+    could not run.
+    """
+    if verdict is None or verdict.unavailable or not verdict.bad_views:
+        return []
+    if str(config(pol)["gallery"].get("render_defects") or "regen").lower() != "regen":
+        return []
+    all_views = list(((pol or {}).get("imagery") or {}).get("all_views") or _ALL_VIEWS)
+    wanted = {str(v) for v in verdict.bad_views}
+    return [v for v in all_views if v in wanted] + sorted(v for v in wanted if v not in all_views)
+
+
+def rematte_views(verdict: GateVerdict, pol: dict[str, Any] | None = None) -> list[str]:
+    """The garment views whose cut-out this verdict asks the chain to re-cut.
+
+    A cut-out the model calls defective — the neckband gone, a stand left in —
+    is made again from the raw archive by the rematte step, whatever the
+    verdict's action (a flag while `readiness.cutouts.hold` is soft). Empty
+    unless policy says `rematte`, or when the audit could not run.
+    """
+    if verdict is None or verdict.unavailable or not verdict.bad_cutouts:
+        return []
+    if str(config(pol)["gallery"].get("cutout_defects") or "rematte").lower() != "rematte":
+        return []
+    return list(dict.fromkeys(str(v) for v in verdict.bad_cutouts))
 
 
 # --------------------------------------------------------------------------- #
@@ -321,7 +608,7 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
 # --------------------------------------------------------------------------- #
 def judge(media: list[dict[str, Any]], *, grade_severity: Any, grade_label: Any = None,
           pol: dict[str, Any] | None = None, evidence: Any = None,
-          api_key: str | None = None) -> GateVerdict:
+          api_key: str | None = None, product_gender: Any = None) -> GateVerdict:
     """Judge the product's photographs and gallery. Never raises.
 
     Same shape as quality_gate.judge on purpose: the chain enforces both the
@@ -384,7 +671,7 @@ def judge(media: list[dict[str, Any]], *, grade_severity: Any, grade_label: Any 
         cache.put(ckey, raw, pol)
 
     verdict = decide(raw, images=images, grade_severity=grade_severity,
-                     grade_label=grade_label, pol=pol)
+                     grade_label=grade_label, pol=pol, product_gender=product_gender)
     verdict.cached = hit
     return verdict
 
@@ -394,9 +681,10 @@ def summary(v: GateVerdict) -> str:
 
     Not GateVerdict.summary(): there `review` reads "could not decide", which
     is right for a gate that had no answer and wrong here, where `review` is a
-    HOLD with a reason — the photographs contradict the grade.
+    HOLD with a reason — the photographs contradict the grade. `regen` is a
+    render the chain makes again (RENDER_DEFECT).
     """
-    head = {"ok": "passed", "review": "HELD", "skipped": "skipped"}.get(v.action, v.action)
+    head = {"ok": "passed", "regen": "REFUSED", "review": "HELD", "skipped": "skipped"}.get(v.action, v.action)
     line = head + (" — " + "; ".join(v.reasons) if v.reasons else "")
     extras: list[str] = []
     if v.soft:
