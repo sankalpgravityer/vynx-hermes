@@ -438,14 +438,41 @@ def neck_pair(neck: str, *, shift: int = 0) -> tuple[bytes, bytes]:
     return _png(cut), _png(raw)
 
 
+ON = {**CFG, "garment_check": {**(CFG.get("garment_check") or {}), "residue_check": True}}
+
+
 def test_the_forms_neck_showing_through_the_collar_is_measured_and_cannot_be_re_cut():
-    """MID-000569's booth FRONT: 2.2% of the garment, white in the photograph."""
+    """MID-000569's booth FRONT: 2.2% of the garment, white in the photograph.
+    Only reported behind `residue_check`, which is off — see the next test."""
     cut, raw = neck_pair("form")
     m = cutouts.garment_hole(cut, raw, CFG)
     assert m["aligned"] and m["residue"] > 0.05 and m["loss"] == 0 and m["opening"] == 0
     assert m["residue_rgb"] == [255, 255, 255]
-    why, fixable = cutouts.hole_problem(m, CFG)
+    why, fixable = cutouts.hole_problem(m, ON)
     assert why and "form's neck" in why and "re-cut reproduces the hole" in why and not fixable
+
+
+def test_a_brighter_patch_of_the_same_wall_is_not_a_form_and_is_not_reported():
+    """KLE-000124: dungarees hanging open between their straps over wall at
+    rgb(243,243,243) while the border ring reads rgb(200,198,197). The gap is
+    wall, the cut-out is correct, and both views were flagged at 5.6% and 4.7%.
+    The measurement cannot separate that from a form, so it is off."""
+    lit = Image.new("RGB", (300, 400), (200, 198, 197))
+    d = ImageDraw.Draw(lit)
+    d.rectangle((60, 40, 240, 360), fill=(243, 242, 243))          # the lit centre
+    d.rectangle((105, 130, 195, 340), fill=(60, 60, 90))           # the garment
+    d.rectangle((120, 60, 135, 130), fill=(60, 60, 90))            # its two straps
+    d.rectangle((165, 60, 180, 130), fill=(60, 60, 90))
+    cut = Image.new("RGBA", (300, 400), (255, 255, 255, 255))
+    dc = ImageDraw.Draw(cut)
+    dc.rectangle((105, 130, 195, 340), fill=(60, 60, 90, 255))
+    dc.rectangle((120, 60, 135, 130), fill=(60, 60, 90, 255))
+    dc.rectangle((165, 60, 180, 130), fill=(60, 60, 90, 255))
+    m = cutouts.garment_hole(_png(cut), _png(lit), CFG)
+    assert m["aligned"] and m["loss"] == 0                          # nothing was cut away
+    assert m["residue"] > 0.008                                     # and it still measures "an object"
+    assert cutouts.hole_problem(m, CFG) == (None, False)            # …which is why it is off
+    assert cutouts.hole_problem(m, ON)[0]                           # switched on, it would fire
 
 
 def test_a_collar_the_mask_cut_away_is_garment_in_the_photograph_and_is_re_cut():
@@ -459,7 +486,7 @@ def test_a_collar_the_mask_cut_away_is_garment_in_the_photograph_and_is_re_cut()
 def test_a_real_neck_opening_and_a_whole_garment_have_nothing_to_say():
     for neck in ("backdrop", "whole"):
         m = cutouts.garment_hole(*neck_pair(neck), CFG)
-        assert cutouts.hole_problem(m, CFG) == (None, False), neck
+        assert cutouts.hole_problem(m, ON) == (None, False), neck
     assert cutouts.garment_hole(*neck_pair("backdrop"), CFG)["opening"] > 0.05
 
 
@@ -528,7 +555,7 @@ def test_judge_re_cuts_a_zoomed_cutout_and_says_which_view():
     assert "IMG.026" in ids(snap([cut, raw]))
 
 
-def test_judge_reports_the_forms_neck_as_a_flaw_no_re_cut_fixes_and_the_lost_collar_as_a_re_cut():
+def test_judge_re_cuts_a_lost_collar_and_leaves_the_forms_neck_alone():
     raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg", width=300, height=400)
     cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png")
     braw = asset("BACK", "RAW", id="r2", current=False, url="https://r2/braw.jpg", width=300, height=400)
@@ -540,11 +567,10 @@ def test_judge_reports_the_forms_neck_as_a_flaw_no_re_cut_fixes_and_the_lost_col
     v = cutouts.judge(snap([cut, raw, bcut, braw]), POL, fetch=fetch, read_dims=read_dims)
     assert v.action == "bad"
     assert v.bad_views == ["BACK"]                       # the lost collar: re-cut
-    assert v.unfixable_views == ["FRONT"]                # the form's neck: said, not re-cut
-    assert v.unfixable_reasons == [r for r in v.reasons if r.startswith("FRONT: neckline")]
-    assert "use the flat-lay cut-out as the FRONT" in v.unfixable_reasons[0]
+    assert v.unfixable_views == []                       # the form's neck: not reported at all
     assert any(r.startswith("BACK: neckline") and "cut away" in r for r in v.reasons)
-    assert cut.border["garment"]["residue"] > 0.05       # the measurement rides on the row
+    assert not any(r.startswith("FRONT:") for r in v.reasons)
+    assert cut.border["garment"]["residue"] > 0.05       # the measurement still rides on the row
 
 
 def test_judge_names_the_zoomed_view_and_writes_the_evidence_back():

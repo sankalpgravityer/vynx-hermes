@@ -146,6 +146,31 @@ DEFAULTS: dict[str, Any] = {
         # neck 2.3%; MID-000253's old booth FRONT 1.6%; the flat lays 0.0-0.2%.
         "loss_min": 0.005,
         "residue_min": 0.008,
+        # THE FORM'S-NECK TEST IS OFF, and this is why.
+        #
+        # It asks whether the hole at the neckline shows something that is
+        # neither the garment nor the backdrop, and calls that a display form.
+        # It cannot tell one from a BRIGHTER PATCH OF THE SAME WALL. The
+        # backdrop colour is the median of a border ring, and these studios
+        # light the middle of the wall more than its edges: KLE-000124's
+        # dungarees hang open between their straps over wall at rgb(243,243,243)
+        # while the ring reads about rgb(200,198,197) — a distance of 50, over
+        # the 40 that separates "backdrop" from "object" — so the wall between
+        # the straps was reported as a form's neck, on both views, at 5.6% and
+        # 4.7%. KLE-000045's t-shirt back did the same at 0.9%. Every one of
+        # those cut-outs is correct.
+        #
+        # A garment on a HANGER is the common case and always shows wall
+        # through its neck, so the false-positive rate is far worse than the
+        # one true case it was built for (MID-000569's form). The `loss` half —
+        # garment-coloured pixels missing from the cut-out — survived the same
+        # data untouched (0.000 on every false positive) and stays on.
+        #
+        # The measurement is still taken and still recorded on the row, so this
+        # can be switched back on behind a separator that actually works: a
+        # form's neck is a solid bright column CENTRED between the shoulders,
+        # not a diffuse gradient.
+        "residue_check": False,
     },
 }
 
@@ -504,11 +529,10 @@ def background_mismatch(border: dict[str, Any], expected: Backdrop,
 #
 #   loss      garment colour — the mask cut the collar (or a strap) away.
 #             A re-cut can restore it: a problem, re-matted.
-#   residue   something else — the form's neck, a hand, a hanger. The garment
-#             was on it and the photograph does not show what is behind, so a
-#             re-cut reproduces the hole (MID-000253's Hermes re-cut did).
-#             Reported, never re-matted: the fix is another photograph (the
-#             flat lay beside it) or a ghost-mannequin fill.
+#   residue   something else — the form's neck, a hand, a hanger. OFF BY
+#             DEFAULT (`residue_check`): it cannot tell an object from a
+#             brighter patch of the same wall, and flagged correct cut-outs of
+#             garments hanging open on a hanger. See that setting's note.
 #   opening   the backdrop — a real neckline. Nothing to say.
 #
 # numpy, not the pure-PIL loops above: 270k pixels compared three ways.
@@ -659,7 +683,8 @@ def hole_problem(m: dict[str, Any] | None, cfg: dict[str, Any]) -> tuple[str | N
     if float(m.get("loss") or 0) >= float(gc.get("loss_min") or 0.005):
         return (f"neckline: {m['loss']:.1%} of the garment was cut away at the collar — "
                 f"garment colour in the photograph, nothing in the cut-out"), True
-    if float(m.get("residue") or 0) >= float(gc.get("residue_min") or 0.008):
+    if (gc.get("residue_check")
+            and float(m.get("residue") or 0) >= float(gc.get("residue_min") or 0.008)):
         rgb = m.get("residue_rgb") or []
         light = bool(rgb) and sum(rgb) / len(rgb) >= 200
         if light:
