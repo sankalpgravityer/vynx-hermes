@@ -1866,6 +1866,22 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         #                       answer for what IS the garment and a mask
         #                       strategy is not more likely to find the collar.
         plan = _cutout.rematte_strategies(why)
+
+        # A LEFTOVER WITH NOTHING CONFIGURED TO REMOVE IT IS LEFT ALONE.
+        #
+        # `[]` and `None` are different answers (see rematte_strategies): None
+        # is "the default chain is right", `[]` is "this is a stand or a hanger
+        # and every strategy that could take it out is switched off". Re-cutting
+        # anyway would ask cloth-seg — the segmenter that left the podium in —
+        # to remove the podium, which is how MID-000521 carried the same stand
+        # through every repair run. Say so and stop.
+        if plan == []:
+            rematte_report["skipped"] = "no leftover strategy configured"
+            return (f"left the existing cut-outs alone — {why}; removing a stand, a "
+                    f"hanger or a hand needs a segmenter other than cloth-seg and "
+                    f"`readiness.cutouts.leftover_strategies` is empty, so a re-cut "
+                    f"would return the same picture")
+
         rematte_report.update({"attempted": True, "views": views, "strategies": plan})
         if not apply:
             tail = (f"; asking {', '.join(plan)} instead of the default chain, because "
@@ -1879,12 +1895,18 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         need = {"keepBetter": "--keep-better"}
         if plan:
             need["bgStrategies"] = "--bg-strategies"
-        if not remote_supports(*need):
-            missing = ", ".join(need.values())
+        # NAME ONLY WHAT IS ACTUALLY MISSING. This printed the whole `need` set,
+        # so a server that had `keepBetter` and lacked `bgStrategies` was
+        # reported as taking neither — and the reader's next move is to
+        # implement an option that is already there.
+        absent = [flag for opt, flag in need.items() if not remote_supports(opt)]
+        if absent:
+            missing = ", ".join(absent)
             rematte_report["skipped"] = f"vnyx-api does not accept {missing}"
             return (f"left the existing cut-outs alone — this vnyx-api cannot take "
-                    f"{missing}; re-cutting without them either stores a worse "
-                    f"cut-out or asks the same segmenter that left this in")
+                    f"{missing}; re-cutting without {'them' if len(absent) > 1 else 'it'} "
+                    f"either stores a worse cut-out or asks the same segmenter that "
+                    f"left this in")
 
         provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
         args = [*common, *live, *(["--provider", provider] if provider else []),

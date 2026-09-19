@@ -94,13 +94,35 @@ DEFAULTS: dict[str, Any] = {
     # measurement would refuse everything; `garment_kept` is the check that
     # reads those.
     "leftover_min_clear": 0.02,
+    # THE DEFAULT CHAIN — what runs when a caller names no strategies.
+    #
+    # CLOTH-SEG ALONE, AND THAT IS A COST DECISION (19 Sep 2026). The four
+    # strategies are not equally priced: cloth-seg is a local ONNX graph and
+    # costs nothing per image, while the other three are paid API calls tried
+    # TWICE each, so a photograph cloth-seg cannot cut walks six paid calls
+    # before the chain gives up. On MID-000132 that was six calls a view across
+    # four views — twenty-four paid calls — and it produced no cut-out at all.
+    #
+    # It was affordable while it never ran: the re-matte was refused outright
+    # for want of `--keep-better` in vnyx-api, so nothing reached this chain.
+    # Implementing that guard is what switched it on, and the bill followed.
+    #
+    # So the paid strategies are now OPT-IN. What is lost is real and measured —
+    # a cut-out with a podium left in stays as it is, because cloth-seg returns
+    # the same podium — and the honest outcome for those is the cut-out on file
+    # rather than a paid attempt at a better one. Widen this list to spend again.
+    "strategies": ["cloth-seg"],
     # --- item 6: a leftover is fixed with a DIFFERENT segmenter ------------
     #
     # Re-matting a stand with cloth-seg produces the same stand — it is a
     # clothing parser, the podium is directly beneath the clothing, and its
     # mask runs at 320px (§1.1). So a re-matte asked for because something was
     # LEFT IN goes to the mask strategies instead, in this order.
-    "leftover_strategies": ["gemini-mask", "openai-mask"],
+    #
+    # EMPTY, for the reason above: both names in it are paid. A leftover is
+    # therefore left alone — see `rematte_strategies`, which now says so rather
+    # than quietly falling back to a cloth-seg re-cut that reproduces the stand.
+    "leftover_strategies": [],
     # …and the result is intersected with cloth-seg, so the garment parser
     # still decides what is cloth. Measured on the same Nike tee: cloth-seg
     # removed the hanger and the form's neck and kept the whole podium; a
@@ -127,6 +149,36 @@ DEFAULTS: dict[str, Any] = {
     # and a pixel comparison between them would be nonsense. Beyond this the
     # replacement is not judged (and therefore not refused).
     "replace_ratio_tolerance": 0.05,
+    # …AND THE RATIO TEST CANNOT SEE A ZOOM, which is what these four are for.
+    #
+    # A cut-out cropped to the garment and padded back out keeps the source
+    # RATIO, so it passes the tolerance above and then loses the pixel
+    # comparison every time — its garment covers three times the canvas, so a
+    # correctly framed replacement reads as "66% less garment" and is refused.
+    # MID-000650's FRONT sat at 0.3285 of its frame against a known-good BACK at
+    # 0.1175, and the cloth-seg replacement that matched the BACK (0.1113) was
+    # turned away on exactly that arithmetic.
+    #
+    # So: outside this scale band the two are not framed alike, and the masks
+    # are compared as SHAPES instead — each cropped to its bounding box and
+    # resized to one grid. 1.25 is a quarter larger in each direction, well
+    # above the few percent two segmenters differ by and well below the 1.7x
+    # that pair measured.
+    "replace_same_scale_max": 1.25,
+    # HOW EQUALLY THE TWO AXES MUST SCALE to count as a reframing rather than a
+    # loss. A zoom moves both alike; a mask that ate the shirt back shortens the
+    # box on one axis only. Measured: reframings 0.973 and 0.990, losses 0.561
+    # and 0.567 — nothing lands between, so 0.90 is safe in both directions.
+    "replace_uniform_min": 0.90,
+    # How alike the two outlines must be to be worth comparing at all. A COARSE
+    # GATE — it separates "the same garment reframed" from "two different
+    # pictures", and nothing more. The real judgement is the ordinary area and
+    # edge-piece tests, re-run on the normalised pair, because an outline test
+    # cannot do their job: KIL-001644's lost strap still matches at 95%.
+    # Low on purpose, so a genuine loss reaches those rules instead of being
+    # turned away here. The measured reframing scored 0.978.
+    "replace_shape_iou_min": 0.80,
+    "replace_shape_grid": 256,
 }
 
 
@@ -888,6 +940,96 @@ def _garment_on(data: bytes, size: tuple[int, int],
     return mask, info
 
 
+def _on_own_box(mask: Any, grid: int) -> Any | None:
+    """The mask cropped to its own bounding box and resized to one square grid.
+
+    Throws away position and scale and keeps the silhouette, so two cut-outs
+    that frame the same garment differently become directly comparable.
+    """
+    import numpy as np
+    from PIL import Image
+
+    ys, xs = np.where(mask)
+    if ys.size == 0:
+        return None
+    crop = mask[ys.min(): ys.max() + 1, xs.min(): xs.max() + 1]
+    img = Image.fromarray((crop * 255).astype(np.uint8))
+    return np.asarray(img.resize((grid, grid), Image.Resampling.NEAREST)) > 127
+
+
+def _rescaled(old: Any, new: Any, cfg: dict[str, Any]) -> tuple[Any, Any, float] | None:
+    """`(old, new, scale)` on a common grid when the two are ONE garment framed
+    at two scales, else None.
+
+    ONLY THE SCALE IS CANCELLED, not the comparison. The caller re-runs the very
+    same rules on what comes back — a materially smaller garment, and a single
+    piece missing at an edge — because both are still the right questions; it is
+    the CANVAS they were being asked on that was wrong. A pure "do the outlines
+    match" test cannot replace them: KIL-001644's lost strap still scores 95%,
+    which is a shape that matches and a garment that does not.
+
+    None when the two are at the same scale, which is the ordinary case and
+    where the pixel comparison is already valid.
+    """
+    import numpy as np
+
+    if float(old.sum()) < 100 or float(new.sum()) < 100:
+        return None
+
+    # THE SCALE COMES FROM THE BOUNDING BOX, NOT THE AREA, and that is the whole
+    # discriminator. Garment AREA changes for two different reasons — the
+    # picture was reframed, or the mask ate part of the garment — so an
+    # area-derived scale reads a lost shirt back as a zoom and cancels exactly
+    # the test that would have caught it.
+    #
+    # A ZOOM SCALES BOTH AXES EQUALLY. A loss does not: it shortens the box on
+    # the axis it ate from. Measured on the pair this exists for and on
+    # synthesised damage, at 448px:
+    #
+    #                                 w x     h x     uniform
+    #   MID-000650 zoom -> correct    0.591   0.575     0.973   accept
+    #   shirt back gone, same scale   0.996   0.559     0.561   refuse
+    #   shirt back gone, rescaled     0.573   0.325     0.567   refuse
+    #   strap gone                    0.996   0.991     0.995   same scale, see below
+    #   honest re-cut, same scale     0.996   0.991     0.995   accept
+    #
+    # The two groups sit at 0.97+ and 0.56 — nothing lands between them.
+    def bbox(mask: Any) -> tuple[int, int] | None:
+        ys, xs = np.where(mask)
+        if ys.size == 0:
+            return None
+        return int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+
+    ob, nb = bbox(old), bbox(new)
+    if not ob or not nb or min(ob) < 8 or min(nb) < 8:
+        return None
+    wr, hr = nb[0] / ob[0], nb[1] / ob[1]
+    if min(wr, hr) / max(wr, hr) < float(cfg.get("replace_uniform_min") or 0.90):
+        return None      # one axis moved and the other did not: a loss, not a zoom
+
+    scale = (wr + hr) / 2
+    lo = float(cfg.get("replace_same_scale_max") or 1.25)
+    if (1.0 / lo) <= scale <= lo:
+        # Same framing. The pixel comparison is valid and must not be pre-empted
+        # — this is where KIL-001644's strap is caught, at 0.996 scale.
+        return None
+
+    grid = int(cfg.get("replace_shape_grid") or 256)
+    a, b = _on_own_box(old, grid), _on_own_box(new, grid)
+    if a is None or b is None:
+        return None
+    union = int((a | b).sum())
+    if union == 0:
+        return None
+    # A COARSE GATE, deliberately. It only asks "is this plausibly the same
+    # garment reframed, rather than two different pictures" — the real
+    # judgement is the caller's rules on the normalised pair. Set low for that
+    # reason: a genuine loss is meant to reach them, not be turned away here.
+    if float((a & b).sum()) / union < float(cfg.get("replace_shape_iou_min") or 0.80):
+        return None
+    return a, b, scale
+
+
 def garment_kept(previous: bytes, candidate: bytes,
                  cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
     """Is the candidate at least as complete as the cut-out it would replace?
@@ -942,13 +1084,46 @@ def garment_kept(previous: bytes, candidate: bytes,
     if old_area < 100:
         return True, "the existing cut-out has almost no garment in it, not compared"
 
+    # THE SAME GARMENT AT A DIFFERENT SCALE IS NOT A LOSS OF GARMENT.
+    #
+    # Everything below counts PIXELS, which assumes the two cut-outs frame the
+    # garment the same way. When the incumbent is a ZOOM — cropped to the
+    # garment and scaled back out to the source ratio — it does not: its garment
+    # covers far more of the canvas, so a correctly framed replacement always
+    # looks like it lost most of the garment and is always refused.
+    #
+    # Measured on MID-000650's FRONT, which is exactly that cut-out:
+    #
+    #   FRONT on file    896x1195   garment 0.3285 of frame   <- the zoom
+    #   FRONT cloth-seg 3000x4000   garment 0.1113 of frame   <- the correct one
+    #   BACK on file    3000x4000   garment 0.1175 of frame   <- known good
+    #
+    # The replacement matches the product's own BACK almost exactly and was
+    # refused as "66% less garment". `replace_ratio_tolerance` above is meant to
+    # catch "different frames, not compared", but a zoom keeps the source RATIO
+    # (0.750 both) and sails through it — the ratio test cannot see a scale.
+    #
+    # So the shapes are compared with the scale normalised away: each mask
+    # cropped to its own bounding box and resized to one grid. A reframing keeps
+    # its outline (0.978 on that pair); a mask that ate the shirt back or a
+    # strap changes it, because the lost piece is missing from the outline too.
+    # That is what keeps KIL-001625's protection intact.
+    reframed = _rescaled(old, new, cfg)
+    note = ""
+    if reframed is not None:
+        old, new, scale = reframed
+        old_area, new_area = float(old.sum()), float(new.sum())
+        note = (f" (the two are the same garment at {scale:.1f}x — compared on a "
+                f"common frame, because the one on file is cropped to the garment "
+                f"and this one is on the photograph's)")
+
     share = new_area / old_area
     drop = 1.0 - share
     drop_max = float(cfg.get("replace_area_drop_max") or 0.10)
     if drop > drop_max:
         return False, (f"the new cut-out has {drop:.0%} less garment than the one it would "
                        f"replace ({int(new_area)} against {int(old_area)} garment pixels, "
-                       f"each against its own backdrop) — the cut-out on file was KEPT")
+                       f"each against its own backdrop){note} — the cut-out on file was KEPT")
 
     # ONE PIECE MISSING AT AN EDGE, which the total above cannot see: KIL-001644
     # lost a single strap, a couple of percent of the garment. Opened first,
@@ -957,7 +1132,8 @@ def garment_kept(previous: bytes, candidate: bytes,
     # strap every time.
     lost = old & ~new
     if not lost.any():
-        return True, f"the new cut-out has {share:.0%} of the garment on file, nothing lost"
+        return True, (f"the new cut-out has {share:.0%} of the garment on file, "
+                      f"nothing lost{note}")
     piece = None
     try:
         import cv2
@@ -984,9 +1160,9 @@ def garment_kept(previous: bytes, candidate: bytes,
     if piece is not None:
         return False, (f"one piece of {piece:.0%} of the garment is missing from the new "
                        f"cut-out at its edge — a strap, a sleeve or part of the back that "
-                       f"the mask cut into — the cut-out on file was KEPT")
+                       f"the mask cut into{note} — the cut-out on file was KEPT")
     return True, (f"the new cut-out has {share:.0%} of the garment on file, largest single "
-                  f"loss under {float(cfg.get('replace_loss_region_max') or 0.02):.0%}")
+                  f"loss under {float(cfg.get('replace_loss_region_max') or 0.02):.0%}{note}")
 
 
 def _gemini(
@@ -1290,8 +1466,19 @@ def rematte_strategies(reason: str, cfg: dict[str, Any] | None = None) -> list[s
     # and item 8 keeps whichever cut-out has more of the garment.
     if _MISSING_RE.search(text):
         return None
-    names = list((cfg or config()).get("leftover_strategies") or [])
-    return [n for n in names if n in STRATEGY_NAMES] or None
+    # AN EMPTY LIST MEANS DO NOT RE-CUT, and it is NOT the same answer as None.
+    #
+    #   None  the default chain is the right tool — the missing-garment case
+    #         above, where cloth-seg is still the best first answer.
+    #   []    this is a leftover and nothing configured can remove it. Sending
+    #         it back through the default chain would ask cloth-seg, the
+    #         segmenter that left the podium in, to remove the podium — the
+    #         same cut, ~20s a view, nothing changed. The caller skips.
+    #
+    # `or None` used to collapse the two, so emptying `leftover_strategies` to
+    # stop the paid calls would have quietly bought a useless free one instead.
+    return [n for n in list((cfg or config()).get("leftover_strategies") or [])
+            if n in STRATEGY_NAMES]
 
 
 def remove_background(
@@ -1349,6 +1536,14 @@ def remove_background(
         ("openai-mask", "mask", lambda: _openai(data, timeout_s, MASK_PROMPT)),
         ("gemini-paint", "paint", lambda: _gemini(data, timeout_s, PROMPT)),
     )
+
+    # THE POLICY'S CHAIN WHEN THE CALLER NAMES NONE. `strategies` is still the
+    # caller's explicit allow-list and still wins; this only decides what "no
+    # preference" means, which used to be all four and is now the free one.
+    # An empty list in policy is read as "no restriction", so the setting cannot
+    # accidentally disable background removal altogether.
+    if strategies is None:
+        strategies = [str(s) for s in (cfg.get("strategies") or [])] or None
 
     wanted = {str(s) for s in strategies} if strategies else None
     banned = {str(s) for s in (skip or [])}

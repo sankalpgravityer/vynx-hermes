@@ -267,8 +267,15 @@ def test_the_nike_booth_cutout_is_refused_and_the_same_picture_without_its_podiu
     "CUTOUT DEFECT — FRONT cut-out: a hand holding the garment",
 ])
 def test_something_left_in_asks_the_mask_strategies(reason):
-    """MID-000521's own words, on all four of its cut-outs (§1.1)."""
-    assert cutout.rematte_strategies(reason) == ["gemini-mask", "openai-mask"]
+    """MID-000521's own words, on all four of its cut-outs (§1.1).
+
+    Asked of an EXPLICIT config, because the shipped default is now empty — the
+    mask strategies are paid and opt-in (19 Sep 2026). What this pins is the
+    mechanism: given a list, a leftover asks for it. The default is pinned by
+    `test_no_leftover_strategy_means_do_not_re_cut`."""
+    on = {"imagery": {"cutout": {"leftover_strategies": ["gemini-mask", "openai-mask"]}}}
+    assert cutout.rematte_strategies(reason, cutout.config(on)) == [
+        "gemini-mask", "openai-mask"]
 
 
 @pytest.mark.parametrize("reason", [
@@ -282,9 +289,25 @@ def test_a_missing_garment_part_keeps_the_default_chain(reason):
     assert cutout.rematte_strategies(reason) is None
 
 
-def test_the_leftover_strategies_are_a_policy_list():
+def test_no_leftover_strategy_means_do_not_re_cut():
+    """`[]` and `None` are OPPOSITE answers, and collapsing them is the bug this
+    pins. None means "the default chain is right"; `[]` means "this is a stand
+    and nothing configured can remove it, so leave the cut-out alone".
+
+    `or None` used to return None for an empty list, which sent the leftover
+    back through cloth-seg — the segmenter that left the stand in — for the same
+    cut at ~20s a view. Emptying the list to stop the PAID calls would then have
+    quietly bought a useless free one instead."""
     off = {"imagery": {"cutout": {"leftover_strategies": []}}}
-    assert cutout.rematte_strategies("stand visible", cutout.config(off)) is None
+    assert cutout.rematte_strategies("stand visible", cutout.config(off)) == []
+    # A missing garment part is still the default chain, not a skip.
+    assert cutout.rematte_strategies("collar cut away", cutout.config(off)) is None
+
+
+def test_the_shipped_default_spends_nothing_on_a_leftover():
+    """What actually ships: no paid strategy, so a leftover is left alone."""
+    assert cutout.config(None)["leftover_strategies"] == []
+    assert cutout.rematte_strategies("stand visible at bottom") == []
 
 
 def test_the_intersection_keeps_only_what_both_masks_kept():
@@ -391,11 +414,39 @@ def test_the_intersection_removes_the_podium_the_mask_strategy_left(providers):
 
 
 def test_skip_leaves_cloth_seg_out_altogether(providers):
+    """`skip` still removes it from a chain the caller widened.
+
+    Named explicitly now: the shipped default is cloth-seg ALONE, so skipping it
+    without naming a replacement leaves nothing to run — which is the next
+    test."""
     providers["answers"]["gemini-mask"] = (cutout_png("none"), None)
     out, _err, provider = cutout.remove_background(
-        lit_sweep(), timeout_s=1, skip=["cloth-seg"])
+        lit_sweep(), timeout_s=1,
+        strategies=["cloth-seg", "gemini-mask"], skip=["cloth-seg"])
     assert provider == "gemini-mask" and out is not None
     assert "cloth-seg" not in providers["calls"]
+
+
+def test_the_default_chain_is_the_free_one(providers):
+    """THE COST SETTING. Unasked, only cloth-seg runs — no paid call is made.
+
+    MID-000132 is what this stops: a photograph cloth-seg could not cut walked
+    six paid attempts across the other three strategies, four views over, and
+    produced no cut-out at all."""
+    providers["answers"]["cloth-seg"] = (None, "cloth-seg declined")
+    out, _err, _provider = cutout.remove_background(lit_sweep(), timeout_s=1)
+    assert out is None, "nothing usable, and nothing is written"
+    assert providers["calls"] == ["cloth-seg"], providers["calls"]
+
+
+def test_banning_the_only_funded_strategy_runs_nothing(providers):
+    """Honest rather than silently expensive: with cloth-seg skipped and no
+    replacement named there is no chain left, and saying so beats quietly
+    falling back to the paid ones."""
+    out, err, provider = cutout.remove_background(
+        lit_sweep(), timeout_s=1, skip=["cloth-seg"])
+    assert out is None and provider == "none" and "excluded" in err
+    assert providers["calls"] == []
 
 
 def test_an_unknown_strategy_name_is_said_rather_than_ignored(providers):
@@ -447,6 +498,102 @@ def test_the_podium_coming_off_is_not_garment_loss():
     d.rectangle((170, 620, 430, 690), fill=(240, 240, 240))     # the podium, kept
     ok, why = cutout.garment_kept(encode(old), transparent())
     assert ok is True, why
+
+
+def _zoomed(data: bytes, back=(235, 235, 235)) -> bytes:
+    """The same cut-out CROPPED TO ITS GARMENT and scaled back out.
+
+    What `fitToCanvas` leaves behind, and what MID-000650's FRONT is: the source
+    RATIO is preserved, so `replace_ratio_tolerance` passes it, and only the
+    scale has changed.
+    """
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    px = im.load()
+    xs = [x for x in range(im.width) for y in range(0, im.height, 4)
+          if px[x, y] != back]
+    ys = [y for y in range(im.height) for x in range(0, im.width, 4)
+          if px[x, y] != back]
+    box = (min(xs), min(ys), max(xs) + 1, max(ys) + 1)
+    # Pad the crop back out to the source ratio, then rescale to the source size.
+    crop = im.crop(box)
+    w = max(crop.width, int(round(crop.height * im.width / im.height)))
+    h = max(crop.height, int(round(w * im.height / im.width)))
+    canvas = Image.new("RGB", (w, h), back)
+    canvas.paste(crop, ((w - crop.width) // 2, (h - crop.height) // 2))
+    return encode(canvas.resize((im.width, im.height), Image.Resampling.LANCZOS))
+
+
+def test_a_zoomed_incumbent_does_not_beat_a_correctly_framed_replacement():
+    """MID-000650, and the reason the zoom could never be repaired.
+
+    Everything in `garment_kept` counts PIXELS, which assumes both cut-outs
+    frame the garment alike. A zoomed incumbent does not: its garment covers
+    three times the canvas, so the correct replacement reads as "66% less
+    garment" and is refused — and `scale_check`, which asks for the re-cut, and
+    this guard, which refuses it, deadlock on exactly the products that need it.
+
+    Measured on the real pair: the one on file held 0.3285 of its frame, the
+    cloth-seg replacement 0.1113, and the product's own known-good BACK 0.1175.
+    """
+    correct = composited()
+    zoom = _zoomed(correct)
+    ok, why = cutout.garment_kept(zoom, correct)
+    assert ok is True, why
+    # The verdict says the scale was cancelled, and the ordinary rules then ran
+    # on the common frame — it is not a bypass.
+    assert "same garment at" in why and "common frame" in why
+    assert "KEPT" not in why
+
+
+def test_a_rescale_that_also_ate_the_shirt_back_is_still_refused():
+    """THE CONTROL. The scale escape must not become a way in for damage: a
+    piece missing from the garment is missing from its OUTLINE too, so the
+    shapes stop matching and the refusal stands."""
+    zoom = _zoomed(composited())
+    ok, why = cutout.garment_kept(zoom, transparent("back"))
+    assert ok is False, why
+    assert "KEPT" in why
+
+
+def test_a_rescale_that_cut_into_a_strap_is_still_refused():
+    zoom = _zoomed(composited())
+    ok, why = cutout.garment_kept(zoom, transparent("strap"))
+    assert ok is False, why
+
+
+def test_the_same_scale_still_goes_through_the_pixel_comparison():
+    """The escape is for a CHANGE of scale only. Two cut-outs framed alike are
+    compared exactly as before, or it would swallow every real loss."""
+    ok, why = cutout.garment_kept(composited(), transparent("back"))
+    assert ok is False and "less garment" in why
+    assert "common frame" not in why, "nothing was rescaled; say nothing about it"
+
+
+def test_a_loss_is_not_mistaken_for_a_zoom():
+    """THE DISCRIMINATOR, stated as a test. A zoom scales both axes alike; a
+    mask that ate the shirt back shortens one. Measured at 448px: reframings
+    0.973 and 0.990, losses 0.561 and 0.567 — so `_rescaled` must decline both
+    losses outright, whatever their overall scale."""
+    import io as _io
+    import numpy as np
+    from PIL import Image as _Image
+    from app.imaging import cutouts as _cutouts
+    from app.config import policy as _policy
+
+    cfg = _cutouts.config(_policy())
+
+    def mask_of(data: bytes):
+        img = _Image.open(_io.BytesIO(data)).convert("RGBA")
+        img = img.resize((448, int(448 * img.height / img.width)), _Image.LANCZOS)
+        return _cutouts.garment_mask(img, cfg)[0]
+
+    ccfg = cutout.config()
+    zoom, comp = _zoomed(composited()), composited()
+    assert cutout._rescaled(mask_of(zoom), mask_of(comp), ccfg) is not None, \
+        "a genuine reframing must be recognised"
+    for missing in ("back",):
+        assert cutout._rescaled(mask_of(zoom), mask_of(transparent(missing)), ccfg) is None, \
+            f"a lost {missing} is not a reframing, whatever the scale says"
 
 
 def test_two_cutouts_of_different_frames_are_not_compared():

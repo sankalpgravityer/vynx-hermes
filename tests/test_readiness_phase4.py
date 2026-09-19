@@ -611,7 +611,22 @@ STAND_LEFT = GateVerdict("ok", soft=["CUTOUT DEFECT — FRONT cut-out: stand vis
 BG_KEPT = "--- summary ---\n  cut-outs written : 0\n  originals kept   : 1\n  failed           : 0\n"
 
 
-def test_mid_000521_a_stand_left_in_is_re_cut_by_a_different_segmenter(wired, monkeypatch):
+def test_mid_000521_a_stand_left_in_is_re_cut_by_a_different_segmenter(
+        wired, monkeypatch):
+    """The mechanism, against a policy that funds the mask strategies.
+
+    Both of them are paid calls and the shipped default no longer lists any
+    (19 Sep 2026, `imagery.cutout.strategies`), so this asks the question of a
+    config that does — otherwise it would be testing the price, not the
+    behaviour. `test_a_stand_is_left_alone_when_nothing_can_remove_it` covers
+    what actually ships."""
+    # `cutout.config()` reads app.config.policy directly, not the chain's, so
+    # the module it actually consults is the one to patch.
+    from app.imaging import cutout as _cutout
+
+    funded = {**_cutout.config(None),
+              "leftover_strategies": ["gemini-mask", "openai-mask"]}
+    monkeypatch.setattr(_cutout, "config", lambda pol=None: funded)
     _photo_sequence(monkeypatch, STAND_LEFT, PHOTO_OK)
     bg = _record_bg_removal(monkeypatch, wired)
     r = _repair(apply=True, approve=True)
@@ -621,6 +636,20 @@ def test_mid_000521_a_stand_left_in_is_re_cut_by_a_different_segmenter(wired, mo
     note = step(r, "rematte")["note"]
     assert "with gemini-mask, openai-mask — the same segmenter would return the same cut" in note
     assert r["rematte"]["strategies"] == ["gemini-mask", "openai-mask"]
+
+
+def test_a_stand_is_left_alone_when_nothing_can_remove_it(wired, monkeypatch):
+    """WHAT SHIPS. No paid strategy is funded, so the stand stays and the step
+    says why — rather than re-cutting with cloth-seg, which is the segmenter
+    that left the stand in and would hand back the same picture."""
+    _photo_sequence(monkeypatch, STAND_LEFT, PHOTO_OK)
+    bg = _record_bg_removal(monkeypatch, wired)
+    r = _repair(apply=True, approve=True)
+    assert bg == [], "no segmenter call, paid or free"
+    note = step(r, "rematte")["note"]
+    assert "left the existing cut-outs alone" in note
+    assert "leftover_strategies" in note
+    assert r["rematte"]["skipped"] == "no leftover strategy configured"
 
 
 def test_a_collar_the_mask_ate_keeps_the_default_chain(wired, monkeypatch):
