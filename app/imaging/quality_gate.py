@@ -187,11 +187,22 @@ class GateVerdict:
         return asdict(self)
 
     def summary(self) -> str:
-        """One line for the step note and the run log."""
+        """One line for the step note and the run log.
+
+        `review` CARRIES TWO DIFFERENT FACTS and printed one sentence for both.
+        The action means "this is a person's call", which covers the provider
+        being unreachable AND a verdict the gate reached perfectly well but may
+        not act on — CATEGORY_IMAGE_MISMATCH is the second kind. Reading
+        "could not decide — the render shows tank top but the product is filed
+        under 'Casual Dress'" sends the reader looking for a broken check when
+        the check worked. So the head follows the evidence: no answer is "could
+        not decide", an answer nobody may act on unattended is "needs a person".
+        """
         head = {
             "ok": "passed",
             "regen": "REFUSED",
-            "review": "could not decide",
+            "review": ("could not decide" if self.unavailable or not self.code
+                       else "needs a person"),
             "skipped": "skipped",
         }.get(self.action, self.action)
         parts = [head]

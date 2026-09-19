@@ -154,8 +154,18 @@ OUT_OF_ORDER = [AI_URL, PORTAL_URL, BOOTH_URL]
 
 
 def _record(**over: Any) -> dict[str, Any]:
+    # `Outerwear > Jackets`, not `Jackets > Jackets`.
+    #
+    # The old path was not one the taxonomy holds — `Jackets` is a SUBCATEGORY
+    # under `Outerwear`, never a category — so this fixture carried a standing
+    # TAX.002. That was invisible while nothing read it, and became three
+    # failures the moment the copy step learned to withhold on exactly that
+    # finding (docs/RECONCILE-CORRUPTION.md §2.3). These tests are about whether
+    # the copy step FIRES, so their product has to be one the rules are content
+    # with; leaving it broken would have meant weakening the guard to keep a
+    # typo working.
     base = {"id": PID, "tenantId": "t1", "gender": ["men"], "masterCategory": "Men",
-            "category": "Jackets", "subCategory": "Jackets", "size": "M", "brand": "Zara",
+            "category": "Outerwear", "subCategory": "Jackets", "size": "M", "brand": "Zara",
             "color": "Black", "sizingGuide": None, "updatedAt": None,
             "title": "Vintage Zara Black Jacket Men M", "summary": "A jacket.",
             "images": list(IN_ORDER), "mediaManualOrder": False}
@@ -424,3 +434,39 @@ def test_the_flagged_lists_carry_ids_per_fix_and_the_commands():
     assert fl["rematte"] == ["a"] and fl["copy"] == ["a"] and fl["regen"] == ["b"] and fl["reorder"] == []
     assert fl["counts"] == {"rematte": 1, "regen": 1, "reorder": 0, "copy": 1}
     assert set(fl["commands"]) == {"rematte", "regen", "reorder", "copy"}
+
+
+def test_the_copy_is_withheld_while_the_record_still_misdescribes_the_garment(wired):
+    """The 18 September 2026 corruption, at the step that made it visible.
+
+    `reconcile` wrote `category: 'hoodie'` on an Adidas t-shirt; TAX.002 rejected
+    it on the next line of the same run; `copy` then fired on "category changed"
+    and produced "Vintage Adidas Deep Burgundy Hoodie Women S". The title is
+    generated FROM the taxonomy, so regenerating it against a record the rules
+    have already refused cannot repair anything — it only describes the wrong
+    product convincingly, and a wrong title is far harder to spot than a wrong
+    `subCategory`.
+
+    The triggers still fire here. The step is withheld in spite of them, which is
+    the whole point: this is not "nothing changed", it is "something changed and
+    it is not safe to write about it yet".
+    """
+    wired["world"]["before"] = _record(subCategory="hoodie",
+                                       title="Vintage Zara Black Jacket Men XL")
+    r = _repair(apply=True)
+    s = step(r, "copy")
+
+    assert s["ran"] is False
+    assert "TAX.003" in s["why"] or "TAX.002" in s["why"]
+    assert "describe the wrong product" in s["why"]
+    assert r["copy"]["withheld"]
+    assert scripts_run(wired["calls"], "regenerate-copy.ts") == []
+
+
+def test_a_record_the_rules_are_content_with_still_regenerates(wired):
+    """The guard narrows the copy step, it does not switch it off."""
+    wired["world"]["before"] = _record(title="Vintage Zara Black Jacket Men XL")
+    r = _repair(apply=False)
+    s = step(r, "copy")
+    assert s["ran"] is not False or "would regenerate" in s.get("note", "")
+    assert not r["copy"].get("withheld")

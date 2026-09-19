@@ -164,6 +164,62 @@ def test_a_part_the_model_lists_as_missing_counts_even_when_it_called_the_cutout
     assert _decide(raw).soft == ["CUTOUT DEFECT — FRONT cut-out: stand visible; hem missing"]
 
 
+# The leftovers, measured. MID-000591 FRONT (18 Sep 2026) reported a hanger on
+# a cut-out with no hanger in it, because the prompt asked whether one was
+# there and never how much of it. §1.2 of docs/PICTURE-CHECK-FIXES.md.
+
+def test_mid_000591_a_hanger_hook_at_the_neckline_is_slight_and_never_a_defect():
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": False, "issue": "hanger visible", "missing_parts": [],
+                        "leftovers": [{"part": "hanger", "extent": "slight"}]}
+    v = _decide(raw)
+    assert v.action == "ok" and v.soft == [] and v.reasons == []
+    assert v.bad_cutouts == [] and pa.rematte_views(v, POL) == []
+    # The measurement outranks the issue line: "no leftovers at all" and
+    # "hanger visible" in the same answer is the model contradicting itself,
+    # and only one half of it was asked how much.
+    raw["images"][0]["leftovers"] = []
+    assert _decide(raw).soft == []
+    # What is struck out is the leftover, not the rest of the sentence.
+    raw["images"][0] = {"index": 1, "ok": False, "issue": "hook at collar, collar cut away",
+                        "missing_parts": [], "leftovers": [{"part": "hook", "extent": "slight"}]}
+    assert _decide(raw).soft == ["CUTOUT DEFECT — FRONT cut-out: collar cut away"]
+
+
+def test_mid_000521_a_stand_under_the_garment_is_clear_and_still_a_cutout_defect():
+    """The case the threshold has to keep: all four cut-outs stand on a podium,
+    and the vision check was the only thing that ever caught it (§1.1)."""
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": True, "issue": "", "missing_parts": [],
+                        "leftovers": [{"part": "stand", "extent": "clear"}]}
+    v = _decide(raw)
+    assert v.soft == ["CUTOUT DEFECT — FRONT cut-out: stand visible"]
+    assert v.bad_cutouts == ["FRONT"] and pa.rematte_views(v, POL) == ["FRONT"]
+    # Named in the issue line already: said once, not twice.
+    raw["images"][1] = {"index": 2, "ok": False, "issue": "hanger and stand visible", "missing_parts": [],
+                        "leftovers": [{"part": "hanger", "extent": "clear"},
+                                      {"part": "stand", "extent": "clear"}]}
+    assert _decide(raw).soft[1] == "CUTOUT DEFECT — BACK cut-out: hanger and stand visible"
+    # A slight one beside a clear one does not water the clear one down.
+    raw["images"][1]["leftovers"][0]["extent"] = "slight"
+    assert _decide(raw).bad_cutouts == ["FRONT", "BACK"]
+
+
+def test_leftovers_are_read_on_a_cutout_and_nowhere_else():
+    """A render's duplicated hand and a photograph shot on its hanger are other
+    questions — the threshold must not quietly answer them too."""
+    raw = _raw()
+    raw["images"][3] = {"index": 4, "ok": False, "issue": "the model's hand is duplicated",
+                        "missing_parts": [], "leftovers": [], "face_visible": True}
+    assert _decide(raw).reasons == ["RENDER DEFECT — AI_BACK render: the model's hand is duplicated"]
+    pol = {**POL, "photo_audit": {"gallery": {"block": True}}}
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": False, "issue": "hanger still in frame",
+                        "missing_parts": [], "leftovers": []}
+    v = _decide(raw, pol=pol, media=RAW_ONLY)
+    assert v.reasons == ["IMAGE DEFECT — FRONT photo: hanger still in frame"]
+
+
 def test_a_render_refused_on_its_own_answer_is_not_refused_twice_for_the_odd_model():
     v = _decide(_raw7(bad=[(7, "shows a different model")], same_model=False, odd=[7]), media=MEDIA_FIVE)
     assert v.reasons == ["RENDER DEFECT — AI_CLOSEUP render: shows a different model"]
@@ -208,8 +264,14 @@ MEDIA_FIVE = [m for m in MEDIA if m["view"] != "AI_FRONT_34"] + [
 ]
 
 
-def _raw7(bad=(), wear="none", confidence=0.9, same_model=True, odd=()):
+def _raw7(bad=(), wear="none", confidence=0.9, same_model=True, odd=(), faces=None):
+    """`faces` = the 1-based indexes whose render shows a face, as the model
+    answers it. None leaves `face_visible` out entirely — an answer cached
+    under the schema before 18 Sep 2026."""
     images = [{"index": i, "ok": i not in dict(bad), "issue": dict(bad).get(i, "")} for i in range(1, 8)]
+    if faces is not None:
+        for e in images:
+            e["face_visible"] = e["index"] in faces
     return {"wear": wear, "wear_confidence": confidence, "defects": [], "images": images,
             "same_model": same_model, "odd_renders": list(odd)}
 
@@ -237,6 +299,51 @@ def test_same_model_needs_a_majority_to_compare_with_else_it_is_a_soft_note():
     # An index that is a photograph, or out of range, is ignored.
     v = _decide(_raw7(same_model=False, odd=[1, 99, "x"]), media=MEDIA_FIVE)
     assert v.action == "ok" and v.bad_views == []
+
+
+# Faces only, 18 Sep 2026. MEDIA_FIVE's renders are images 3–7: AI_FRONT,
+# AI_BACK, AI_FRONT_34, AI_BACK_34, AI_CLOSEUP. Three of those can show a face;
+# the two back views cannot, and every false positive this question ever made
+# was one of them (BOA-006151 → [4, 6], BOA-006153 → [7]). §1.4.
+
+def test_same_model_is_judged_across_the_renders_with_a_face_and_no_others():
+    # MID-000569's close-up: a face, a different woman, still caught.
+    v = _decide(_raw7(same_model=False, odd=[7], faces=[3, 5, 7]), media=MEDIA_FIVE)
+    assert v.action == "regen" and v.code == "RENDER_DEFECT"
+    assert v.bad_views == ["AI_CLOSEUP"] and pa.regen_views(v, POL) == ["AI_CLOSEUP"]
+    # Two of the three faces called odd is no majority — and the two faceless
+    # renders do not pad the population into one (2 of 5 would have flagged).
+    v = _decide(_raw7(same_model=False, odd=[5, 7], faces=[3, 5, 7]), media=MEDIA_FIVE)
+    assert v.action == "ok" and v.bad_views == []
+    assert any("may not all show the same model" in s for s in v.soft)
+    # Only two faces in the whole set: nobody to hold a majority. Under the old
+    # rule this was 1 odd of 5 renders and a re-render of AI_FRONT_34.
+    v = _decide(_raw7(same_model=False, odd=[5], faces=[3, 5]), media=MEDIA_FIVE)
+    assert v.action == "ok" and v.bad_views == [] and v.soft == []
+
+
+def test_boa_006151_odd_renders_may_not_name_a_render_with_no_face():
+    v = _decide(_raw7(same_model=False, odd=[4, 6], faces=[3, 5, 7]), media=MEDIA_FIVE)
+    assert v.action == "ok" and v.reasons == [] and v.bad_views == []
+    # Not even softly: the note would be the line on the page this exists to
+    # clear, and the comparison behind it was made on hair and build.
+    assert v.soft == [] and pa.regen_views(v, POL) == []
+    # No face anywhere in the set — the question is simply not answered.
+    v = _decide(_raw7(same_model=False, odd=[4], faces=[]), media=MEDIA_FIVE)
+    assert v.action == "ok" and v.bad_views == [] and v.soft == []
+
+
+def test_a_cached_answer_with_neither_new_field_still_decides():
+    """An answer stored before the 18 Sep schema has no `leftovers` and no
+    `face_visible`. It is judged the way it was written: no leftovers to
+    threshold, the face unknown, so every render is compared as before."""
+    raw = _raw7(bad=[(1, "hanger visible")], same_model=False, odd=[7])
+    assert all("leftovers" not in e and "face_visible" not in e for e in raw["images"])
+    v = _decide(raw, media=MEDIA_FIVE)
+    assert v.action == "regen" and v.code == "RENDER_DEFECT"
+    assert v.soft == ["CUTOUT DEFECT — FRONT cut-out: hanger visible"]
+    assert v.reasons == ["RENDER DEFECT — AI_CLOSEUP render: a different model than the other renders"]
+    assert v.bad_cutouts == ["FRONT"] and v.bad_views == ["AI_CLOSEUP"]
 
 
 def test_mid_000253_the_smeared_knees_on_a_view_the_gate_never_sees_re_render_that_view_alone():

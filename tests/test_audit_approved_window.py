@@ -143,12 +143,31 @@ def test_judged_now_a_clean_pass_leaves_only_soft_flags_and_no_never_judged_code
     assert "clutter" in next(i for i in issues if i["code"] == "PHOTO_AUDIT_SOFT_FLAGS")["detail"]
 
 
-def test_judged_now_but_the_provider_was_down_stays_never_judged():
+def test_judged_now_but_the_provider_was_down_is_its_own_finding():
+    """An outage is a fault in the RUN, and says nothing about the product.
+
+    Two things it must not be confused with, which is the whole point of giving
+    it a code of its own:
+
+      * a refusal. `unavailable` is not a verdict, so GATE_WOULD_REFUSE stays out.
+      * `NO_GATE_RECORD` / `NO_PHOTO_AUDIT`, which mean "nobody ever judged
+        this" — history a reader discounts. A sheet where the provider was down
+        for every product then reads as an ordinary backlog of unjudged ones,
+        and that is exactly what happened on 18 Sep 2026 when `google-genai` was
+        missing from the environment: 393 products, no refusals, nothing in the
+        summary to say the pictures had not actually been looked at.
+
+    HIGH, because an unchecked picture on an approved product is the thing this
+    report exists to find.
+    """
     judged = {"gate": {"action": "review", "code": "VISION_UNAVAILABLE", "reasons": ["429"], "unavailable": True},
               "photos": {"action": "skipped", "code": None, "reasons": ["could not run — 429"]}}
     issues = _assess(agent={**AGENT_OK, "deltas": {}}, judged=judged)
-    assert codes(issues) == ["NO_GATE_RECORD", "NO_PHOTO_AUDIT"]
-    assert all("could not judge now" in i["detail"] for i in issues)
+    assert codes(issues) == ["PICTURES_COULD_NOT_BE_JUDGED", "PICTURES_COULD_NOT_BE_JUDGED"]
+    assert all(i["severity"] == "high" for i in issues)
+    assert {i["detail"].split(" could not run")[0] for i in issues} == {"image gate", "photo audit"}
+    assert all("429" in i["detail"] for i in issues)
+    assert "PICTURES_COULD_NOT_BE_JUDGED" in aw.MEANING
 
 
 def test_pictures_on_file_incomplete_renders_no_label_unmatted_and_lead():

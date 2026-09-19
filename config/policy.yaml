@@ -189,6 +189,53 @@ garment_families:
   adjacent:
     - ["tops", "outerwear"]
 
+# --------------------------------------------------------------------------- #
+# Filing the garment from its photographs — app/resolver.py resolve_taxonomy
+#
+# TAX.002 and TAX.003 read COLUMNS: is the category under the master, is the
+# subcategory under the category. Both pass on a path that is structurally
+# perfect and describes the wrong garment. MID-000615 is a tank top filed under
+# `Women > Dresses > Casual Dress`; that path exists in the tenant's tree, so
+# nothing fired, while the quality gate raised CATEGORY_IMAGE_MISMATCH and
+# returned `review` — a hold with no repair behind it, on every run, forever.
+#
+# So the tenant's own `{category: [subcategory]}` under the product's master is
+# now SENT WITH the vision call that was already happening, and the model picks
+# a pair from it. No extra call: the images are attached either way and this
+# costs output tokens.
+#
+# The answer is validated against the tree before anything is written — a reply
+# that is not in the list is dropped, never proposed. That is the one field
+# where an off-catalog value has already done damage (18 Sep 2026:
+# `category: 'hoodie'` on an Adidas t-shirt, republished as a "Deep Burgundy
+# Hoodie" by the copy step).
+# --------------------------------------------------------------------------- #
+taxonomy_from_picture:
+  enabled: true
+  # ASK EVEN WHEN NO RULE ASKED. This is the cost decision, and it cannot be
+  # avoided: a garment filed under a category that EXISTS raises no finding, so
+  # waiting for one means waiting forever. MID-000615's record is otherwise
+  # clean — the whole planner block is behind `if findings:` and it reached none
+  # of it.
+  #
+  #   true   every product with a garment photograph and a tree to choose from.
+  #          Free on any product that already triggered the vision call (same
+  #          call, same images, more output tokens); one cached Gemini call
+  #          otherwise, once per `llm.cache.ttl_hours`.
+  #   false  only alongside a question some rule already raised — cheaper, and
+  #          blind to exactly the case this block exists for.
+  always_ask: true
+  # ABOVE `confidence.llm_apply_threshold` (0.85), deliberately. That floor is
+  # for one field; this writes two at once, and a wrong pair costs a re-render
+  # as well — `classify_garment_type` picks the render prompt's framing off the
+  # category, so a tank top filed as a dress is RENDERED as a dress. Its own
+  # knob so it can be raised without moving every other AI write with it.
+  #
+  # The photo audit read MID-000615's garment at 0.90 and the quality gate at
+  # 0.70, which is roughly the spread to expect; 0.9 keeps the confident
+  # readings and sends the hesitant ones to a person as a `propose`.
+  min_confidence: 0.9
+
 guardrails:
   # Fields the LLM is NEVER allowed to write directly. It may only supply
   # evidence; the deterministic resolver computes the final value.
@@ -216,6 +263,38 @@ guardrails:
     - bin_barcode
     - lpn_code
     - sku
+
+# --------------------------------------------------------------------------- #
+# Rules that are reported but never decide anything.
+#
+# Same keys and values as the tenant's own `AutoApprovalConfig.severityOverrides`
+# (see app/approval.py:apply_severity_overrides) — `RULE` or `RULE:field`, valued
+# with a severity name or one of ignore/off/none/skip. This block is the DEFAULT
+# layer underneath that one: a tenant that sets its own entry for the same key
+# still wins, so nothing here can override a deliberate per-tenant decision.
+#
+# MATERIAL AND GRADE, 18 Sep 2026. Neither is a condition of approval at VNYX.
+# Material is a fibre string that arrives from the care label and is very often
+# a spelling the tenant's `/material-settings` list has not absorbed yet; grade
+# is the operator's own judgement of the garment in their hand, which no check
+# here is in a position to overrule. Both were holding products whose data and
+# pictures were otherwise correct, so they stop being findings rather than
+# staying visible as noise nobody acts on.
+#
+# Removing an entry brings the rule straight back — nothing else was changed.
+rules:
+  severity_overrides:
+    # Grade: condition ↔ grade sync, Grade A with defects, Grade C/D without.
+    GRADE.001: ignore
+    GRADE.002: ignore
+    GRADE.003: ignore
+    # Material: not in the tenant's list, a paragraph where a fibre belongs,
+    # and the two "required field" rules SCOPED TO MATERIAL ONLY — DATA.001 and
+    # DATA.010 each cover ten fields, and a missing category must keep blocking.
+    ATTR.003: ignore
+    TEXT.005: ignore
+    DATA.001:material: ignore
+    DATA.010:material: ignore
 
 taxonomy:
   Men:
@@ -451,12 +530,113 @@ imagery:
     # vision model, and only when use_llm is on.
     ambiguous_border_max_stddev: 26.0
 
+  # --- making the cut-out (app/imaging/cutout.py) -----------------------------
+  #
+  # Everything Hermes decides while PRODUCING a cut-out, as against judging one
+  # that already exists (`readiness.cutouts`). Items 6, 7 and 8 of
+  # docs/PICTURE-CHECK-FIXES.md.
+  cutout:
+    # The long edge every pixel comparison below is made on. 448 to match
+    # `readiness.cutouts.garment_check.work_width`: the two ask the same
+    # question of the same garment and a different grid would give them
+    # different answers about the same picture.
+    work_px: 448
+
+    # --- item 7: the set the segmenter left behind ---------------------------
+    #
+    # `_kept_backdrop` used to abstain whenever the SOURCE's border was not one
+    # colour — "source border is not uniform (spread 71), not checked" — which
+    # is every studio sweep with uneven lighting, so the check written for a
+    # surviving podium was off exactly where podiums are. Hermes returned
+    # `ok: true` on the Nike booth photograph (`fc8e53e7`) with the whole
+    # podium still in the cut-out (§1.1).
+    #
+    # It now falls back to the CUT-OUT's own backdrop, which is flat by
+    # construction — this module writes (255,255,255,0) under full transparency
+    # — and counts the pixels the segmenter KEPT that are that colour and lie
+    # outside the garment's outline. A podium is white, kept, and not garment.
+    #
+    # Measured on that cut-out at the 448px grid, against the same picture with
+    # the podium taken off:
+    #
+    #                            largest region   scattered   bottom band
+    #   as cloth-seg cut it           1.70%         2.94%        31.9%
+    #   podium removed                0.01%         0.02%         0.0%
+    leftover_region_max: 0.01
+    # THE BOTTOM BAND, SEPARATELY, BECAUSE A PODIUM IS ALWAYS THERE. Of the
+    # KEPT region's own rows, not the frame's — on `fc8e53e7` the frame's
+    # bottom rows are transparent, the podium ends three quarters of the way
+    # down the picture.
+    leftover_bottom_fraction: 0.10
+    leftover_bottom_max: 0.25
+    # A white shirt on a white backdrop reads as backdrop everywhere and every
+    # kept pixel would look like a podium, so at least this much of what was
+    # kept has to differ from the backdrop before the question may be put at
+    # all. Below it the measurement is `unknown` and NOTHING is refused — the
+    # rule §0 sets for every derived mask.
+    leftover_garment_min: 0.50
+    leftover_min_clear: 0.02
+
+    # --- item 6: a leftover is fixed with a DIFFERENT segmenter --------------
+    #
+    # Re-matting a stand with cloth-seg produces the same stand: it is a
+    # clothing parser, the podium is directly beneath the clothing, and its
+    # mask runs at 320px. Measured on the same Nike tee — cloth-seg removed the
+    # hanger and the form's neck and kept the whole podium; a matting model
+    # removed the podium and kept the hanger. Neither is right alone, so the
+    # re-matte asks these and INTERSECTS the answer with cloth-seg, which
+    # leaves the garment parser deciding what is cloth.
+    #
+    # Empty this list to send every re-matte back through the default chain.
+    leftover_strategies: ["gemini-mask", "openai-mask"]
+    intersect_cloth: true
+
+    # --- item 8: a replacement is never worse than what it replaces ----------
+    #
+    # KIL-001625's re-matte cut away a large part of the shirt back and
+    # KIL-001644's cut into a strap, and both damaged replacements went live:
+    # the chain re-mattes through `backfill-bg-removal.ts --replace`, which
+    # supersedes the old row, and every measurement Hermes had ran AFTER that.
+    # So the new cut-out's garment is compared against the one it would
+    # supersede — both segmented against their own flat backdrop, which is the
+    # reliable segmentation (§0) as against the lit wall in the photograph
+    # (§1.3) — and a worse one is refused before the bytes are handed back.
+    #
+    # How much less garment it may have. Two segmenters honestly disagree about
+    # a hem or a feathered edge by a percent or two; a lost shirt back is a
+    # different order of magnitude.
+    replace_area_drop_max: 0.10
+    # …and the same defect when it is too small to move the total: one strap.
+    # A SINGLE PIECE this big, missing and touching the garment's edge, is
+    # refused on its own. Opened by `replace_open_px` first, because the thin
+    # rim two segmenters always differ by is one connected region around the
+    # whole outline and would otherwise read as a missing strap every time.
+    replace_loss_region_max: 0.02
+    replace_open_px: 5
+    # Two cut-outs of different shapes are not the same picture measured twice.
+    # Beyond this the replacement is not judged, and therefore not refused.
+    replace_ratio_tolerance: 0.05
+
   # --- generation -------------------------------------------------------------
   generation:
-    # "Nano Banana Pro". Pinned to the same id services/banana-nano.ts uses:
-    # renders from the two paths land in the same gallery, so a model change on
-    # one side alone makes backfilled products visibly different.
-    model: "gemini-3-pro-image-preview"
+    # "Nano Banana Pro" was `gemini-3-pro-image-preview`, pinned to the same id
+    # services/banana-nano.ts uses: renders from the two paths land in the same
+    # gallery, so a model change on one side alone makes backfilled products
+    # visibly different. THAT IS NOW TRUE — vnyx-api still renders on the Pro
+    # model, and this only changes what the Hermes chain produces.
+    #
+    # 18 Sep 2026: switched to `gemini-3.1-flash-image` for cost. Half the price
+    # at the same resolution — 1,120 output tokens either way, $0.067 against
+    # $0.134 — and measured at the same speed: 39.0s against 39.2s on
+    # MID-000253's AI_FRONT_34, rendered both ways through /v1/imagery/generate,
+    # which stores nothing.
+    #
+    # One product, one view, so this is a trial rather than a calibration. On
+    # that sample flash was the better of the two: it reproduced the woman in
+    # the product's existing AI_FRONT, while the Pro model drew a different one.
+    # Both drew the garment correctly. Revert this line if a class of garment
+    # comes back worse.
+    model: "gemini-3.1-flash-image"
     # EMPTY ON PURPOSE: one Gemini attempt, then a different vendor.
     #
     # These other Gemini names DO sometimes render a garment the primary refuses —
@@ -693,7 +873,17 @@ photo_audit:
   enabled: true
   required: false
   wear:
-    enabled: true
+    # OFF, 18 Sep 2026 — grade is not a condition of approval (see the
+    # `rules.severity_overrides` block above, which retires GRADE.001-003 for the
+    # same reason). With this false the wear question still appears in the schema
+    # and comes back `unknown`, `decide()` skips the comparison entirely, and no
+    # GRADE_SUSPECT can be raised.
+    #
+    # It costs nothing to leave off. The two images this pass selected are the
+    # FRONT and BACK cut-outs, which the gallery pass below picks up anyway and
+    # the selector deduplicates by URL — so the vision call carries the same
+    # pictures either way. Set true to bring the grade comparison back.
+    enabled: false
     views: ["FRONT", "BACK"]
     max_images: 2
     disagreement_steps: 2
@@ -711,12 +901,26 @@ photo_audit:
     # The re-render is paid and counts against readiness.max_regenerations_per_run.
     # Also fired when one render shows a DIFFERENT person than the others
     # (the `same_model` question): that view is re-rendered against them.
+    #
+    # 18 Sep 2026: `same_model` is judged on FACES ALONE — the model answers
+    # `face_visible` per render and only the renders with a face are compared.
+    # A back view or a detail crop is never odd. BOA-006151 (AI_BACK,
+    # AI_BACK_34) and BOA-006153 (AI_CLOSEUP) were false positives on renders
+    # with no face in them; MID-000569's close-up had one and is still caught.
     render_defects: regen
     # rematte | hold | soft — what a defective CUT-OUT becomes: a collar or
     # sleeve the mask cut away, a stand or hand left in (MID-000569: the
     # sweater's neckband missing from both FRONT cut-outs). `rematte` re-cuts
     # it from the raw archive through the chain's rematte step (CUTOUT_DEFECT —
     # a flag while readiness.cutouts.hold is soft, a hold once it is block).
+    #
+    # 18 Sep 2026: a leftover — hanger, hook, stand, podium, hand — is MEASURED
+    # (`leftovers`, extent none|slight|clear) and only `clear` is a defect. A
+    # hook tip at a neckline is `slight`, recorded and never flagged
+    # (MID-000591 FRONT reported a hanger that was not in the frame);
+    # MID-000521's podium under all four cut-outs is `clear` and still holds.
+    # No switch: a leftover below the bar is not a policy question, it is an
+    # answer the check should never have been giving.
     cutout_defects: rematte
   # null = llm.model_fast.
   model: null
@@ -848,6 +1052,58 @@ readiness:
     # BOA-006175, -006127, -006166 before this was settled. That is not zoom.
     # A crop to the garment changes the ratio, and is.
     canvas_tolerance: 0.02
+    # THE RATIO TEST ABOVE CANNOT SEE A ZOOM, and that is what `garment_check`
+    # is for: the cut-out compared with the PHOTOGRAPH it was cut from
+    # (app/imaging/cutouts.py garment_hole). Downloads the original; ~0.5s of
+    # numpy per view.
+    #
+    #   framing  AUTO (19 Sep 2026). The cut-out's garment against the
+    #            PHOTOGRAPH's garment at the same coordinates. It asks a lit
+    #            studio wall where the garment is, and a wall close to the
+    #            garment's own colour cannot say: BOA-006151's garment sits 15
+    #            from its backdrop, BOA-006153's 23 and MID-000521's 55 against
+    #            a tolerance of 40, so correct cut-outs scored 60.9%, 75.7% and
+    #            73.2% and were held as CUTOUT_UNFIXABLE; only the pair with a
+    #            separation of 204 cleared 90%.
+    #
+    #            IT WAS TURNED OFF ENTIRELY AND THAT REMOVED THE CHECK. The
+    #            replacement, `box_fill_max`, needs the garment's bounding box
+    #            to cover 90% of the frame, which on a portrait canvas means 90%
+    #            of its WIDTH — a garment never is. MID-000615's FRONT cut-out
+    #            is zoomed, scored 0.805, covers 30.8% of its frame, and passed
+    #            every remaining test.
+    #
+    #            So the separation is now MEASURED (`garment_hole.separation`)
+    #            and the test judges only above `min_separation`. Below it the
+    #            answer is unknown, and `scale_check` is what covers that band.
+    #            docs/PICTURE-CHECK-FIXES.md §1.3. `false` restores the retired
+    #            behaviour; `true` judges regardless of the wall.
+    #   loss     garment-coloured pixels missing at the neckline: the mask ate
+    #            the collar. Re-cut.
+    #   residue  OFF. It called a brighter patch of the studio wall a display
+    #            form, and flagged correct cut-outs of garments hanging open on
+    #            a hanger (KLE-000124 at 5.6% and 4.7%, KLE-000045 at 0.9%).
+    #            The measurement is still recorded on the row; the test needs a
+    #            separator that works before it can be trusted again.
+    garment_check:
+      enabled: true
+      residue_check: false
+      alignment_check: auto
+      # Above every measured false positive (15, 23, 55), far below the one
+      # sound judgement (204).
+      min_separation: 90
+    # THE ZOOM TEST THAT NEEDS NO PHOTOGRAPH. One garment, one canvas, one
+    # booth: two views should cover comparable fractions of their frames, so a
+    # cut-out standing `max_area_ratio` times its smallest sibling was cropped
+    # to the garment and scaled back up. MID-000615: FRONT 0.3078 against BACK
+    # 0.0894 — 3.4x the area, ~1.9x linear. The smallest is the reference
+    # because a zoom only ever enlarges. Silent when every cut-out on the
+    # product is zoomed by the same amount; that case is `framing` above.
+    scale_check:
+      enabled: true
+      min_views: 2
+      max_area_ratio: 2.2
+      min_reference_area: 0.02
     # A cut-out whose garment touches this many of its four edges (outermost
     # pixel line, `edge_touch_min_fraction` of it) was cut to its bounding box.
     crop_edges_touched: 4
@@ -855,6 +1111,38 @@ readiness:
     # A pixel on that line is garment only this far (RGB) from the backdrop:
     # edge vignetting and compression noise sit 15-25 off it and are not a hem.
     edge_rgb_tolerance: 40
+    # THE SAME CROP AFTER `fitToCanvas` PADDED IT BACK OUT to the source ratio,
+    # which the edge test above cannot see and the ratio test never could:
+    # KLE-000028's FRONT is 896×1195 on a 3000×4000 photograph — the identical
+    # 0.750 ratio — with the trousers 1.4× larger and touching no edge. The
+    # fraction of its OWN frame the garment's bounding box may cover. 0.90
+    # because a booth capture always leaves margin: BOA-006127's shirt reaches
+    # the left and right edges (in the original too) but only ~0.6 of the
+    # height, so its box covers ~0.6 and it is not touched, while a crop covers
+    # 1.00 and a padded crop within a few percent of it. Needs no photograph —
+    # which is why it replaced the overlap test. docs/PICTURE-CHECK-FIXES.md §2.
+    box_fill_max: 0.90
+    # THE GARMENT'S SHAPE IS DERIVED, NOT ASSUMED (§0). Every cut-out vnyx-api
+    # stores is fully opaque, composited on rgb(235,235,235) — 0.0% alpha-clear
+    # on MID-000521, MID-000591, BOA-006151 and BOA-006153 — so `alpha > 128`
+    # selected the whole frame and every geometric measurement built on it was
+    # measuring the frame. The alpha is read only when some of the picture is
+    # genuinely clear (`mask_alpha_min_clear`; Hermes' own output is 50-80%
+    # clear, a composited one 0.0%); otherwise the garment is segmented against
+    # the cut-out's OWN backdrop, taken from its four corners — flat and uniform
+    # by construction, unlike the raw photograph's lit wall. The corners and not
+    # the border ring because the ring is the garment's colour whenever the
+    # garment crosses it. A mask covering less than `mask_min_fraction` or more
+    # than `mask_max_fraction` of the frame is not a garment: the measurement is
+    # `unknown` and nothing is flagged from it.
+    mask_alpha_min_clear: 0.02
+    mask_alpha_threshold: 128
+    mask_corner_fraction: 0.04
+    # Tight — 24 against the 40 the raw photograph needs — because this backdrop
+    # was painted, not lit.
+    mask_rgb_tolerance: 24
+    mask_min_fraction: 0.005
+    mask_max_fraction: 0.95
     # Decision 1: the tenant's `background` setting wins; this when unset.
     # Mirrors vnyx-api's resolveMatteBackdrop, which is what the re-matte
     # applies — the check and the fix must agree.

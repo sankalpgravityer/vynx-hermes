@@ -331,6 +331,10 @@ def wired(monkeypatch):
         calls["judge"] += 1
         return verdicts[i]
 
+    # Pinned for the reason test_readiness_phase3.py's fixture spells out: the
+    # option probe is a live HTTP call to VNYX_API_URL, and an unpinned one
+    # makes these tests pass or fail on whether a server is running locally.
+    monkeypatch.setattr(rp, "remote_supports", lambda *names: True)
     monkeypatch.setattr(rp, "needs", fake_needs)
     monkeypatch.setattr(rp, "run_step", fake_run_step)
     monkeypatch.setattr(rp, "approve_check", fake_approve_check)
@@ -592,6 +596,69 @@ def test_a_dry_run_names_the_cut_out_it_would_re_cut(wired, monkeypatch):
 def test_a_whole_gallery_skips_the_re_cut(wired):
     r = _repair(apply=True)
     assert step(r, "rematte")["ran"] is False and "every cut-out whole" in step(r, "rematte")["why"]
+
+
+# --------------------------------------------------------------------------- #
+# Items 6 and 8 of docs/PICTURE-CHECK-FIXES.md, where the chain sends them
+# --------------------------------------------------------------------------- #
+
+# MID-000521's own words, on all four of its cut-outs (§1.1). The re-matte for
+# this one has to ask a DIFFERENT segmenter: cloth-seg is a clothing parser,
+# the podium is directly beneath the clothing, so re-running it returns the
+# same podium and the same verification passes it again.
+STAND_LEFT = GateVerdict("ok", soft=["CUTOUT DEFECT — FRONT cut-out: stand visible at bottom"],
+                         bad_cutouts=["FRONT"], lead_view="FRONT")
+BG_KEPT = "--- summary ---\n  cut-outs written : 0\n  originals kept   : 1\n  failed           : 0\n"
+
+
+def test_mid_000521_a_stand_left_in_is_re_cut_by_a_different_segmenter(wired, monkeypatch):
+    _photo_sequence(monkeypatch, STAND_LEFT, PHOTO_OK)
+    bg = _record_bg_removal(monkeypatch, wired)
+    r = _repair(apply=True, approve=True)
+    args = bg[0]
+    assert args[args.index("--bg-strategies") + 1] == "gemini-mask,openai-mask"
+    assert "--keep-better" in args and "--replace" in args
+    note = step(r, "rematte")["note"]
+    assert "with gemini-mask, openai-mask — the same segmenter would return the same cut" in note
+    assert r["rematte"]["strategies"] == ["gemini-mask", "openai-mask"]
+
+
+def test_a_collar_the_mask_ate_keeps_the_default_chain(wired, monkeypatch):
+    """A second segmenter is not the answer to a missing garment part."""
+    _photo_sequence(monkeypatch, CUTOUT_BAD, PHOTO_OK)
+    bg = _record_bg_removal(monkeypatch, wired)
+    r = _repair(apply=True, approve=True)
+    assert "--bg-strategies" not in bg[0] and "--keep-better" in bg[0]
+    assert r["rematte"]["strategies"] is None
+
+
+def test_kil_001625_a_refused_replacement_says_the_original_was_kept(wired, monkeypatch):
+    """§2.1: the damaged replacement is not stored, and the row says so.
+
+    The cut-out on the page is the one that was already there, so the audit
+    flags the same defect again — and without this sentence that reads as a
+    re-cut which did not help, and the product comes back next run to be cut
+    exactly the same way.
+    """
+    _photo_sequence(monkeypatch, CUTOUT_BAD, CUTOUT_BAD)
+    calls: list[list[str]] = []
+    inner = rp.run_step
+
+    def outer(vnyx_api, script, args, *, timeout_s, quiet, results_name=None):
+        if script == "backfill-bg-removal.ts":
+            calls.append(list(args))
+            return True, BG_KEPT, None
+        return inner(vnyx_api, script, args, timeout_s=timeout_s, quiet=quiet,
+                     results_name=results_name)
+
+    monkeypatch.setattr(rp, "run_step", outer)
+    r = _repair(apply=True, approve=True)
+    note = step(r, "rematte")["note"]
+    assert r["rematte"]["kept"] == 1 and r["rematte"]["written"] == 0
+    assert "ORIGINAL WAS KEPT" in note
+    assert "a further re-cut will not clear it" in note
+    assert "STILL flagged after the re-cut" in note
+    assert r["approval"]["outcome"] == "would_approve"          # soft, as before
 
 
 def test_render_defects_switched_to_soft_never_re_render(wired, monkeypatch):

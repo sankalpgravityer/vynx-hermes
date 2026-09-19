@@ -62,14 +62,85 @@ def gather_evidence(p: ProductSnapshot, findings: list[Finding],
     # care label was photographed is exactly the case worth asking about — the
     # label carries brand, material and size — and gating on `p.images` alone
     # skipped it silently.
-    if (p.images or p.care_label_urls) and (fields_touched & visual_fields):
-        ev.vision = llm.audit_images(p, _claims(p))
+    if (p.images or p.care_label_urls) and (
+        (fields_touched & visual_fields) or wants_taxonomy(p, pol)
+    ):
+        ev.vision = llm.audit_images(p, _claims(p), taxonomy_options(p, pol))
 
     if p.description and ({"description", "title"} & fields_touched or ids & {"TEXT.004"}):
         ev.text_verdicts = llm.audit_description(p, _claims(p))
 
     ev.llm_calls = getattr(llm, "calls", 0)
     return ev
+
+
+def wants_taxonomy(p: ProductSnapshot, pol: dict[str, Any] | None) -> bool:
+    """Should the vision call carry the taxonomy question, with no rule asking?
+
+    THE WHOLE POINT, AND THE REASON IT CANNOT BE FINDING-DRIVEN. Every other
+    question this layer asks is raised by a rule first: a finding names a field,
+    `fields_touched` picks it up, the call is made. A garment filed under a
+    category that EXISTS IN THE TREE raises no finding at all — TAX.002 and
+    TAX.003 read columns and both are correct about MID-000615's
+    `Women > Dresses > Casual Dress`. So waiting for a rule means waiting
+    forever, and the question has to be asked on its own account.
+
+    Which makes it a real cost decision rather than a free ride, and `always_ask`
+    is where it is made:
+
+      true   ask on every product that has a garment photograph and a tree to
+             choose from. This is what "the field is never empty and never wrong"
+             actually requires, and on any product that already triggered the
+             vision call it is free — same call, same images, more output tokens.
+             On a clean product it is one cached Gemini call, once per
+             `llm.cache.ttl_hours`.
+      false  ask only alongside a question some rule already raised, which is the
+             behaviour before this existed: cheaper, and blind to exactly the
+             case above.
+
+    A care label alone is not enough — `p.images` is required. Filing a garment
+    from a photograph of its wash tag is not a question worth paying for.
+    """
+    cfg = (pol or {}).get("taxonomy_from_picture") or {}
+    if not cfg.get("enabled", True) or not cfg.get("always_ask", True):
+        return False
+    return bool(p.images) and bool(taxonomy_options(p, pol))
+
+
+def taxonomy_options(p: ProductSnapshot, pol: dict[str, Any] | None) -> dict[str, list[str]]:
+    """`{category: [subcategory, ...]}` the picture may be filed under, or `{}`.
+
+    THE TENANT'S OWN TREE, NARROWED TO THE PRODUCT'S MASTER CATEGORY. Narrowed
+    because the master is the anchor everything else hangs off (readiness phase
+    1): a Women's product filed under a Men's category is a different, already
+    detected fault, and offering the whole tree invites the model to move the
+    product across roots on the strength of a photograph — which is precisely
+    what `readiness.master.photo_check` refuses to let a picture do.
+
+    EMPTY WHEN THERE IS NO MASTER, and that is deliberate rather than a
+    fallback to the whole tree. With no anchor there is no answer to narrow to,
+    the master planner escalates the product anyway
+    (MASTER_CATEGORY_UNRESOLVED), and asking the question would spend output
+    tokens on a suggestion nothing may act on.
+
+    Empty also when the feature is off in policy, so the prompt drops the whole
+    section and the call returns to exactly its previous shape.
+    """
+    cfg = (pol or {}).get("taxonomy_from_picture") or {}
+    if not cfg.get("enabled", True):
+        return {}
+    if not (p.catalog and p.catalog.categories and p.master_category):
+        return {}
+    # The tenant's own spelling of the root, matched loosely — 'WOMEN' and
+    # 'Women' are the same root, and `decide_master` already treats them so.
+    from app.readiness import flat
+
+    want = flat(p.master_category)
+    for root, branch in p.catalog.categories.items():
+        if flat(root) == want:
+            return {str(cat): [str(s) for s in (subs or [])]
+                    for cat, subs in (branch or {}).items()}
+    return {}
 
 
 def _claims(p: ProductSnapshot) -> dict[str, Any]:

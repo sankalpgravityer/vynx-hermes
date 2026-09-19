@@ -265,6 +265,86 @@ def vnyx_api_url() -> str | None:
     return (os.getenv("VNYX_API_URL") or "").rstrip("/") or None
 
 
+# What the step runner said it accepts, cached for the process. `None` means not
+# asked yet; an empty set means asked and it would not say. The sentinel below
+# means there was nobody to ask because the steps are spawned locally.
+_LOCAL_TRANSPORT = "*local*"
+_REMOTE_OPTIONS: set[str] | None = None
+
+
+def remote_options() -> set[str]:
+    """The option names this deployment of vnyx-api accepts.
+
+    `GET /internal/auto-approval/ping` has listed them since readiness phase 2,
+    precisely so a Hermes about to send an option the server does not know can
+    tell before the 400. Nothing consulted it until now.
+
+    It matters because `--bg-strategies` and `--keep-better` (items 6 and 8 of
+    docs/PICTURE-CHECK-FIXES.md) are sent by the chain but land on a vnyx-api
+    whose `backfill-bg-removal.ts` does not take them yet. Without this probe the
+    first re-matte of every run dies on a 400 halfway through the chain — after
+    the master, matte and reconcile steps have already written.
+
+    Failing open is not available here. `--keep-better` is the guard that stops a
+    re-matte STORING a cut-out worse than the one it replaces (KIL-001625 lost a
+    large part of a shirt back exactly that way), so dropping it silently and
+    re-cutting anyway is the one outcome worse than not re-cutting at all. The
+    caller's answer is to skip the re-matte and say so.
+
+    Never raises: a ping that fails answers "nothing", which is the same
+    conservative branch as an old server.
+    """
+    global _REMOTE_OPTIONS
+    if _REMOTE_OPTIONS is not None:
+        return _REMOTE_OPTIONS
+
+    base = vnyx_api_url()
+    if not base:
+        # LOCAL TRANSPORT: there is no schema to answer 400, because the step is
+        # a spawn of the checkout's own script. Nothing can be asked and nothing
+        # needs to be — an argument the script does not know is a flag it does
+        # not read, not a rejected request. So this reports the sentinel and
+        # `remote_supports` lets the call through, leaving the checkout's
+        # currency to whoever maintains the checkout.
+        _REMOTE_OPTIONS = {_LOCAL_TRANSPORT}
+        return _REMOTE_OPTIONS
+
+    import httpx
+
+    try:
+        r = httpx.get(
+            f"{base}/internal/auto-approval/ping",
+            headers={"x-internal-secret": os.getenv("AUTO_APPROVAL_INTERNAL_SECRET", "")},
+            timeout=20,
+        )
+        body = r.json() if r.status_code == 200 else {}
+        _REMOTE_OPTIONS = {str(o) for o in (body.get("options") or [])}
+    except Exception:  # noqa: BLE001 — a probe that cannot run is not a failure
+        _REMOTE_OPTIONS = set()
+    return _REMOTE_OPTIONS
+
+
+def remote_supports(*options: str) -> bool:
+    """May the chain send these options?
+
+    VETOES ONLY ON POSITIVE EVIDENCE. False is returned in exactly one case: a
+    server answered the ping, listed the options it takes, and one of these was
+    not on the list. That is the case that would 400 mid-chain, and it is the
+    only one worth stopping for.
+
+    Everything else is a yes — the local transport, where there is no request to
+    reject; and a ping that did not answer, because a server that cannot be
+    reached will not run the step either, and inventing a skip for it would
+    replace a clear connection error with a misleading "left the cut-outs
+    alone". A guess in either direction is wrong here, so this only acts on what
+    it was actually told.
+    """
+    known = remote_options()
+    if not known or _LOCAL_TRANSPORT in known:
+        return True
+    return all(o in known for o in options)
+
+
 def run_remote(script: str, args: list[str], *, timeout_s: int,
                quiet: bool) -> tuple[bool, str, dict[str, Any] | None]:
     """Ask vnyx-api to run one step. Returns (ok, output, results).
@@ -311,14 +391,46 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
     # the intended order of operations.
     if "--replace" in args:
         options["replace"] = True
-    # Which on-model views to (re)generate (readiness phase 4). A closed enum
-    # on the server; sent as a list, never as a comma string.
+    # WHICH SEGMENTERS THE RE-MATTE MAY ASK (item 6 of
+    # docs/PICTURE-CHECK-FIXES.md). Sent as a list of the names
+    # app/imaging/cutout.py defines (`STRATEGY_NAMES`) and validated against a
+    # closed enum on the server, like `views` below — the rule that nothing
+    # from a request becomes a free-form argv value holds here too. vnyx-api
+    # forwards them to /v1/imagery/remove-background as `strategies`.
+    if "--bg-strategies" in args:
+        options["bgStrategies"] = [
+            s.strip()
+            for s in args[args.index("--bg-strategies") + 1].split(",")
+            if s.strip()
+        ]
+    # DO NOT REPLACE A CUT-OUT WITH A WORSE ONE (item 8). The script sends the
+    # cut-out being superseded to Hermes as `previous_url`, and writes nothing
+    # when Hermes answers `kept_existing`. Both options need the vnyx-api
+    # deploy that carries them; before it the strict body schema answers 400
+    # and the step fails loudly, which is the same order of operations
+    # `--replace` itself went through and is preferable to a silent no-op that
+    # would let the KIL-001625 damage through again.
+    if "--keep-better" in args:
+        options["keepBetter"] = True
+    # `--views` MEANS TWO DIFFERENT THINGS, and the script decides which.
+    #
+    # On backfill-imagery.ts it is the on-model views to (re)generate —
+    # AI_FRONT and friends (readiness phase 4). On backfill-bg-removal.ts it is
+    # the GARMENT views to re-cut, FRONT and BACK. Both are closed enums on the
+    # server and they do not overlap, so sending one under the other's key is a
+    # 400: "Invalid enum value. Expected 'AI_FRONT' | ... , received 'FRONT'".
+    #
+    # Keyed off the script rather than off the values, because guessing from
+    # the content would quietly pick a key for an unknown view instead of
+    # failing where the mistake is.
     if "--views" in args:
-        options["views"] = [
+        picked = [
             v.strip().upper()
             for v in args[args.index("--views") + 1].split(",")
             if v.strip()
         ]
+        key = "matteViews" if script == "backfill-bg-removal.ts" else "views"
+        options[key] = picked
     # The copy step's two halves (readiness phase 5). Neither flag means both.
     if "--title" in args:
         options["title"] = True
@@ -561,6 +673,80 @@ def _generation_in_flight(state: dict[str, Any]) -> bool:
 # The chain
 # --------------------------------------------------------------------------- #
 
+# ATTRIBUTES THAT DO NOT JUSTIFY A VISION CALL ON THEIR OWN.
+#
+# `material` is the case this exists for. It is missing on most of the catalogue,
+# and the bulk extractor only recovers it when the fibre composition happens to be
+# printed legibly on the tag — the three BOAS products checked most recently were
+# all "missing material" with two care labels each. A seventeen-field pass costs
+# 60-250 seconds and a paid vision call, and usually returns "Unknown" anyway,
+# which the placeholder list then reads as still empty. Material is not a
+# condition of approval either (`rules.severity_overrides` in policy.yaml), so
+# the call buys nothing on any axis.
+#
+# Brand and size are NOT in here and should not be: they are on every tag, and
+# the narrow care-label pass reads them cheaply and better.
+#
+# `--infer` overrides it. That flag means "look at the garment, not just the
+# label", which is the one way material is sometimes recoverable, so asking for
+# it explicitly is asking for this too.
+#
+# MODULE LEVEL so `needs()` (live) and `needs_from()` (fixture) read the SAME
+# set. While this lived inside the chain runner the offline report promised an
+# `extract` step on a product whose only gap was material — a step the live run
+# then skipped, so the fixture and the chain disagreed about the same record.
+NOT_WORTH_EXTRACT = frozenset({"material"})
+
+# The rules that say "this record does not describe this garment".
+#
+# NAMED ONE BY ONE, not matched on a `TAX.` prefix. The first version of this did
+# use the prefix and swept in TAX.005 and TAX.007, which are about the MANNEQUIN
+# RIG — a rendering choice the title never mentions. A product with no rig
+# configured would then have had its copy withheld forever, which is the opposite
+# of the point: this guard exists to stop ONE specific failure, not to stop the
+# copy step working.
+#
+#   TAX.001-004   the master category, category or sub-category is not one the
+#                 tenant's tree holds, or they disagree with the gender
+#   GENDER.001    the gender itself is inconsistent
+#   SIZE.011      the sizing guide belongs to the other gender
+#   DRIFT.001     the column and its `properties` twin disagree about one of them
+#
+# These are exactly the fields the generated title is written from. A price, a
+# care label or a missing rig says nothing about whether the title describes the
+# garment, so none of them withholds the copy.
+_COPY_BLOCKING_RULES = frozenset({
+    "TAX.001", "TAX.002", "TAX.003", "TAX.004",
+    "GENDER.001", "SIZE.011", "DRIFT.001",
+})
+
+
+def _blocking_taxonomy(snap: Any) -> list[Any]:
+    """Findings that mean the record misdescribes the garment.
+
+    NO SEVERITY FLOOR, and that is deliberate. The first version required HIGH,
+    borrowing the approval gate's own bar, and it let TAX.003 through — an
+    invalid SUB-category, which the rules rank MEDIUM because it needs a
+    reviewer's eye rather than stopping the product. But the title is generated
+    from the sub-category, so a MEDIUM TAX.003 still produces a title naming a
+    garment type this tenant's catalogue does not have.
+
+    Severity answers "should this stop an approval". The question here is
+    different and narrower: "does the record still misdescribe the garment". The
+    rule list above already answers it, so ranking it a second time only
+    reintroduces the gap.
+
+    Run against the STORED record — a step can report success and leave the field
+    unwritten, so a check that trusted the plan would clear a product whose
+    repair never landed.
+    """
+    from app.rules import run_all
+    from app.rules import gate as gate_rules
+
+    pol = policy()
+    return [f for f in run_all(snap, pol) + gate_rules.check_gate(snap, pol)
+            if str(f.rule_id) in _COPY_BLOCKING_RULES]
+
 # --------------------------------------------------------------------------- #
 # Offline: fixtures
 # --------------------------------------------------------------------------- #
@@ -642,7 +828,11 @@ def run_fixture(path: Path, *,
     # here). The live chain measures; the fixture reads what is on the rows.
     if state["unmatted"] or any(rid in ("IMG.026", "IMG.027") for rid in gate["findings"]):
         would.append("matte")
-    if state["description_missing"] or state["attributes_missing"]:
+    # Same test the live chain makes — a gap the extractor is not worth calling
+    # for (material) must not appear here as a step that would run.
+    if state["description_missing"] or (
+        set(state["attributes_missing"]) - NOT_WORTH_EXTRACT
+    ):
         would.append("extract")
     if state["care_label"] and any(a in ("brand", "size") for a in state["attributes_missing"]):
         would.append("care label")
@@ -1035,7 +1225,42 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
         args = [*common, *live, *force]
         if replace:
-            args.append("--replace")
+            # `--keep-better` beside `--replace`, always (item 8 of
+            # docs/PICTURE-CHECK-FIXES.md). `replaceWithDerived` supersedes the
+            # old row and cannot be undone, so "is the new one at least as
+            # complete" has to be asked BEFORE the swap; Hermes answers it from
+            # the two cut-outs' garments, each segmented against its own flat
+            # backdrop, and writes nothing when the answer is no.
+            #
+            # A server that cannot take the guard does not get the replace. Not
+            # the other way round: re-cutting without it is how KIL-001625 lost a
+            # large part of its shirt back, and a silent downgrade to the unsafe
+            # call is worse than leaving the existing cut-out alone.
+            if not remote_supports("keepBetter"):
+                matte_state["replace_skipped"] = "vnyx-api does not accept keepBetter"
+                # NAME THE DEFECT IN THE REFUSAL. Without this the note said only
+                # that the re-cut was declined, so a reader learned the chain
+                # could not act and never learned WHAT it had found — the
+                # measurement was on the row in the JSON and nowhere a person
+                # would look. A refusal that hides its own finding reads as the
+                # check having found nothing.
+                return ("left the existing cut-outs alone — this vnyx-api cannot take "
+                        "--keep-better, and re-cutting without it can store a cut-out "
+                        "worse than the one it replaces. STILL WRONG, unrepaired: "
+                        + "; ".join(fixable or cutout_before.reasons))
+            args.extend(["--replace", "--keep-better"])
+            # ONLY THE VIEWS THAT ARE WRONG. `--replace` on its own redoes every
+            # covered view, so a product with one defective cut-out paid for two
+            # segmenter calls and had a sound picture re-cut for no reason — and
+            # the note above already said "re-matte FRONT" while both were being
+            # redone, which made the log a poor guide to what had happened.
+            #
+            # Gated like `keepBetter`: a deployment that cannot take the option
+            # keeps the old whole-product behaviour rather than losing the
+            # re-matte over it. The guard is what may never be dropped; this is
+            # an economy.
+            if remote_supports("matteViews"):
+                args.extend(["--views", ",".join(replace)])
             matte_state["replaced"] = True
         ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args,
                               timeout_s=600, quiet=quiet)
@@ -1059,11 +1284,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         #
         # So the summary the script already prints is parsed, and a step that
         # wrote nothing while failing something says so.
-        written = failed = None
+        written = failed = kept = None
         for line in (out or "").splitlines():
             low = line.lower()
             if "cut-outs written" in low:
                 written = _trailing_int(line)
+            elif "kept" in low and ":" in line:
+                kept = _trailing_int(line)
             elif "failed" in low and ":" in line:
                 failed = _trailing_int(line)
         if failed and not written:
@@ -1075,6 +1302,15 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         note = ("would " if not apply else "") + "; ".join(parts)
         if failed:
             note += f' ({written} written, {failed} FAILED)'
+        if kept:
+            # NOT A FAILURE, AND IT MUST NOT READ AS ONE (item 8). Every
+            # candidate was a real cut-out; each had less garment than the one
+            # already on file, so nothing was replaced and the picture the
+            # catalog shows is unchanged. Said out loud because the alternative
+            # — a defect on record with no explanation — is what queues the
+            # product to be sent through the identical re-matte next run.
+            note += (f' ({kept} view(s): the re-matte lost part of the garment, so the '
+                     f'ORIGINAL CUT-OUT WAS KEPT — re-cutting it again will do the same)')
 
         # THE RE-CHECK. Every fix is followed by the check that asked for it
         # (§4, principles): the cut-outs are measured again from the rows the
@@ -1164,26 +1400,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             raise StepFailed("extraction returned non-zero")
         return "read the care label" + (" and the cut-outs" if infer else "")
 
-    # ATTRIBUTES THAT DO NOT JUSTIFY A VISION CALL ON THEIR OWN.
-    #
-    # `material` is the case this exists for. It is missing on most of the
-    # catalogue, and the bulk extractor only recovers it when the fibre
-    # composition happens to be printed legibly on the tag — the three BOAS
-    # products checked most recently were all "missing material" with two care
-    # labels each. A seventeen-field pass costs 60-250 seconds and a paid vision
-    # call, and usually returns "Unknown" anyway, which the placeholder list
-    # then reads as still empty.
-    #
-    # Brand and size are NOT in here and should not be: they are on every tag,
-    # and the narrow care-label pass below reads them cheaply and better.
-    #
-    # `--infer` overrides it. That flag means "look at the garment, not just the
-    # label", which is the one way material is sometimes recoverable, so asking
-    # for it explicitly is asking for this too.
-    _NOT_WORTH_EXTRACT = {"material"}
-
+    # See NOT_WORTH_EXTRACT at module level for why material is in it, and why
+    # this set has to be the same one `needs_from()` reads.
     missing = set(state["attributes_missing"])
-    worth_extracting = missing if infer else missing - _NOT_WORTH_EXTRACT
+    worth_extracting = missing if infer else missing - NOT_WORTH_EXTRACT
 
     want_extract = state["description_missing"] or worth_extracting
     # Everything still missing that ONLY the care-label pass below can do better.
@@ -1615,40 +1835,82 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # clear stays a flag. Skipped when the matte step re-cut this product this
     # run already: the same segmenter would return the same cut.
     rematte_report: dict[str, Any] = {"attempted": False, "views": [], "written": None,
-                                      "failed": None, "after": None}
+                                      "failed": None, "kept": None, "strategies": None,
+                                      "after": None}
 
     def _cutout_defects(v: Any) -> str:
         return "; ".join(r for r in [*v.reasons, *v.soft] if str(r).startswith("CUTOUT DEFECT"))
 
     def _rematte() -> str:
         nonlocal photo_verdict, cutout_verdict
+        from app.imaging import cutout as _cutout
         from app.imaging import photo_audit
 
         views = photo_audit.rematte_views(photo_verdict, policy())
         why = _cutout_defects(photo_verdict)
-        rematte_report.update({"attempted": True, "views": views})
+        # A DIFFERENT SEGMENTER, NOT THE SAME ONE (item 6 of
+        # docs/PICTURE-CHECK-FIXES.md). Which one depends on what is wrong:
+        #
+        #   something LEFT IN   a stand, a hanger, a hand. cloth-seg is a
+        #                       clothing parser and the podium is directly
+        #                       beneath the clothing, so re-running it returns
+        #                       the same podium and the same verification
+        #                       passes it again — which is exactly why
+        #                       MID-000521 carried "stand visible at bottom" on
+        #                       all four cut-outs through every repair run. The
+        #                       mask strategies are asked instead, and Hermes
+        #                       intersects their answer with cloth-seg so the
+        #                       garment parser still decides what is cloth.
+        #   something MISSING   a collar, a strap, part of a back. The default
+        #                       chain, because cloth-seg is still the best first
+        #                       answer for what IS the garment and a mask
+        #                       strategy is not more likely to find the collar.
+        plan = _cutout.rematte_strategies(why)
+        rematte_report.update({"attempted": True, "views": views, "strategies": plan})
         if not apply:
+            tail = (f"; asking {', '.join(plan)} instead of the default chain, because "
+                    f"something was left in rather than cut out" if plan else "")
             return (f"would re-cut {', '.join(views)} from the raw archive ({why}); "
-                    f"the photo audit would judge the new cut-outs")
+                    f"the photo audit would judge the new cut-outs{tail}")
+
+        # Same rule as the matte step: no guard, no re-cut. A re-matte is the one
+        # place that DELIBERATELY supersedes a live cut-out, so it is the last
+        # place to accept a best-effort call.
+        need = {"keepBetter": "--keep-better"}
+        if plan:
+            need["bgStrategies"] = "--bg-strategies"
+        if not remote_supports(*need):
+            missing = ", ".join(need.values())
+            rematte_report["skipped"] = f"vnyx-api does not accept {missing}"
+            return (f"left the existing cut-outs alone — this vnyx-api cannot take "
+                    f"{missing}; re-cutting without them either stores a worse "
+                    f"cut-out or asks the same segmenter that left this in")
 
         provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
-        args = [*common, *live, *(["--provider", provider] if provider else []), "--replace"]
+        args = [*common, *live, *(["--provider", provider] if provider else []),
+                "--replace", "--keep-better"]
+        if plan:
+            args.extend(["--bg-strategies", ",".join(plan)])
         ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args,
                               timeout_s=600, quiet=quiet)
         if not ok:
             raise StepFailed("background removal returned non-zero")
-        written = failed = None
+        written = failed = kept = None
         for line in (out or "").splitlines():
             low = line.lower()
             if "cut-outs written" in low:
                 written = _trailing_int(line)
+            elif "kept" in low and ":" in line:
+                kept = _trailing_int(line)
             elif "failed" in low and ":" in line:
                 failed = _trailing_int(line)
-        rematte_report.update({"written": written, "failed": failed})
+        rematte_report.update({"written": written, "failed": failed, "kept": kept})
         if failed and not written:
             raise StepFailed(f"background removal produced no cut-outs ({failed} image(s) "
                              f"failed). The segmenter is unreachable or timing out.")
         note = f"re-cut {', '.join(views)} from the raw archive ({why})"
+        if plan:
+            note += f" with {', '.join(plan)} — the same segmenter would return the same cut"
         if failed:
             note += f" ({written} written, {failed} FAILED)"
 
@@ -1662,7 +1924,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             vision_unavailable.append("photos")
             raise StepFailed(note + " — vision unavailable on the second look: "
                              + "; ".join(second.reasons))
-        if photo_audit.rematte_views(second, policy()):
+        still = bool(photo_audit.rematte_views(second, policy()))
+        if still:
             note += (" — STILL flagged after the re-cut: " + _cutout_defects(second)
                      + (" (holds as CUTOUT_DEFECT)" if second.blocks
                         else " (soft — readiness.cutouts.hold)"))
@@ -1670,6 +1933,17 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             note += " — photo audit again: passed"
         else:
             note += f" — photo audit again: {photo_audit.summary(second)}"
+        if kept:
+            # THE PICTURE ON THE PAGE IS THE ONE THAT WAS ALREADY THERE (item
+            # 8): the replacement had less garment than it and was refused, so
+            # nothing changed. Said out loud, and said harder when the audit is
+            # still flagging — otherwise the row reads as a re-cut that did not
+            # help and the product comes back through the same step next run to
+            # be cut the same way, which is the loop §2.1 exists to break.
+            note += (f"; {kept} view(s) were NOT replaced — the new cut-out lost part of the "
+                     f"garment and the ORIGINAL WAS KEPT"
+                     + (", so this defect is the one that was already on file and a further "
+                        "re-cut will not clear it" if still else ""))
         return note
 
     from app.imaging import photo_audit as _pa
@@ -1967,8 +2241,35 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         changed_fields, text_rules = _copy_triggers()
         copy_report["changed"], copy_report["rules"] = changed_fields, text_rules
         copy_report["triggers"] = [*(f"{f} changed" for f in changed_fields), *text_rules]
-        copy_why = ("" if copy_report["triggers"]
-                    else "nothing the title or description reads changed, and the copy agrees with the record")
+        # NEVER DESCRIBE DATA THE RULES HAVE ALREADY REJECTED.
+        #
+        # The title is generated FROM the taxonomy, gender and size. If those are
+        # still blocking after `reconcile` ran, regenerating the copy does not
+        # repair anything — it launders a known-bad record into prose and makes
+        # the damage much harder to see, because a wrong title reads as a real
+        # product while a wrong `subCategory` reads as a bug.
+        #
+        # 18 Sep 2026 is the case. `reconcile` wrote `category: 'hoodie'` on an
+        # Adidas t-shirt and TAX.002 rejected it on the next line; `copy` then
+        # ran on "category changed" and produced "Vintage Adidas Deep Burgundy
+        # Hoodie Women S". Same run: "Men's/Unisex" on one product, a New Balance
+        # title that stopped naming New Balance on another.
+        #
+        # Checked against the STORED record after reconcile, not against the plan
+        # — a step can report success and leave the field unwritten.
+        blocking_now = sorted({
+            f.rule_id for f in _blocking_taxonomy(_snapshot_now())
+        })
+        if not copy_report["triggers"]:
+            copy_why = ("nothing the title or description reads changed, "
+                        "and the copy agrees with the record")
+        elif blocking_now:
+            copy_report["withheld"] = blocking_now
+            copy_why = (f'the record still fails {", ".join(blocking_now)} — the title is '
+                        f'generated from those fields, so regenerating it now would only '
+                        f'describe the wrong product convincingly')
+        else:
+            copy_why = ""
     step("copy", copy_why, _copy)
 
     # ---- 5. approve -------------------------------------------------------
@@ -2217,9 +2518,17 @@ def report(r: dict[str, Any]) -> None:
                     [*(after_p.get("reasons") or []), *(after_p.get("soft") or [])])
         outcome_txt = ("not re-judged (dry run)" if not after_p
                        else "STILL flagged" if still else "photo audit again: passed")
+        if rem.get("kept"):
+            # The one outcome that is neither a fix nor a failure (item 8): the
+            # replacement had less garment than what is on file and was
+            # refused, so the picture is unchanged and nothing should re-queue
+            # it. Said on the line a person actually reads.
+            outcome_txt += f' — ORIGINAL KEPT on {rem["kept"]} view(s), the re-cut lost garment'
+        asked = "for CUTOUT_DEFECT" + (
+            " with " + ", ".join(rem["strategies"]) if rem.get("strategies") else "")
+        good = bool(after_p) and not still and not rem.get("kept")
         print(f'    {"re-cut":14} {paint(", ".join(rem.get("views") or []) or "nothing", DIM)} '
-              f'{paint("for CUTOUT_DEFECT", DIM)}  '
-              f'{paint(outcome_txt, GREEN if after_p and not still else YELLOW)}')
+              f'{paint(asked, DIM)}  {paint(outcome_txt, GREEN if good else YELLOW)}')
 
     unfix = r.get("unfixable") or {}
     if unfix:

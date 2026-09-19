@@ -48,10 +48,36 @@ the renderer is handed the product's stored personality and its AI_FRONT as the
 reference (`gallery.render_defects: regen`; `hold` makes it a person's decision,
 `soft` the old flag). A cut-out or photograph that is not what its slot says
 stays `IMAGE_DEFECT` under `gallery.block`: nothing re-renders a photograph.
+
+TWO OF THESE QUESTIONS CARRY A THRESHOLD RATHER THAN A YES/NO (18 Sep 2026,
+items 4 and 5 of docs/PICTURE-CHECK-FIXES.md). Both were yes/no questions the
+model could only answer by guessing, and both produced flags a person then had
+to go and disprove:
+
+  LEFTOVERS   "a stand, hanger or hand left in the picture is a defect too"
+              asked nothing about how much, so MID-000591 FRONT reported a
+              hanger on a cut-out with none in it. Now measured per image —
+              `leftovers: [{part, extent}]`, extent none|slight|clear — and
+              only `clear` is a defect. MID-000521's podium is what `clear`
+              means; a hook tip at a collar is `slight` and rides in the
+              record without a flag.
+  THE MODEL   `same_model` was asked across every render, so a back view was
+              compared on hair and build. Every false positive (BOA-006151's
+              AI_BACK and AI_BACK_34, BOA-006153's AI_CLOSEUP) was a faceless
+              render. Now `face_visible` is asked per render and the
+              comparison is drawn across those alone — MID-000569's close-up,
+              which had a face and a different woman in it, is still caught.
+
+Both are one schema revision because each one invalidates the photo-audit
+cache for every product (~$0.009 a head). `decide()` still reads an answer
+cached under the older schema: no `leftovers` key means no leftovers, no
+`face_visible` means the face is unknown, and each falls back to the behaviour
+that answer was written under rather than failing.
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from app.imaging.quality_gate import GateVerdict
@@ -108,8 +134,72 @@ SCHEMA: dict[str, Any] = {
                             "empty for a render or an unprocessed photograph."
                         ),
                     },
+                    # 18 Sep 2026, MID-000591 FRONT: "hanger visible" on a
+                    # cut-out with no hanger in it. The prompt said "a stand,
+                    # hanger or hand left in the picture is a defect too" and
+                    # set no threshold, so a hook tip at the neckline — or a
+                    # shadow read as one — satisfied the sentence. So the
+                    # leftover is now MEASURED, not merely named: only `clear`
+                    # is a defect, `slight` is recorded and nothing follows.
+                    # The bar is MID-000521, whose four cut-outs stand on a
+                    # podium nobody could call ambiguous (§1.1) — that is what
+                    # `clear` has to keep catching.
+                    "leftovers": {
+                        "type": "array",
+                        "description": (
+                            "For a GARMENT PHOTOGRAPH with the background removed only: "
+                            "each thing in the picture that is NOT the garment — a "
+                            "hanger, a hanger hook, a stand or podium, a mannequin part, "
+                            "a hand, a clip — with how much of it is visible. Empty when "
+                            "there is nothing but garment; always empty for a render or "
+                            "an unprocessed photograph."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "part": {
+                                    "type": "string",
+                                    "description": "What it is, in one or two words: 'hanger', "
+                                                   "'hook', 'stand', 'podium', 'hand', 'clip'.",
+                                },
+                                "extent": {
+                                    "type": "string",
+                                    "enum": ["none", "slight", "clear"],
+                                    "description": (
+                                        "How much of it is in the picture. none = not there "
+                                        "at all. slight = a trace you would have to look for: "
+                                        "the tip of a hanger hook above the collar, a sliver "
+                                        "at an edge, a shadow that might be one. clear = "
+                                        "plainly and wholly there: a whole hanger in frame, a "
+                                        "podium or stand the garment is standing on, a hand "
+                                        "holding it up. When you are unsure, answer slight."
+                                    ),
+                                },
+                            },
+                            "required": ["part", "extent"],
+                        },
+                    },
+                    # 18 Sep 2026, BOA-006151 and BOA-006153: every render ever
+                    # named in `odd_renders` falsely was one with no face in it
+                    # (AI_BACK, AI_BACK_34, AI_CLOSEUP). Asked for "the same
+                    # face, hair colour and style, skin tone and build", the
+                    # model has no face on a back view and falls back to hair
+                    # and build, where a back view of the SAME person
+                    # legitimately looks unlike the front. So the face is asked
+                    # for per render and the comparison is drawn only across
+                    # the renders that have one (§1.4).
+                    "face_visible": {
+                        "type": "boolean",
+                        "description": (
+                            "For an AI RENDER: true when the model's FACE is visible and "
+                            "identifiable in THIS picture — eyes, nose and mouth in frame. "
+                            "false for a back view, a head cropped out of frame, a face "
+                            "turned away, or a detail crop of the garment. Always false "
+                            "for a garment photograph."
+                        ),
+                    },
                 },
-                "required": ["index", "ok", "issue", "missing_parts"],
+                "required": ["index", "ok", "issue", "missing_parts", "leftovers", "face_visible"],
             },
         },
         # Readiness phase 1: the master category is confirmed against the
@@ -135,20 +225,28 @@ SCHEMA: dict[str, Any] = {
         # 17 Sep 2026, MID-000569: a close-up re-rendered beside four renders of
         # a blonde woman came back with a dark-haired one. Every render is in
         # this one call, so the question costs nothing extra.
+        #
+        # 18 Sep 2026: the question is now asked ONLY of the renders with a
+        # face in them (`face_visible` above). MID-000569 was a close-up WITH a
+        # face, so it survives; BOA-006151's two back views and BOA-006153's
+        # close-up, which had none, stop being answered at all.
         "same_model": {
             "type": "boolean",
             "description": (
-                "true when every AI RENDER in the list shows the SAME person: the "
-                "same face, hair colour and style, skin tone and build. true when "
-                "there are fewer than two renders. false when one or more renders "
-                "show a different person than the others."
+                "true when every AI RENDER IN WHICH A FACE IS VISIBLE shows the SAME "
+                "person: the same face, and with it the same hair colour and style, "
+                "skin tone and build. Renders with NO face visible (a back view, a "
+                "detail crop) are NOT compared and never make this false. true when "
+                "fewer than two renders show a face. false only when one or more "
+                "renders WITH A FACE show a different person than the others."
             ),
         },
         "odd_renders": {
             "type": "array", "items": {"type": "integer"},
             "description": "When same_model is false: the 1-based index(es) of the "
                            "render(s) showing a DIFFERENT person than the majority. "
-                           "Empty otherwise.",
+                           "Only a render whose face_visible is true may be named "
+                           "here — never a back view or a detail crop. Empty otherwise.",
         },
     },
     "required": ["wear", "defects", "wear_confidence", "images",
@@ -179,12 +277,65 @@ SYSTEM = (
     "For a background-removed cut-out, a PART OF THE GARMENT MISSING is a "
     "defect: a collar or neckband cut away, a sleeve, cuff or hem eaten by the "
     "mask, a strap gone. The garment's own openings (the neck hole, the space "
-    "between sleeve and body) are not. A stand, hanger or hand left in the "
-    "picture is a defect too.\n"
-    "Finally, look across ALL the AI renders together and say whether they show "
-    "the same person; when one shows a different person than the rest, name it "
-    "in odd_renders."
+    "between sleeve and body) are not.\n"
+    # MID-000591 FRONT (18 Sep 2026) came back "hanger visible" on a cut-out
+    # with no hanger anywhere in it. The sentence that used to stand here — "a
+    # stand, hanger or hand left in the picture is a defect too" — asked HOW
+    # MUCH of nothing, so a hook tip at the neckline, or a shadow the model
+    # read as one, satisfied it and became a CUTOUT DEFECT a person had to
+    # read. The threshold is set where the real case sits: MID-000521's four
+    # cut-outs stand on a podium (§1.1), and nobody would call that slight.
+    "Anything left in a cut-out that is not the garment — a hanger, a hanger "
+    "hook, a stand or podium, a mannequin part, a hand, a clip — goes in "
+    "`leftovers` with HOW MUCH of it you can see. The tip of a hanger hook "
+    "showing above the collar, a sliver at an edge, or a shadow you think might "
+    "be one, is `slight`. A WHOLE HANGER in the frame, a podium or stand the "
+    "garment is standing on, or a hand holding the garment up, is `clear`. "
+    "ONLY `clear` is a defect. When the most you can see is `slight`, record it "
+    "in `leftovers` and do NOT mention it in `issue` — answer ok = true unless "
+    "something else is wrong with the picture. When you are unsure how much is "
+    "visible, it is `slight`.\n"
+    # BOA-006151 (odd_renders [4, 6] → AI_BACK, AI_BACK_34) and BOA-006153
+    # (odd_renders [7] → AI_CLOSEUP), 18 Sep 2026: every false positive this
+    # question has ever produced was a render with NO FACE in it. Asked for the
+    # same face, hair, skin tone and build, the model has no face to compare on
+    # a back view, falls back to hair and build, and guesses — and a back view
+    # of the same person legitimately looks unlike the front. MID-000569, the
+    # one true case, was a close-up WITH a visible face, so faces alone keep it.
+    "Finally, the person in the renders. For EVERY AI render say whether the "
+    "model's FACE is visible in it (`face_visible`): a back view, a detail crop "
+    "of the garment, a head out of frame or a face turned away is false. Then "
+    "compare ONLY the renders where a face is visible and say in same_model "
+    "whether they show the same person, naming any that does not in "
+    "odd_renders. A render with no face is NEVER compared and is NEVER odd — a "
+    "back view or a detail crop is not judged on hair, build or clothing. When "
+    "fewer than two renders show a face there is nothing to compare: answer "
+    "same_model = true and leave odd_renders empty."
 )
+
+# The words a leftover goes by, for the one job of recognising that a free-text
+# `issue` is about a leftover the model measured as less than `clear` — so the
+# threshold above cannot be walked around by writing "hanger visible" in the
+# issue line instead (MID-000591's exact shape). Matched whole-word, so
+# "standing" and "handle" do not count as a stand or a hand.
+_LEFTOVER_RE = re.compile(
+    r"\b(hangers?|hooks?|stands?|podiums?|plinths?|mannequins?|dress forms?|"
+    r"hands?|clips?|pegs?|props?|tripods?|rails?|racks?)\b")
+
+
+def _without_leftovers(issue: str) -> str:
+    """`issue` with the clauses that are about a leftover struck out.
+
+    The model answers twice about the same thing: once as a measurement
+    (`leftovers`, with an extent) and once as free text (`issue`). When the two
+    disagree the MEASUREMENT wins, because it is the only one of the two that
+    was asked how much. Called only for a cut-out whose measured leftovers are
+    all below `clear`; the clauses that survive (a collar cut away, a blurred
+    picture) are untouched.
+    """
+    kept = [c.strip() for c in re.split(r"[;,]", issue)
+            if c.strip() and not _LEFTOVER_RE.search(c.lower())]
+    return "; ".join(kept)
 
 _DEFAULTS: dict[str, Any] = {
     "enabled": True,
@@ -332,6 +483,13 @@ def prompt_for(images: list[dict[str, Any]], photos: int) -> str:
         lines.append(f"  image {i} — {tag} ({im['view']}): expected to be {im['expect']}.")
     if photos:
         lines.append(f"Judge WEAR from images 1–{photos} only (the garment photographs).")
+    elif any(im["kind"] == "photo" for im in images):
+        # Wear is switched off (`wear.enabled: false`) but garment photographs
+        # are still in the call for the gallery check. The old wording here —
+        # "there is no garment photograph" — contradicted the per-image lines
+        # above, which name several, and a prompt that argues with itself is a
+        # worse instruction than either half alone.
+        lines.append("Do NOT judge wear on this listing; answer wear = unknown.")
     else:
         lines.append("There is no garment photograph; answer wear = unknown.")
     lines.append("For every image say whether it matches its expectation, and name the "
@@ -419,6 +577,11 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
         cutout_issues: list[str] = []
         render_issues: list[str] = []
         renders = [i for i, im in enumerate(images, start=1) if im.get("kind") == "render"]
+        # Which renders show a face, as the model answered it. Empty when the
+        # answer predates `face_visible` — an older cached one — and the
+        # comparison below then falls back to every render, which is what this
+        # module did until 18 Sep 2026.
+        faces: dict[int, bool] = {}
         for entry in raw.get("images") or []:
             if not isinstance(entry, dict):
                 continue
@@ -431,14 +594,57 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
             im = images[idx - 1]
             view = str(im.get("view") or "")
             is_cutout = im.get("kind") != "render" and im.get("processing") == "BG_REMOVED"
+            # Collected before any of the `continue`s below: a render that is
+            # perfectly fine on its own still votes on who is in the picture.
+            if im.get("kind") == "render" and "face_visible" in entry:
+                faces[idx] = bool(entry.get("face_visible"))
             # A garment part the mask ate counts on a cut-out even when the
             # model still called the picture "ok" — the part-by-part question
             # is the one it answers honestly.
             missing = ([str(p).strip() for p in (entry.get("missing_parts") or []) if str(p).strip()]
                        if is_cutout else [])
-            if entry.get("ok") is not False and not missing:
-                continue
-            issue = str(entry.get("issue") or "").strip()[:80]
+            # THE LEFTOVERS, MEASURED (18 Sep 2026). Only `clear` is a defect —
+            # a whole hanger, or the podium under all four of MID-000521's
+            # cut-outs. `slight` is the hook tip at a neckline that made
+            # MID-000591 FRONT report a hanger that was not there: it is kept
+            # in the stored answer and nothing follows from it.
+            #
+            # Read on a CUT-OUT only, and only when the model answered the
+            # field: a render's "hand duplicated" and a raw photograph shot on
+            # its hanger are other questions, and an answer cached under the
+            # older schema has no `leftovers` key at all and is judged exactly
+            # as it was before.
+            has_leftovers = is_cutout and isinstance(entry.get("leftovers"), list)
+            clear_left: list[str] = []
+            if has_leftovers:
+                for row in entry["leftovers"]:
+                    if not isinstance(row, dict):
+                        continue
+                    part = str(row.get("part") or "").strip()
+                    if part and str(row.get("extent") or "").strip().lower() == "clear" \
+                            and part not in clear_left:
+                        clear_left.append(part)
+            raw_issue = str(entry.get("issue") or "").strip()[:80]
+            issue = raw_issue
+            # The measurement outranks the free text (see `_without_leftovers`):
+            # nothing above `slight` was seen, so an issue line that says
+            # "hanger visible" is the model contradicting its own answer.
+            if has_leftovers and not clear_left and issue:
+                issue = _without_leftovers(issue)
+            if not missing and not clear_left:
+                if entry.get("ok") is not False:
+                    continue
+                if raw_issue and not issue:
+                    continue      # the only complaint was a leftover below the bar
+            if clear_left:
+                # Only what the issue line does not already say: MID-000521's
+                # BACK answer reads "hanger and stand visible" and measures
+                # both as clear, and "hanger and stand visible; hanger, stand
+                # visible" helps nobody.
+                low = issue.lower()
+                fresh = [p for p in clear_left if p.lower() not in low]
+                if fresh:
+                    issue = (f"{issue}; " if issue else "") + f"{', '.join(fresh[:3])} visible"
             if missing:
                 issue = (f"{issue}; " if issue else "") + f"{', '.join(missing[:3])} missing"
             issue = issue or "does not match its slot"
@@ -454,22 +660,36 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
                 continue
             photo_issues.append(f"{view} photo: {issue}")
 
-        # ONE PERSON ACROSS THE RENDERS. The gate judges the lead alone and
-        # cannot see that the close-up shows somebody else (MID-000569). A
-        # render that shows a different person than the majority is a render
-        # defect of THAT view — re-rendered against the others as reference.
-        # Needs a majority to compare with: three renders or more, and the odd
-        # ones fewer than the rest.
-        if raw.get("same_model") is False and len(renders) >= 3:
-            odd: list[int] = []
+        # ONE PERSON ACROSS THE RENDERS, JUDGED ON FACES ALONE. The gate judges
+        # the lead alone and cannot see that the close-up shows somebody else
+        # (MID-000569). A render that shows a different person than the
+        # majority is a render defect of THAT view — re-rendered against the
+        # others as reference. Needs a majority to compare with: three renders
+        # or more, and the odd ones fewer than the rest.
+        #
+        # 18 Sep 2026: the population is the renders WITH A FACE, not all of
+        # them. BOA-006151 named AI_BACK and AI_BACK_34, BOA-006153 named
+        # AI_CLOSEUP — every false positive was a faceless render, where the
+        # only evidence left is hair and build and a back view of the same
+        # person honestly looks unlike the front (§1.4). MID-000569's close-up
+        # HAD a face, so it is still judged and still caught.
+        #
+        # `faces` empty means the answer predates the field (a cached one):
+        # fall back to every render, the behaviour that answer was written
+        # under. With the field present, all-false is a real answer — nobody's
+        # face is visible, so nobody is compared.
+        judged = [i for i in renders if faces.get(i)] if faces else renders
+        if raw.get("same_model") is False and len(judged) >= 3:
+            named: list[int] = []
             for o in raw.get("odd_renders") or []:
                 try:
                     o = int(o)
                 except (TypeError, ValueError):
                     continue
-                if o in renders and o not in odd:
-                    odd.append(o)
-            if odd and len(odd) * 2 < len(renders):
+                if o in renders and o not in named:
+                    named.append(o)
+            odd = [o for o in named if o in judged]
+            if odd and len(odd) * 2 < len(judged):
                 for o in odd:
                     view = str(images[o - 1].get("view") or "")
                     if view in bad_views:
@@ -477,6 +697,14 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
                     render_issues.append(f"{view} render: a different model than the other renders")
                     if view:
                         bad_views.append(view)
+            elif named and not odd:
+                # Every render it named is one with no face in it. That is not
+                # a weaker finding to note softly — it is the comparison the
+                # prompt forbids, made anyway, and a soft flag would put the
+                # BOA-006151 line back on the page this change exists to clear.
+                # The answer stays in the record (`head["raw"]`) and nothing
+                # else happens.
+                pass
             else:
                 soft.append("the renders may not all show the same model (which one is unclear)")
 

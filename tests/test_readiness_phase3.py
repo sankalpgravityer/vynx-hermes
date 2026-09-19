@@ -498,13 +498,18 @@ def test_two_pictures_that_do_not_cover_the_same_frame_are_not_asked_about_a_nec
 
 
 # --------------------------------------------------------------------------- #
-# The same-ratio zoom (KLE-000028)
+# The same-ratio zoom (KLE-000028), and the test that used to catch it
 # --------------------------------------------------------------------------- #
 #
 # The cut-out keeps the photograph's aspect ratio and touches no edge, so both
-# older tests pass it; the garment inside stands 1.4x larger. Measured on the
-# real pair: a correct cut-out overlaps its photograph 0.988-1.000, that one
-# 0.519.
+# older tests pass it; the garment inside stands 1.4x larger. Over six pairs of
+# Hermes' OWN transparent cut-outs a correct one overlapped its photograph
+# 0.988-1.000 and that one 0.519 — and the calibration held only because those
+# six were transparent. It is retired (`alignment_check`, item 2); what catches
+# the zoom now is the cut-out's own bounding box (item 3, further down).
+
+ALIGN_ON = {**CFG, "garment_check": {**(CFG.get("garment_check") or {}), "alignment_check": True}}
+
 
 def zoomed_pair(scale: float = 1.45) -> tuple[bytes, bytes]:
     """The same garment, cut out at `scale` and padded back to the frame's ratio."""
@@ -517,10 +522,12 @@ def zoomed_pair(scale: float = 1.45) -> tuple[bytes, bytes]:
     return _png(cut), _png(raw)
 
 
-def test_a_cutout_zoomed_inside_the_right_ratio_is_named_and_re_cut():
+def test_the_overlap_is_still_measured_and_still_named_when_switched_back_on():
+    """The measurement survives item 2 untouched — it simply cannot flag."""
     m = cutouts.garment_hole(*zoomed_pair(), CFG)
-    assert m["aligned"] is False and m["overlap"] < 0.9
-    why, fixable = cutouts.frame_problem(m, CFG, derived=True)
+    assert m["aligned"] is False and m["overlap"] < 0.9      # still on the row, still in the JSON
+    assert cutouts.frame_problem(m, CFG, derived=True) == (None, False)
+    why, fixable = cutouts.frame_problem(m, ALIGN_ON, derived=True)
     assert why and "zoomed or shifted" in why and "Re-cut it" in why and fixable
     # The ratio test and the edge test, which is why this had to be measured.
     assert cutouts.canvas_mismatch((896, 1195), (3000, 4000), 0.02) is None
@@ -529,19 +536,21 @@ def test_a_cutout_zoomed_inside_the_right_ratio_is_named_and_re_cut():
 def test_the_same_framing_says_nothing_about_framing():
     m = cutouts.garment_hole(*zoomed_pair(scale=1.0), CFG)
     assert m["aligned"] is True
-    assert cutouts.frame_problem(m, CFG, derived=True) == (None, False)
-    assert cutouts.frame_problem(None, CFG, derived=True) == (None, False)
+    assert cutouts.frame_problem(m, ALIGN_ON, derived=True) == (None, False)
+    assert cutouts.frame_problem(None, ALIGN_ON, derived=True) == (None, False)
 
 
 def test_a_guessed_pairing_is_a_note_never_a_defect():
     """With no derivation edge the original was matched by view and origin, and
     two different photographs of the same view disagree honestly."""
-    m = cutouts.garment_hole(*zoomed_pair(), CFG)
-    why, fixable = cutouts.frame_problem(m, CFG, derived=False)
+    m = cutouts.garment_hole(*zoomed_pair(), ALIGN_ON)
+    why, fixable = cutouts.frame_problem(m, ALIGN_ON, derived=False)
     assert why and "may simply be different photographs" in why and not fixable
 
 
-def test_judge_re_cuts_a_zoomed_cutout_and_says_which_view():
+def test_judge_no_longer_holds_a_product_on_the_overlap_alone():
+    """Item 2 in one line: the pair that used to come back `bad` on `framing:`
+    and nothing else now comes back `ok`, with the number still recorded."""
     raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg",
                 width=3000, height=4000)
     cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png",
@@ -549,10 +558,10 @@ def test_judge_re_cuts_a_zoomed_cutout_and_says_which_view():
     c, r = zoomed_pair()
     fetch, read_dims = fake_io({"https://r2/cut.png": c, "https://r2/raw.jpg": r})
     v = cutouts.judge(snap([cut, raw]), POL, fetch=fetch, read_dims=read_dims)
-    assert v.action == "bad" and v.bad_views == ["FRONT"] and v.unfixable_views == []
-    assert any("framing:" in reason for reason in v.reasons)
-    # And the rules report the same thing from the measurement left on the row.
-    assert "IMG.026" in ids(snap([cut, raw]))
+    assert v.action == "ok"
+    assert not any("framing:" in reason for reason in v.reasons)
+    assert cut.border["garment"]["overlap"] < 0.9        # measured, recorded, silent
+    assert "IMG.026" not in ids(snap([cut, raw]))
 
 
 def test_judge_re_cuts_a_lost_collar_and_leaves_the_forms_neck_alone():
@@ -634,6 +643,377 @@ def test_outcome_names_the_cutout_hold():
 
 
 # --------------------------------------------------------------------------- #
+# Item 1: the garment mask is DERIVED, not assumed
+# (docs/PICTURE-CHECK-FIXES.md §0 and §4)
+# --------------------------------------------------------------------------- #
+#
+# Every cut-out vnyx-api stores is fully opaque, composited on rgb(235,235,235):
+# 0.0% alpha-clear and 0.0% border-clear on MID-000521 and MID-000591 at
+# 3000×4000 and BOA-006151 and BOA-006153 at 896×1195. So `alpha > 128` selects
+# THE WHOLE FRAME and every geometric measurement standing on it was measuring
+# the frame. §4's pass condition: the mask's area is the garment's, under 50% of
+# the frame.
+
+def composited(w: int = 600, h: int = 800, back=(235, 235, 235),
+               box=(210, 160, 390, 640), garment=(60, 60, 90)) -> Image.Image:
+    """What vnyx-api hands back: RGBA, alpha 255 EVERYWHERE, one flat backdrop.
+
+    The default garment is 180×480 of a 600×800 frame — 18.00% of it exactly.
+    """
+    img = Image.new("RGBA", (w, h), tuple(back) + (255,))
+    ImageDraw.Draw(img).rectangle(box, fill=tuple(garment) + (255,))
+    return img
+
+
+def test_a_composited_cutout_masks_the_garment_and_not_the_frame():
+    img = composited()
+    a = list(img.getchannel("A").tobytes())
+    assert min(a) == 255                                  # 0.0% clear, as measured on all four
+    assert sum(1 for v in a if v > 128) / len(a) == 1.0    # what `alpha > 128` would have said
+
+    mask, info = cutouts.garment_mask(img, CFG)
+    assert info["source"] == "backdrop" and info["alpha_clear"] == 0.0
+    assert info["backdrop_rgb"] == [235, 235, 235]        # the corner median, exactly
+    assert 0.17 <= info["area"] <= 0.19                   # truth 0.1800
+    assert info["area"] < 0.50                            # §4's pass condition for item 1
+
+
+def test_a_cutout_that_really_has_an_alpha_is_read_from_it():
+    """Hermes' own output: 50-80% of the frame genuinely clear. Nothing about
+    item 1 may change what those measure."""
+    mask, info = cutouts.garment_mask(transparent(), CFG)
+    assert info["source"] == "alpha" and info["alpha_clear"] > 0.5
+    assert 0.25 <= info["area"] <= 0.32                   # the inscribed ellipse, 3/5 of each side
+
+
+def test_the_corner_median_is_not_taken_hostage_by_a_garment_on_the_ring():
+    """Why the corners and not the border ring. A garment spanning the full
+    width takes the ring median with it and the mask INVERTS: 10% of the frame
+    measured against a truth of 90%. BOA-006127's sleeves reach both side edges
+    in the original too, so this is not a hypothetical shape."""
+    img = composited(box=(0, 40, 599, 760))               # 90.1% of the frame
+    ring = cutouts.measure(encode(img), CFG, (235, 235, 235))["rgb"]
+    assert ring == [60, 60, 90]                           # the ring median IS the garment
+    assert cutouts.corner_backdrop(img, CFG) == (235, 235, 235)
+    _, info = cutouts.garment_mask(img, CFG)
+    assert info["source"] == "backdrop" and 0.89 <= info["area"] <= 0.91
+
+
+def test_no_usable_mask_is_unknown_and_flags_nothing():
+    # Nothing separates: a frame that is all one colour, so the corner colour
+    # is the "garment" and the mask is empty.
+    _, empty = cutouts.garment_mask(Image.new("RGBA", (300, 400), (60, 60, 90, 255)), CFG)
+    assert empty["source"] == "unknown" and "no garment could be separated" in empty["note"]
+    # Everything separates: the garment sits in all four corners, so the corner
+    # colour is the garment's and the "mask" would be the backdrop. That is §0's
+    # mistake with the sign flipped, and it is reported instead of answered.
+    cornered = Image.new("RGBA", (300, 400), (235, 235, 235, 255))
+    dc = ImageDraw.Draw(cornered)
+    for x0, y0 in ((0, 0), (270, 0), (0, 370), (270, 370)):
+        dc.rectangle((x0, y0, x0 + 29, y0 + 29), fill=(60, 60, 90, 255))
+    _, everything = cutouts.garment_mask(cornered, CFG)
+    assert everything["source"] == "unknown" and "not a backdrop" in everything["note"]
+    # And nothing may be flagged from either.
+    for info in (empty, everything):
+        assert cutouts.frame_mismatch({"edges_touched": 0, "box": info}, CFG) is None
+
+
+def test_a_cutout_whose_shape_cannot_be_derived_reports_unknown_not_a_defect():
+    flat = _png(Image.new("RGBA", (300, 400), (60, 60, 90, 255)))
+    _, raw = neck_pair("collar")
+    m = cutouts.garment_hole(flat, raw, CFG)
+    assert m["aligned"] is None and m["mask"]["source"] == "unknown"
+    assert cutouts.frame_problem(m, ALIGN_ON, derived=True) == (None, False)
+    assert cutouts.hole_problem(m, ON) == (None, False)
+
+
+def test_the_derived_mask_is_what_the_neckline_check_now_measures():
+    """The mask source rides on the measurement so §4's condition can be read
+    off the JSON rather than off the pictures."""
+    m = cutouts.garment_hole(*neck_pair("collar"), CFG)
+    assert m["mask"]["source"] == "backdrop" and m["mask"]["area"] < 0.5
+    why, fixable = cutouts.hole_problem(m, CFG)
+    assert why and "cut away at the collar" in why and fixable
+
+
+# --------------------------------------------------------------------------- #
+# Item 2: the raw-photograph overlap test is retired
+# --------------------------------------------------------------------------- #
+
+def lit_wall_pair() -> tuple[bytes, bytes]:
+    """BOA-006153's shape: a LIGHT garment on a lit wall, cut out correctly.
+
+    Measured on the real pair — garment median against the photograph's border
+    ring — the backdrop reads 195,189,182 and the garment 197,197,195, a
+    separation of 23 against a `backdrop_tolerance` of 40. So the photograph
+    reports no garment where the garment is, and the overlap collapses: 75.7%
+    with a correct mask, and the 19% the dossier printed with the old one.
+    """
+    raw = Image.new("RGB", (300, 400), (195, 189, 182))
+    ImageDraw.Draw(raw).rectangle((90, 70, 210, 330), fill=(197, 197, 195))
+    cut = Image.new("RGBA", (300, 400), (255, 255, 255, 255))
+    ImageDraw.Draw(cut).rectangle((90, 70, 210, 330), fill=(197, 197, 195, 255))
+    return _png(cut), _png(raw)
+
+
+def test_a_light_garment_on_a_lit_wall_is_measured_low_and_no_longer_flagged():
+    c, r = lit_wall_pair()
+    m = cutouts.garment_hole(c, r, CFG)
+    assert m["mask"]["source"] == "backdrop"          # the cut-out's own backdrop is flat…
+    assert m["overlap"] < 0.9 and m["aligned"] is False   # …the photograph's wall is not
+    assert cutouts.frame_problem(m, CFG, derived=True) == (None, False)
+    # Switched back on, it is the false positive that held BOA-006153.
+    assert "zoomed or shifted" in cutouts.frame_problem(m, ALIGN_ON, derived=True)[0]
+
+
+def test_judge_passes_the_boa_006153_shape_end_to_end():
+    """§4 for items 2 and 3: BOA-006153 and BOA-006151 report no framing
+    problem. Same tenant backdrop, same pairing, same download path."""
+    raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg",
+                width=300, height=400)
+    cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png")
+    c, r = lit_wall_pair()
+    fetch, read_dims = fake_io({"https://r2/cut.png": c, "https://r2/raw.jpg": r})
+    v = cutouts.judge(snap([cut, raw]), POL, fetch=fetch, read_dims=read_dims)
+    assert v.action == "ok" and v.reasons == []
+    # The measurement is on the row, in the JSON, exactly as before.
+    g = cut.border["garment"]
+    assert g["overlap"] < 0.9 and g["aligned"] is False and g["mask"]["source"] == "backdrop"
+
+
+def test_the_flag_is_a_policy_flip_not_a_code_change():
+    """Tri-state, and `auto` is what ships (19 Sep 2026)."""
+    assert cutouts.config(POL)["garment_check"]["alignment_check"] == "auto"
+    pol = copy.deepcopy(POL)
+    pol["readiness"]["cutouts"]["garment_check"] = {"enabled": True, "alignment_check": True}
+    assert cutouts.config(pol)["garment_check"]["alignment_check"] is True
+
+
+def test_alignment_mode_resolves_yaml_shapes():
+    """YAML hands back a bool for true/false and a string for auto, so both have
+    to resolve — and an unrecognised value must be OFF, never silently on."""
+    assert cutouts._alignment_mode(False) == "off"
+    assert cutouts._alignment_mode(True) == "always"
+    assert cutouts._alignment_mode("auto") == "auto"
+    assert cutouts._alignment_mode("true") == "always"
+    assert cutouts._alignment_mode("off") == "off"
+    assert cutouts._alignment_mode("wibble") == "off"
+    assert cutouts._alignment_mode(None) == "off"
+
+
+# The four separations measured by hand and quoted in the policy block, plus the
+# case that made the gate necessary. `overlap` is each one's real score.
+#
+#   name                     overlap  separation  correct cut-out?
+_MEASURED = [
+    ("BOA-006151 FRONT", 0.609, 15, True),
+    ("BOA-006153 FRONT", 0.757, 23, True),
+    ("MID-000521 FRONT", 0.732, 55, True),
+    ("MID-000615 FRONT", 0.805, 150, False),
+]
+
+
+@pytest.mark.parametrize("name,overlap,separation,correct", _MEASURED)
+def test_auto_judges_only_where_the_photograph_can_answer(name, overlap, separation, correct):
+    """THE REGRESSION TEST. Every measured false positive stays silent because
+    the wall cannot separate itself from the garment; the real zoom is flagged.
+
+    Turning `alignment_check` off entirely made all four silent, which is how
+    MID-000615 shipped a zoomed FRONT cut-out under the note "every cut-out is
+    on its canvas and the tenant's backdrop"."""
+    m = {"aligned": overlap >= 0.9, "overlap": overlap, "separation": separation}
+    why, fixable = cutouts.frame_problem(m, CFG, derived=True)
+    assert (why is None) is correct, f"{name}: {why}"
+    if not correct:
+        assert fixable and "zoomed or shifted" in why and "separation 150" in why
+
+
+def test_auto_abstains_on_a_row_measured_before_separation_existed():
+    """No `separation` key is an OLDER ROW, not a clear one. Judging it would
+    reintroduce exactly the false positives the gate exists to stop."""
+    m = {"aligned": False, "overlap": 0.6}
+    assert cutouts.frame_problem(m, CFG, derived=True) == (None, False)
+    # …and with the gate off it judges, which is what `true` is for.
+    assert "zoomed or shifted" in cutouts.frame_problem(m, ALIGN_ON, derived=True)[0]
+
+
+def test_garment_hole_records_the_separation_it_measures():
+    """The number the gate reads has to come off the picture, not a constant."""
+    c, r = lit_wall_pair()
+    m = cutouts.garment_hole(c, r, CFG)
+    assert m is not None and "separation" in m
+    # A lit wall on its own garment's colour: this pair is the low-separation
+    # case, which is the whole reason `auto` exists.
+    assert m["separation"] < CFG["garment_check"]["min_separation"]
+    assert len(m["raw_backdrop_rgb"]) == 3 and len(m["raw_garment_rgb"]) == 3
+
+
+# --------------------------------------------------------------------------- #
+# The cut-outs against each other — the zoom test that needs no photograph
+# --------------------------------------------------------------------------- #
+
+def _area_checks(*pairs: tuple[str, float], source: str = "backdrop"):
+    return [{"view": v, "measured": True, "problems": [],
+             "garment": {"mask": {"source": source, "area": a}}} for v, a in pairs]
+
+
+def test_scale_outliers_catches_mid_000615():
+    """The real numbers off reports/one-product-dry.json: a zoomed FRONT beside
+    a sound BACK, 3.4x the frame area. No photograph involved."""
+    out = cutouts.scale_outliers(_area_checks(("FRONT", 0.3078), ("BACK", 0.0894)), CFG)
+    assert list(out) == ["FRONT"]
+    assert "3.4x the area" in out["FRONT"] and "1.9x linear" in out["FRONT"]
+
+
+@pytest.mark.parametrize("why,rows", [
+    ("a healthy pair", (("FRONT", 0.21), ("BACK", 0.18))),
+    ("a jacket open on one view", (("FRONT", 0.30), ("BACK", 0.19))),
+    ("one view only — nothing to compare", (("FRONT", 0.31),)),
+    ("a reference the segmenter ate", (("FRONT", 0.30), ("BACK", 0.004))),
+])
+def test_scale_outliers_stays_silent(why, rows):
+    assert cutouts.scale_outliers(_area_checks(*rows), CFG) == {}, why
+
+
+def test_scale_outliers_ignores_an_unknown_mask():
+    """§0's rule: nothing may be flagged from a mask that is not the garment's."""
+    checks = _area_checks(("FRONT", 0.3078), source="unknown") + _area_checks(("BACK", 0.0894))
+    assert cutouts.scale_outliers(checks, CFG) == {}
+
+
+def test_scale_outliers_is_silent_when_every_view_is_zoomed():
+    """Documented blind spot: the ratio is 1.0, so this says nothing and the
+    separation-gated framing test is what has to catch it."""
+    assert cutouts.scale_outliers(_area_checks(("FRONT", 0.31), ("BACK", 0.30)), CFG) == {}
+
+
+def test_judge_reports_a_scale_outlier_on_its_own_row():
+    """End to end: the sentence lands on the offending check AND in the run's
+    reasons, and the verdict turns bad."""
+    small = composite(600, 800)
+    big = Image.new("RGB", (600, 800), (235, 235, 235))
+    ImageDraw.Draw(big).ellipse((30, 40, 570, 760), fill=(180, 40, 40))
+    front = asset("FRONT", "BG_REMOVED", id="c1", url="https://r2/front.png")
+    back = asset("BACK", "BG_REMOVED", id="c2", url="https://r2/back.png")
+    fetch, read_dims = fake_io({
+        "https://r2/front.png": encode(big), "https://r2/back.png": encode(small),
+    })
+    v = cutouts.judge(snap([front, back]), POL, fetch=fetch, read_dims=read_dims)
+    assert v.action == "bad" and "FRONT" in v.bad_views and "BACK" not in v.bad_views
+    assert any("scale:" in r and r.startswith("FRONT:") for r in v.reasons)
+    row = next(c for c in v.checks if c["view"] == "FRONT")
+    assert any("scale:" in p for p in row["problems"])
+
+
+# --------------------------------------------------------------------------- #
+# Item 3: what overlap was for, from the cut-out's own frame
+# --------------------------------------------------------------------------- #
+
+def padded_bbox_crop(w: int = 600, h: int = 800) -> Image.Image:
+    """KLE-000028's FRONT: cropped to the garment, then `fitToCanvas` PADDED
+    the crop back out to the source ratio. The ratio matches the photograph's,
+    so `canvas_mismatch` passes it; the garment stops a few pixels short of the
+    sides, so `frame_mismatch`'s edge test passes it too. Only the bounding box
+    — 97% of the width, the full height, 97% of the frame — says what it is."""
+    img = Image.new("RGBA", (w, h), (235, 235, 235, 255))
+    ImageDraw.Draw(img).ellipse((w * 3 // 200, 0, w - 1 - w * 3 // 200, h - 1),
+                                fill=(60, 60, 90, 255))
+    return img
+
+
+def test_a_bounding_box_crop_padded_back_to_the_ratio_is_named():
+    m = cutouts.measure(encode(padded_bbox_crop()), CFG, (235, 235, 235))
+    assert m["edges_touched"] < 4                        # the edge test cannot see it
+    assert cutouts.canvas_mismatch((600, 800), (3000, 4000), 0.02) is None   # nor the ratio test
+    assert m["box"]["source"] == "backdrop" and m["box"]["fill"] >= 0.90
+    why = cutouts.frame_mismatch(m, CFG, original=(3000, 4000))
+    assert why and "bounding box covers" in why and "not the photograph's frame" in why
+    assert "0.750 ratio (3000×4000)" in why              # why the ratio test said nothing
+
+
+def test_the_box_test_needs_no_original_at_all():
+    """Its whole point: it asks the cut-out about its own frame. A WEB cut-out
+    with no booth capture to pair with is still judged."""
+    m = cutouts.measure(encode(padded_bbox_crop()), CFG, (235, 235, 235))
+    assert cutouts.frame_mismatch(m, CFG) is not None
+
+
+def test_a_correct_cutout_and_sleeves_at_the_edge_are_not_a_bounding_box_crop():
+    # The whole frame scaled down: the garment sits inside it with margin.
+    ok = cutouts.measure(encode(composited()), CFG, (235, 235, 235))
+    assert ok["box"]["fill"] < 0.50
+    assert cutouts.frame_mismatch(ok, CFG, original=(3000, 4000)) is None
+    # BOA-006127: the shirt reaches the left and right edges — in the ORIGINAL
+    # too — but fills about 0.6 of the height, so its box covers about 0.6.
+    sleeves = cutouts.measure(encode(sleeves_at_the_edge()), CFG, (235, 235, 235))
+    assert sleeves["box"]["fill_w"] == 1.0 and sleeves["box"]["fill"] < 0.90
+    assert cutouts.frame_mismatch(sleeves, CFG, original=(3000, 4000)) is None
+
+
+def test_judge_and_img026_both_name_the_padded_crop():
+    raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg",
+                width=3000, height=4000)
+    cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png")
+    fetch, read_dims = fake_io({"https://r2/cut.png": encode(padded_bbox_crop(600, 800))})
+    p = snap([cut, raw])
+    v = cutouts.judge(p, POL, fetch=fetch, read_dims=read_dims)
+    assert v.action == "bad" and v.bad_views == ["FRONT"]
+    assert any(r.startswith("FRONT: frame:") and "bounding box covers" in r for r in v.reasons)
+    # And from the row alone, with no second download.
+    assert "IMG.026" in ids(p)
+
+
+# --------------------------------------------------------------------------- #
+# Item 9: "no original on file" is not a finding (§2.2, §4)
+# --------------------------------------------------------------------------- #
+
+def test_no_original_on_file_is_recorded_in_the_json_and_nowhere_else():
+    """The sweatshirt's cut-outs are WEB origin while its photographs are
+    DECISION and PHOTOBOOTH, so no pair is found — the normal state for a
+    picture uploaded through the web, not a fault in it."""
+    cut = MediaAsset(url="https://r2/c.png", view="FRONT", processing="BG_REMOVED",
+                     id="c1", origin="WEB")
+    booth = MediaAsset(url="https://r2/b.jpg", view="FRONT", processing="RAW",
+                       id="r1", origin="PHOTOBOOTH")
+    fetch, read_dims = fake_io({"https://r2/c.png": encode(composite(600, 800))})
+    v = cutouts.judge(snap([cut, booth]), POL, fetch=fetch, read_dims=read_dims)
+    assert v.action == "ok" and v.reasons == []
+    check = v.checks[0]
+    assert check["original"] is None
+    assert check.get("note") is None                     # nothing to caption or mark
+    assert check["original_note"] == "no original on file — canvas not compared"
+
+
+def test_the_dossier_draws_no_mark_and_no_caption_for_a_missing_original():
+    from scripts import product_dossier as pd
+
+    media = [{"url": "https://r2/c.png", "view": "FRONT", "processing": "BG_REMOVED",
+              "mediaType": "IMAGE", "isCurrent": True, "position": 0}]
+    rep = {"measured": {"checks": [
+        # As `judge` writes it now …
+        {"url": "https://r2/c.png", "view": "FRONT", "problems": [], "measured": True,
+         "original_note": "no original on file — canvas not compared"},
+    ]}}
+    assert pd.image_notes({"media": media}, rep, POL) == {}
+
+    # … and as reports written before item 9 still carry it, since the dossier
+    # is re-rendered from stored JSON.
+    legacy = {"measured": {"checks": [
+        {"url": "https://r2/c.png", "view": "FRONT", "problems": [], "measured": True,
+         "note": "no original on file — canvas not compared"},
+    ]}}
+    assert pd.image_notes({"media": media}, legacy, POL) == {}
+
+    # A note that IS about the picture still draws.
+    real = {"measured": {"checks": [
+        {"url": "https://r2/c.png", "view": "FRONT", "problems": [], "measured": False,
+         "note": "cut-out could not be downloaded"},
+    ]}}
+    assert pd.image_notes({"media": media}, real, POL) == {
+        "https://r2/c.png": ["cut-out could not be downloaded"]}
+
+
+# --------------------------------------------------------------------------- #
 # The chain's matte step, every I/O edge replaced
 # --------------------------------------------------------------------------- #
 
@@ -706,6 +1086,22 @@ def wired(monkeypatch):
         calls["judge"] += 1
         return verdicts[i]
 
+    # THE OPTION PROBE IS NETWORK, AND IT WAS NOT PINNED.
+    #
+    # `remote_supports` asks the live vnyx-api at VNYX_API_URL which options it
+    # accepts, and the chain declines the re-matte when `keepBetter` is absent —
+    # correctly, because re-cutting without that guard can store a cut-out worse
+    # than the one it replaces. Unpinned, that made these tests depend on
+    # whether a server happened to be listening on the developer's machine AND
+    # on which revision it was running: with the API up and no `keepBetter` in
+    # its `/ping`, five of them fail with an empty `matte_args` and nothing in
+    # the failure names the network as the cause.
+    #
+    # Pinned to "this deployment takes everything", because what these tests are
+    # about is what the chain DOES with a re-matte, not whether a particular
+    # server can accept one. `test_a_server_without_keep_better_is_refused`
+    # covers the other branch on purpose.
+    monkeypatch.setattr(rp, "remote_supports", lambda *names: True)
     monkeypatch.setattr(rp, "needs", fake_needs)
     monkeypatch.setattr(rp, "run_step", fake_run_step)
     monkeypatch.setattr(rp, "approve_check", fake_approve_check)
@@ -750,6 +1146,55 @@ def test_a_wrong_cutout_is_re_matted_with_replace_and_re_checked(wired):
     assert r["cutouts"]["before"]["action"] == "bad"
     assert r["cutouts"]["after"]["action"] == "ok"
     assert r["approval"]["outcome"] == "would_approve"
+
+
+def test_only_the_defective_view_is_re_cut(wired):
+    """`--replace` alone redoes EVERY covered view, so a product with one bad
+    cut-out paid for two segmenter calls and had a sound picture re-cut — while
+    the note said "re-matte FRONT". The bad views are named now."""
+    wired["verdicts"][:] = [BAD, OK]          # BAD.bad_views == ["FRONT"]
+    _repair(apply=True)
+    args = wired["calls"]["matte_args"][0]
+    assert "--views" in args
+    assert args[args.index("--views") + 1] == "FRONT"
+
+
+def test_an_old_server_still_gets_the_whole_product(wired, monkeypatch):
+    """The view list is an economy, not the guard: a deployment that cannot take
+    it keeps the previous behaviour rather than losing the re-matte."""
+    monkeypatch.setattr(rp, "remote_supports",
+                        lambda *names: "matteViews" not in names)
+    wired["verdicts"][:] = [BAD, OK]
+    _repair(apply=True)
+    args = wired["calls"]["matte_args"][0]
+    assert "--replace" in args and "--keep-better" in args and "--views" not in args
+
+
+def test_a_server_without_keep_better_is_refused(wired, monkeypatch):
+    """THE BRANCH PRODUCTION IS ACTUALLY ON (19 Sep 2026).
+
+    `--keep-better` is item 8 of docs/PICTURE-CHECK-FIXES.md and is not
+    implemented in vnyx-api: `/internal/auto-approval/ping` lists fifteen
+    options and that is not one of them, and `backfill-bg-removal.ts` has no
+    such flag. So on the live deployment every re-matte this chain asks for is
+    DECLINED — the cut-out is measured, named and reported, and then left alone.
+
+    That refusal is correct and must stay. KIL-001625 lost a large part of a
+    shirt back to a re-cut made without the guard, and `replaceWithDerived`
+    supersedes the old row with no undo. A silent downgrade to the unsafe call
+    is the one outcome worse than not re-cutting.
+
+    It is tested here so the behaviour is a decision on the record rather than a
+    surprise in a log, and so that implementing `keepBetter` in vnyx-api is
+    visibly what unblocks it."""
+    monkeypatch.setattr(rp, "remote_supports", lambda *names: False)
+    wired["verdicts"][:] = [BAD, OK]
+    r = _repair(apply=True)
+    assert wired["calls"]["matte_args"] == [], "nothing may be re-cut unguarded"
+    note = matte_step(r)["note"]
+    assert "left the existing cut-outs alone" in note and "--keep-better" in note
+    # The measurement survives the refusal: the defect is still on the record.
+    assert r["cutouts"]["before"]["action"] == "bad"
 
 
 def test_a_dry_run_lists_the_re_matte_and_never_holds_on_it(wired):

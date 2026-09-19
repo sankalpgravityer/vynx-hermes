@@ -119,6 +119,82 @@ def test_two_real_values_is_medium_and_unrepairable():
     assert found[0].detail["repair_to"] is None
 
 
+def test_a_master_category_the_tenants_tree_does_not_hold_is_never_proposed():
+    """The empty-side argument does not survive contact with free text.
+
+    "One side is empty, so the other is right" holds for a size. It does not hold
+    for a taxonomy name, where the `properties` copy is written by the analyze
+    worker from the model's own words. On 18 Sep 2026 it said "Men's/Unisex",
+    this rule proposed it, the executor wrote it, TAX.001 rejected it in the same
+    run, and `copy` then regenerated the title from it.
+
+    Still reported — the two copies really do disagree — but MEDIUM and
+    unrepairable, which is this rule's existing way of saying a person decides.
+    """
+    p = snap(
+        columns={"masterCategory": "Unknown"},
+        properties={"mastercategory": "Men's/Unisex"},
+    )
+    found = drift(p)
+    assert len(found) == 1
+    assert found[0].severity.value == "medium"
+    assert found[0].detail["repair_to"] is None
+    assert found[0].detail["rejected_value"] == "Men's/Unisex"
+    assert "not in this tenant's category tree" in found[0].message
+
+
+def test_a_subcategory_the_tree_does_not_hold_is_never_proposed():
+    """'hoodie' on a t-shirt, which became "Deep Burgundy Hoodie" in the title."""
+    p = snap(
+        columns={"subCategory": "Unknown"},
+        properties={"sub_category": "hoodie"},
+    )
+    found = drift(p)
+    assert len(found) == 1
+    assert found[0].detail["repair_to"] is None
+
+
+def test_a_taxonomy_value_the_tree_does_hold_is_still_repaired():
+    """The check narrows this rule, it does not switch it off."""
+    p = snap(
+        columns={"masterCategory": "Unknown"},
+        properties={"mastercategory": "Men"},
+    )
+    found = drift(p)
+    assert len(found) == 1
+    assert found[0].severity.value == "high"
+    assert found[0].detail["repair_to"] == "Men"
+
+
+def test_punctuation_is_not_a_value_the_tenant_does_not_have():
+    """Compared on letters and digits, like every other catalog check here."""
+    p = snap(
+        columns={"subCategory": "Unknown"},
+        properties={"sub_category": "leather-jacket"},
+    )
+    found = drift(p)
+    assert len(found) == 1
+    assert found[0].detail["repair_to"] == "leather-jacket"
+
+
+def test_no_tree_means_no_opinion():
+    """A caller that sent no categories must not have every taxonomy repair
+    refused — the same contract the catalog rules keep for an absent list."""
+    raw = {
+        "id": "p1", "tenantId": "t1", "sku": "S1", "productCode": "PC1",
+        "masterCategory": "Men", "category": "Jackets", "subCategory": "Leather Jacket",
+        "size": "S", "euSize": "46", "sizingGuide": "Men Uppers", "brand": "Zara",
+        "color": "Black", "material": "Leather", "condition": "As New",
+        "gender": ["men"], "careLabelCount": 1,
+        "properties": {"mastercategory": "Men's/Unisex"},
+        "columnValues": {"masterCategory": "Unknown"},
+    }
+    p = to_snapshot(raw, catalog={"brands": [], "colors": [], "materials": []})
+    found = drift(p)
+    assert len(found) == 1
+    assert found[0].detail["repair_to"] == "Men's/Unisex"
+
+
 def test_both_empty_is_not_drift():
     """Missing is DATA.010's job. Reporting it here too would double-count."""
     p = snap(
@@ -278,12 +354,20 @@ def test_a_hoodie_on_defaults_names_the_general_upper_chart():
     assert found[0].detail["suggested"] == ["Men Uppers"]
 
 
-def test_a_shirt_on_defaults_keeps_both_and_escalates():
-    """Where the ambiguity is REAL, it must survive.
+def test_a_business_shirt_takes_the_specialised_chart_not_the_general_one():
+    """Two charts fit, and the garment says which.
 
-    A men's business shirt genuinely could take either chart, so naming one
-    would be a guess. Two candidates is the honest answer and the planner turns
-    it into an escalation.
+    This test used to assert an escalation, and that was right while every
+    multi-candidate finding went to a person. `_pick_guide` changed it
+    deliberately: on a real catalogue "Men Uppers" and "Men DressShirts" both
+    list S-XXL, so every men's t-shirt asked a person to pick and the person
+    said "Men Uppers" every time.
+
+    The rule it replaced that with is specific-beats-general, and THIS product is
+    the case that rule exists to get right: a garment whose own taxonomy says
+    "Business Shirt" belongs on the dress-shirt chart. Filing it on the general
+    one would be the same error the escalation was protecting against, only
+    silent. The genuinely open choice is still escalated — see the test below.
     """
     p = upper_snap(category="Shirts", subCategory="Business Shirt")
     found = size012(p)
@@ -292,8 +376,29 @@ def test_a_shirt_on_defaults_keeps_both_and_escalates():
 
     plan: list[dict] = []
     approval._plan_guide_switch(p, gate.check_gate(p, policy()), plan)
-    assert [a["kind"] for a in plan] == ["escalate"]
-    assert "pick one" in plan[0]["detail"]
+    assert [a["kind"] for a in plan] == ["set_column"]
+    assert plan[0]["value"] == "Men DressShirts"
+
+
+def test_a_plain_top_takes_the_general_chart():
+    """Nothing in a t-shirt's taxonomy claims the dress-shirt chart, so the
+    general one wins — which is what "general" means, and what the person was
+    answering every time."""
+    p = upper_snap(category="Tops", subCategory="T-Shirt")
+    plan: list[dict] = []
+    approval._plan_guide_switch(p, gate.check_gate(p, policy()), plan)
+    assert [a["kind"] for a in plan] == ["set_column"]
+    assert plan[0]["value"] == "Men Uppers"
+
+
+def test_a_choice_with_nothing_to_reason_from_still_escalates():
+    """`_pick_guide` returns None when the candidates are all general or all
+    specialised: there is no specific-beats-general to apply, and a guess would
+    be a guess. The escalation this file used to pin has moved here."""
+    assert approval._pick_guide(
+        upper_snap(category="Tops", subCategory="T-Shirt"),
+        ["Men Uppers", "Men Tops"],
+    ) is None
 
 
 def test_the_named_chart_becomes_a_repair():

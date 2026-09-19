@@ -46,11 +46,13 @@ ISSUE CODES, and why each is a risk:
 
   MANUAL_APPROVAL             moved to APPROVED by a person, never verified by the agent
   NO_GATE_RECORD              the lead render was never judged by the image gate
-  NO_PHOTO_AUDIT              the photographs were never checked for wear or defects
+  NO_PHOTO_AUDIT              the photographs were never checked for defects
   GATE_REFUSED_BUT_APPROVED   the gate refused the render and the product was approved anyway
-  PHOTO_AUDIT_HELD_BUT_APPROVED  the photo audit held it (GRADE_SUSPECT / IMAGE_DEFECT); approved anyway
+  PHOTO_AUDIT_HELD_BUT_APPROVED  the photo audit held it (IMAGE_DEFECT); approved anyway
   GATE_WOULD_REFUSE / PHOTO_AUDIT_WOULD_HOLD   only with --judge-images: never judged when approved,
                               judged now, and refused / held
+  PICTURES_COULD_NOT_BE_JUDGED  --judge-images was asked for and the vision call did not run.
+                              Says nothing about the product — the run itself is the fault.
   AGENT_HELD_BUT_APPROVED     the agent's last verdict was HELD or FAILED; a person overrode it
   RULE:<id>                   a Hermes rule fires on it today, blocking or advisory, at its own severity
   RENDERS_INCOMPLETE          fewer than five AI views on file
@@ -243,7 +245,19 @@ def assess(*, record: dict[str, Any], media: list[dict[str, Any]], approved: dic
             add("GATE_WOULD_REFUSE", "high",
                 f'judged now — {now.get("code") or ""}: {"; ".join(now.get("reasons") or [])}'.strip())
         elif now.get("unavailable"):
-            add("NO_GATE_RECORD", "medium", f'never judged; could not judge now — {"; ".join(now.get("reasons") or [])}')
+            # NOT `NO_GATE_RECORD`. That code means "nobody ever judged this",
+            # which a reader treats as history; this means "--judge-images was
+            # asked for and the call did not run", which is a live outage and
+            # says nothing about the product. Reported as its own HIGH code so a
+            # run where the vision provider was down cannot be read as a sheet
+            # full of products whose pictures were merely never checked.
+            #
+            # This is not hypothetical: a run on 18 Sep 2026 reported 393
+            # `NO_GATE_RECORD` and 2 refusals because `google-genai` was missing
+            # from the environment, and the summary looked like an ordinary
+            # backlog of unjudged products.
+            add("PICTURES_COULD_NOT_BE_JUDGED", "high",
+                f'image gate could not run — {"; ".join(now.get("reasons") or [])}')
     else:
         add("NO_GATE_RECORD", "medium", "the lead render was never judged by the image gate")
 
@@ -265,7 +279,12 @@ def assess(*, record: dict[str, Any], media: list[dict[str, Any]], approved: dic
                 f'judged now — {"; ".join(now.get("reasons") or [])} -> re-render {views} '
                 f'(same model; repair_product.py --apply, or check_product.py --apply --render)')
         elif now.get("action") == "skipped" and "could not run" in " ".join(now.get("reasons") or []):
-            add("NO_PHOTO_AUDIT", "low", f'never judged; could not judge now — {"; ".join(now.get("reasons") or [])}')
+            # Same reasoning as the gate's branch above. The photo audit is
+            # `required: false`, so its failure comes back as `skipped` rather
+            # than a hold — which is right for the chain and wrong for a report,
+            # where "skipped" and "checked and fine" must never look alike.
+            add("PICTURES_COULD_NOT_BE_JUDGED", "high",
+                f'photo audit could not run — {"; ".join(now.get("reasons") or [])}')
         elif now.get("soft") and not now.get("bad_cutouts"):
             add("PHOTO_AUDIT_SOFT_FLAGS", "low", "judged now — " + "; ".join(now["soft"])[:300])
         # A cut-out missing part of the garment (MID-000569: the neckband cut
@@ -370,19 +389,44 @@ def judge_now(record: dict[str, Any], media: list[dict[str, Any]], agent: dict[s
               pol: dict[str, Any], force: bool = False) -> dict[str, Any]:
     """`--judge-images`: the gate and the photo audit, run now, for whichever of
     the two the agent never recorded — or both, with `force` (`--rejudge`).
-    Vision calls (cached); no database write."""
+    Vision calls (cached); no database write.
+
+    THE ARGUMENTS ARE THE POINT, and getting them wrong is silent. The vision
+    call itself is keyed on the lead image and a FIXED prompt, so `size`,
+    `kids` and which `gender` is passed change nothing about the model's answer
+    and nothing about the cache — they are read by `decide()`, afterwards. Which
+    means a caller that omits them still gets a verdict, just a weaker one, with
+    no error to say so.
+
+    Omitting them cost a real answer on 18 Sep 2026. This function asked without
+    `size`, so `BODY_SIZE_MISMATCH` could not fire at all, and passed the raw
+    `gender` column rather than the root the master category implies. The sheet
+    reported 18 gender mismatches and no size mismatches across 408 products;
+    `scripts/product_dossier.py`, asking the same cached answers with the full
+    set, found 23 size mismatches in its first 102. Both re-render the whole set,
+    so the under-reading also under-priced the repair.
+
+    So this mirrors `check_product.inspect` exactly. That is the call the chain's
+    own `gate` step makes, and this report exists to predict the chain.
+    """
     from app.imaging import photo_audit, quality_gate
+    from app import readiness
 
     deltas = (agent or {}).get("deltas") or {}
+    root_gender = readiness.root_gender(record.get("masterCategory"), pol)
     out: dict[str, Any] = {}
     if force or not deltas.get("gate"):
         out["gate"] = quality_gate.judge(
-            media, gender=record.get("gender"), category=record.get("category"),
-            subcategory=record.get("subCategory"), pol=pol).as_dict()
+            media, gender=root_gender or record.get("gender"),
+            category=record.get("category"), subcategory=record.get("subCategory"), pol=pol,
+            size=record.get("size") or record.get("internationalSize"),
+            kids=readiness.is_kids(record.get("masterCategory"), record.get("mannequinType"), pol),
+        ).as_dict()
     if force or not deltas.get("photos"):
         out["photos"] = photo_audit.judge(
             media, grade_severity=record.get("gradeSeverity"),
-            grade_label=record.get("gradeLabel") or record.get("grade"), pol=pol).as_dict()
+            grade_label=record.get("gradeLabel") or record.get("grade"), pol=pol,
+            product_gender=root_gender).as_dict()
     return out
 
 
@@ -631,6 +675,14 @@ def write_workbook(rows: list[dict[str, Any]], out: Path, *, dsn: str, start: da
         ("Generated", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")),
         ("Method", method),
     ]
+    # Straight after Method, because it qualifies it: a sheet whose vision calls
+    # did not run is not the report Method claims it is, and that has to be
+    # visible on the first screen rather than only in the Issues tab.
+    unchecked = sum(1 for r in rows
+                    if any(i["code"] == "PICTURES_COULD_NOT_BE_JUDGED" for i in r["issues"]))
+    if unchecked:
+        meta.append(("Pictures UNCHECKED", f"{unchecked} of {len(rows)} product(s) — the vision call did not "
+                                           f"run for these; see PICTURES_COULD_NOT_BE_JUDGED below"))
     for n, (k, v) in enumerate(meta, start=3):
         ws.cell(row=n, column=1, value=k).font = Font(bold=True)
         ws.cell(row=n, column=2, value=v)
@@ -703,11 +755,15 @@ def write_workbook(rows: list[dict[str, Any]], out: Path, *, dsn: str, start: da
 MEANING = {
     "MANUAL_APPROVAL": "moved to APPROVED by a person; the agent never verified it",
     "NO_GATE_RECORD": "the lead render was never judged by the image gate (no model, bad face, wrong gender, broken body)",
-    "NO_PHOTO_AUDIT": "the photographs were never checked for wear against the grade or for gallery defects",
+    "NO_PHOTO_AUDIT": "the photographs were never checked for gallery or render defects",
     "GATE_REFUSED_BUT_APPROVED": "the image gate refused the render and the product was approved anyway",
-    "PHOTO_AUDIT_HELD_BUT_APPROVED": "the photo audit held or refused it (GRADE_SUSPECT / IMAGE_DEFECT / RENDER_DEFECT) and it was approved anyway",
+    "PHOTO_AUDIT_HELD_BUT_APPROVED": "the photo audit held or refused it (IMAGE_DEFECT / RENDER_DEFECT) and it was approved anyway",
     "GATE_REFUSED": "not approved (yet); the image gate refused the render on the agent's last run",
     "PHOTO_AUDIT_HELD": "not approved (yet); the photo audit held or refused it on the agent's last run",
+    "PICTURES_COULD_NOT_BE_JUDGED": ("--judge-images was asked for and the vision call did not run, so these "
+                                     "pictures are UNCHECKED — not passed, not failed. Read the detail for the "
+                                     "reason (a missing SDK, no API key, a provider outage, images that would "
+                                     "not download), fix it and run again; the cache makes a repeat run cheap"),
     "GATE_WOULD_REFUSE": "never judged when approved; judged now with --judge-images, the image gate refuses the render",
     "PHOTO_AUDIT_WOULD_HOLD": "never judged when approved; judged now with --judge-images, the photo audit holds it",
     "RENDER_DEFECT": "judged now with --judge-images: a render carries a visible AI defect (a smeared limb, duplicated garments, clutter) or shows a different model than the other renders — the chain re-renders that view with the same model",

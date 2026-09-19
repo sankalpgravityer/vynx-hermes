@@ -218,13 +218,24 @@ def image_notes(loaded: dict[str, Any], rep: dict[str, Any],
             by_view[str(check.get("view"))].append(f"frame: {check['problem']}")
 
     # 3. The cut-out measurement, which carries its own urls.
+    #
+    # NOT "NO ORIGINAL ON FILE" (docs/PICTURE-CHECK-FIXES.md item 9, §2.2). A
+    # cut-out of WEB origin has no booth capture to pair with — the sweatshirt's
+    # are WEB while its photographs are DECISION and PHOTOBOOTH — so
+    # `cutout_pairs` finds nothing and the canvas comparison cannot run. That is
+    # the normal state for a picture uploaded through the web, and nothing is
+    # wrong with it; drawn here it became a red border and a red caption on a
+    # perfectly good cut-out. `cutouts.judge` now keeps it off `note` entirely
+    # (`original_note`, JSON only) — this line is for the dossiers re-rendered
+    # from reports written before that change.
     for check in (rep.get("measured") or {}).get("checks") or []:
         for problem in check.get("problems") or []:
             add_url(check.get("url"), str(problem))
         for flaw in check.get("flaws") or []:
             add_url(check.get("url"), str(flaw))
-        if check.get("note"):
-            add_url(check.get("url"), str(check["note"]))
+        note = str(check.get("note") or "")
+        if note and not note.startswith("no original on file"):
+            add_url(check.get("url"), note)
 
     # 4. The rules that name a picture (IMG.026, IMG.027).
     for issue in rep.get("issues") or []:

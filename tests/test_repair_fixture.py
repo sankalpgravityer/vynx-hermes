@@ -26,8 +26,13 @@ def test_the_shipped_fixture_is_judged_without_a_database():
     assert r["sku"] == "BOA-006114" and r["tenant"] == "BOAS" and r["stage"] == "REVIEW"
     assert r["verified"] is False
     blocking = {f["rule_id"] for f in r["blocking"]}
-    # The six defects the record carries; every one is a different rule family.
-    assert {"PRICE.003", "TAX.004", "TAX.005", "DATA.010", "SIZE.011", "IMG.030"} <= blocking
+    # The five blocking defects the record carries; each a different rule family.
+    assert {"PRICE.003", "TAX.004", "TAX.005", "SIZE.011", "IMG.030"} <= blocking
+    # This fixture's only missing required field is `material`, and material stops
+    # products no longer (`rules.severity_overrides` in policy.yaml). The field is
+    # still reported as absent — the state block below is read from the record, not
+    # from the findings — it simply no longer holds the product.
+    assert "DATA.010" not in {f["rule_id"] for f in r["blocking"] + r["advisory"]}
     assert r["state"]["care_label"] == 0
     assert r["state"]["renders"] == 5
     assert "material" in r["state"]["attributes_missing"]

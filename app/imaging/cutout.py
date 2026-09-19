@@ -38,7 +38,9 @@ import base64
 import io
 import logging
 import os
+import re
 import time
+from copy import deepcopy
 from typing import Any
 
 from app.config import policy, settings
@@ -47,6 +49,95 @@ from app.imaging import openai_image
 from app.net import genai_client_args
 
 log = logging.getLogger("hermes.cutout")
+
+# The `imagery.cutout` policy block, with its defaults. Everything items 6, 7
+# and 8 of docs/PICTURE-CHECK-FIXES.md decide is a number here, so a threshold
+# can be moved from config/policy.yaml with a reload and no code change — the
+# same arrangement `readiness.cutouts` has for the checks in cutouts.py.
+DEFAULTS: dict[str, Any] = {
+    # The long edge every pixel comparison below is made on. 448 to match
+    # `readiness.cutouts.garment_check.work_width`: the two ask the same
+    # question of the same garment and a different grid would give them
+    # different answers about the same picture.
+    "work_px": 448,
+    # --- item 7: the set the segmenter left behind -------------------------
+    #
+    # A cut-out is judged against the SOURCE's backdrop when the source has one
+    # (the original path), and against ITS OWN otherwise — which is every
+    # studio sweep with uneven lighting, the case that used to abstain.
+    #
+    # The fraction of the KEPT pixels one contiguous backdrop-coloured region
+    # may cover. 0.01 is the bar the source-backdrop path already uses and the
+    # measurements either side of it are wider here than they were there: the
+    # Nike booth cut-out (`fc8e53e7`, cloth-seg, podium kept) measures 1.70%
+    # against its own white backdrop, and the same cut-out with the podium
+    # taken off measures 0.01% — a factor of 170.
+    "leftover_region_max": 0.01,
+    # THE BOTTOM BAND, SEPARATELY, BECAUSE A PODIUM IS ALWAYS THERE. The
+    # bottom this fraction of the KEPT region's own rows — not the frame's,
+    # which on `fc8e53e7` is transparent under the podium — and the fraction of
+    # the pixels kept there that are the backdrop's colour rather than garment.
+    # Measured: 31.9% with the podium, 0.0% without it. 0.25 sits between them
+    # and well clear of both.
+    "leftover_bottom_fraction": 0.10,
+    "leftover_bottom_max": 0.25,
+    # WHEN THIS QUESTION MAY NOT BE PUT AT ALL. The garment has to be separable
+    # from the cut-out's own backdrop before "opaque, and the backdrop's
+    # colour" can mean "left over": a white shirt on a white backdrop reads as
+    # backdrop everywhere and every pixel the segmenter kept would look like a
+    # podium. So at least this much of what was kept must differ from the
+    # backdrop, or the measurement is `unknown` and NOTHING is refused — the
+    # same rule §0 sets for every derived mask.
+    "leftover_garment_min": 0.50,
+    # Some of the picture must actually be clear. A fully opaque result is a
+    # composited cut-out (§0), where "opaque" is the whole frame and this
+    # measurement would refuse everything; `garment_kept` is the check that
+    # reads those.
+    "leftover_min_clear": 0.02,
+    # --- item 6: a leftover is fixed with a DIFFERENT segmenter ------------
+    #
+    # Re-matting a stand with cloth-seg produces the same stand — it is a
+    # clothing parser, the podium is directly beneath the clothing, and its
+    # mask runs at 320px (§1.1). So a re-matte asked for because something was
+    # LEFT IN goes to the mask strategies instead, in this order.
+    "leftover_strategies": ["gemini-mask", "openai-mask"],
+    # …and the result is intersected with cloth-seg, so the garment parser
+    # still decides what is cloth. Measured on the same Nike tee: cloth-seg
+    # removed the hanger and the form's neck and kept the whole podium; a
+    # matting model removed the podium and kept the hanger. The intersection is
+    # the only combination that removes both.
+    "intersect_cloth": True,
+    # --- item 8: a replacement is never worse than what it replaces --------
+    #
+    # How much less garment the new cut-out may have than the one it would
+    # supersede, both segmented against their own flat backdrop. KIL-001625's
+    # re-matte took "a large part of shirt back" out; two segmenters honestly
+    # disagree about a hem or a feathered edge by a percent or two, and that is
+    # what the room below 0.10 is for.
+    "replace_area_drop_max": 0.10,
+    # …and the same defect when it is too small to move the total: KIL-001644
+    # lost one strap. A SINGLE PIECE of the garment this big, missing from the
+    # new cut-out and touching the garment's edge, is refused on its own.
+    # Opened first (`replace_open_px`) so the thin rim two segmenters always
+    # differ by cannot add up to one — a 1px outline around a whole garment is
+    # one connected region of several percent and is not a missing strap.
+    "replace_loss_region_max": 0.02,
+    "replace_open_px": 5,
+    # Two cut-outs of different SHAPES are not the same picture measured twice,
+    # and a pixel comparison between them would be nonsense. Beyond this the
+    # replacement is not judged (and therefore not refused).
+    "replace_ratio_tolerance": 0.05,
+}
+
+
+def config(pol: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The `imagery.cutout` block with defaults filled in."""
+    out = deepcopy(DEFAULTS)
+    over = ((pol if pol is not None else policy()).get("imagery") or {}).get("cutout") or {}
+    for k, v in over.items():
+        if v is not None:
+            out[k] = v
+    return out
 
 # Written for a SEGMENTER's job, not an artist's. Every clause is there because
 # a generative model will otherwise take liberties: re-light the garment, crop
@@ -382,8 +473,11 @@ def _cloth_seg(data: bytes) -> tuple[bytes | None, str | None]:
     return buf.getvalue(), None
 
 
-def _kept_backdrop(source: bytes, result: bytes) -> tuple[bool, str]:
-    """Did the cut-out keep part of the studio backdrop? (ok, why)
+def _source_backdrop(source: bytes, result: bytes) -> tuple[bool | None, str]:
+    """Did the cut-out keep part of the SOURCE's backdrop? (ok, why)
+
+    `ok` is None when the question could not be put at all — the caller then
+    asks the cut-out's own backdrop instead (item 7; see `_kept_backdrop`).
 
     THE HOLE THIS FILLS. `_is_cutout` asks the review rules' classifier, which
     looks at the FRAME BORDER — the right question for "has anything been
@@ -400,9 +494,11 @@ def _kept_backdrop(source: bytes, result: bytes) -> tuple[bool, str]:
 
     WHEN IT DECLINES TO JUDGE. If the source border is not uniform there is no
     single backdrop colour to measure against, and a made-up one would reject
-    good cut-outs; the check abstains and says so. A white garment on a white
-    sweep will trip it — correctly, since that is the case where the boundary
-    is genuinely ambiguous and a human should look.
+    good cut-outs. That abstention used to END the check, and it is why Hermes
+    returned `ok: true` on the Nike booth photograph with the whole podium
+    still in the cut-out: "source border is not uniform (spread 71), not
+    checked" (§1.1). It now hands the question to `_own_leftovers`, which needs
+    no uniform source at all.
     """
     from PIL import Image
     import numpy as np
@@ -422,7 +518,7 @@ def _kept_backdrop(source: bytes, result: bytes) -> tuple[bool, str]:
         src = np.asarray(Image.open(io.BytesIO(source)).convert("RGB"))
         res = Image.open(io.BytesIO(result)).convert("RGBA")
     except Exception:  # noqa: BLE001
-        return True, "unchecked"
+        return None, "the source or the result could not be decoded"
 
     h, w = src.shape[:2]
     band = max(2, int(min(h, w) * 0.03))
@@ -434,15 +530,15 @@ def _kept_backdrop(source: bytes, result: bytes) -> tuple[bool, str]:
     spread = float(np.median(np.abs(border - backdrop).sum(axis=1)))
     del border
     if spread > 60:
-        return True, f"source border is not uniform (spread {spread:.0f}), not checked"
+        return None, f"source border is not uniform (spread {spread:.0f})"
 
     arr = np.asarray(res)
     if arr.shape[:2] != src.shape[:2]:
-        return True, "sizes differ, not checked"
+        return None, "the result is not the source's size"
 
     opaque = arr[:, :, 3] >= 250
     if not opaque.any():
-        return True, "nothing opaque"
+        return None, "nothing opaque"
 
     # Same distance metric as the chroma key, for the same reason: a JPEG edge
     # never lands exactly on the backdrop colour.
@@ -501,6 +597,396 @@ def _kept_backdrop(source: bytes, result: bytes) -> tuple[bool, str]:
     return True, (f"largest backdrop-coloured region {largest:.1%}"
                   + (f", {scattered:.0%} scattered (garment print)"
                      if scattered > 0.02 else ""))
+
+
+# --------------------------------------------------------------------------- #
+# The cut-out's OWN backdrop — item 7 of docs/PICTURE-CHECK-FIXES.md
+# --------------------------------------------------------------------------- #
+#
+# WHY A SECOND WAY OF ASKING THE SAME QUESTION. `_source_backdrop` needs one
+# backdrop colour in the PHOTOGRAPH, and a studio sweep does not have one: the
+# middle of the wall is lit harder than its edges, the floor is a different
+# surface from the sweep, and the border band takes in all of it. On the Nike
+# booth photograph (`fc8e53e7-…-original_front.jpg`) that band measured a
+# spread of 71 against a ceiling of 60, so the check said "source border is not
+# uniform, not checked" and `remove_background` returned `ok: true` with the
+# entire podium still under the shirt (§1.1). Every booth photograph with
+# uneven lighting disabled it the same way — the check was written FOR a
+# surviving podium and was off exactly where podiums are.
+#
+# THE CUT-OUT ITSELF HAS A BACKDROP AND IT IS FLAT BY CONSTRUCTION. Everything
+# this module returns writes (255,255,255,0) under full transparency —
+# `_key_out`, `_apply_mask` and `_cloth_seg` all neutralise the RGB there, for
+# the separate reason that anything flattening the cut-out onto white must not
+# reveal what used to be behind the garment. So the corners are white, exactly
+# white, and segmenting against them is the easy problem §0 describes rather
+# than the impossible one §1.3 does.
+#
+# WHAT IS COUNTED. The garment's real outline, from `cutouts.garment_mask` on
+# the cut-out composited over its own backdrop colour (item 1 — the alpha
+# cannot be used here, because the alpha is precisely what kept the podium),
+# and then: pixels the segmenter KEPT which are nonetheless the backdrop's
+# colour and lie OUTSIDE that outline. A podium is white, kept, and not
+# garment. A garment is not.
+#
+# Measured on the real cut-out in the repository root, at the 448px work grid:
+#
+#                                      largest region   scattered   bottom band
+#     fc8e53e7 as cloth-seg cut it          1.70%         2.94%        31.9%
+#     the same, podium taken off            0.01%         0.02%         0.0%
+#
+# The podium's grey RIM sits further than `mask_rgb_tolerance` from white and
+# is therefore counted as garment; only its flat white interior is counted as
+# leftover, which is why 1.70% understates what the eye sees. It does not
+# matter — the bar is 1%, and the clean cut-out measures 0.01%.
+
+def _flatten(data: bytes, cfg: dict[str, Any],
+             size: tuple[int, int] | None = None) -> tuple[Any, Any, Any, str | None]:
+    """A cut-out over its OWN flat backdrop. `(flat RGB image, alpha, backdrop, error)`.
+
+    THE RGB AND THE ALPHA ARE RESIZED SEPARATELY, and that is not a style
+    choice: Pillow resamples RGBA with PREMULTIPLIED alpha, so every fully
+    transparent pixel comes back rgb(0,0,0) and the corner colour — the whole
+    basis of the segmentation below — reads black instead of the white that is
+    actually written there. Measured on `fc8e53e7`: the corner is
+    (255,255,255,0) at 3000×4000 and (0,0,0,0) after a thumbnail to 448.
+
+    COMPOSITED RATHER THAN JUST DROPPING THE ALPHA, because a cut-out this
+    module did not make need not carry a neutralised backdrop: everything here
+    writes (255,255,255,0) under full transparency, but a foreign one may still
+    have the photograph's own pixels there and dropping the alpha would hand
+    `garment_mask` the whole room. Painting the corner colour in makes the
+    backdrop flat by construction whatever was underneath, which is exactly the
+    condition item 1 needs.
+    """
+    from PIL import Image
+    import numpy as np
+
+    from app.imaging import cutouts
+
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGBA")
+    except Exception as exc:  # noqa: BLE001
+        return None, None, None, f"could not be decoded ({exc.__class__.__name__})"
+    if size is None:
+        # Downsampled first, and the whole measurement is made here: a 3000×4000
+        # RGBA is 12 megapixels compared four ways, and this runs on every
+        # candidate from every provider. A garment's outline and a podium are
+        # both hundreds of pixels across — neither needs full resolution.
+        work = int(cfg.get("work_px") or 448)
+        scale = min(1.0, work / float(max(img.size)))
+        size = (max(8, int(round(img.width * scale))), max(8, int(round(img.height * scale))))
+
+    rgb = np.asarray(img.convert("RGB").resize(size, Image.Resampling.LANCZOS)).astype(np.float32)
+    alpha = np.asarray(img.getchannel("A").resize(size, Image.Resampling.LANCZOS))
+    back = cutouts.corner_backdrop(
+        Image.fromarray(rgb.astype("uint8"), "RGB"), cutouts.config(policy()))
+    if back is None:
+        return None, None, None, "its own backdrop colour could not be read"
+    a = (alpha.astype(np.float32) / 255.0)[..., None]
+    flat = rgb * a + np.asarray(back, dtype=np.float32) * (1.0 - a)
+    return Image.fromarray(flat.clip(0, 255).astype("uint8"), "RGB"), alpha, back, None
+
+
+def _own_leftovers(result: bytes, cfg: dict[str, Any]) -> dict[str, Any]:
+    """What the cut-out says about itself: `largest`, `scattered`, `bottom`.
+
+    All three are fractions of the pixels the segmenter KEPT. A `note` and no
+    numbers means the question could not be put, and nothing may be refused on
+    it — the same rule §0 sets for every derived mask.
+    """
+    import numpy as np
+
+    from app.imaging import cutouts
+
+    flat, alpha, back, err = _flatten(result, cfg)
+    if err:
+        return {"note": f"the cut-out {err}"}
+
+    opaque = alpha >= 250
+    kept = int(opaque.sum())
+    if not kept:
+        return {"note": "nothing opaque"}
+    clear = float((alpha < 128).mean())
+    if clear < float(cfg.get("leftover_min_clear") or 0.02):
+        # A fully opaque result is a COMPOSITED cut-out (§0), where "the pixels
+        # the segmenter kept" is the whole frame and every backdrop pixel would
+        # read as a podium. `garment_kept` is the check that reads those.
+        return {"note": f"the result is {clear:.1%} clear — not a cut-out to read this way"}
+
+    # Segmented by COLOUR against that flat backdrop, never by the alpha:
+    # handed the alpha `garment_mask` would take it, and the alpha is what kept
+    # the podium — it would answer "the garment is the shirt AND the podium"
+    # and find nothing left over. Flattening removes that option from it.
+    garment, info = cutouts.garment_mask(flat, cutouts.config(policy()))
+    if garment is None:
+        return {"note": info.get("note") or "the garment's shape could not be derived"}
+
+    share = float((garment & opaque).sum()) / float(kept)
+    floor = float(cfg.get("leftover_garment_min") or 0.5)
+    if share < floor:
+        # The garment is the backdrop's own colour — a white shirt on white.
+        # Every pixel kept then looks like a podium, so the honest answer is
+        # that this cannot be told apart, not that the cut-out is bad.
+        return {"note": (f"only {share:.0%} of what was kept differs from the cut-out's own "
+                         f"backdrop {cutouts.to_hex(back)} — the garment is the backdrop's "
+                         f"colour, so a leftover cannot be told from the garment")}
+
+    leftover = opaque & ~garment
+    out: dict[str, Any] = {
+        "backdrop": cutouts.to_hex(back),
+        "garment_share": round(share, 4),
+        "scattered": round(float(leftover.sum()) / float(kept), 4),
+    }
+
+    # THE BOTTOM BAND, MEASURED ON THE KEPT REGION AND NOT THE FRAME. On
+    # `fc8e53e7` the frame's own bottom rows are transparent — the podium ends
+    # three quarters of the way down the picture — so a band taken from the
+    # frame would sample nothing at all. The bottom of what the segmenter KEPT
+    # is where a podium is, always, because the podium is what the garment
+    # stands on.
+    rows = np.where(opaque.any(axis=1))[0]
+    y0, y1 = int(rows.min()), int(rows.max())
+    band = max(1, int(round((y1 - y0 + 1) * float(cfg.get("leftover_bottom_fraction") or 0.10))))
+    strip = slice(y1 - band + 1, y1 + 1)
+    out["bottom"] = round(float(leftover[strip].sum()) / max(1.0, float(opaque[strip].sum())), 4)
+
+    # One piece or speckle, the same question `_source_backdrop` asks and for
+    # the same reason: a pale print is broken into fragments by the garment's
+    # own colours, a podium is not.
+    #
+    # AND IT HAS TO REACH THE OUTSIDE OF THE CUT-OUT. This backdrop is PURE
+    # WHITE — the colour this module writes under full transparency — where the
+    # source's was whatever the studio wall happened to be, so a garment with a
+    # genuinely white panel or logo has a solid region of it inside the
+    # silhouette and would be refused by every strategy in turn, leaving the
+    # product with no cut-out at all. What is left of the SET is never inside:
+    # a podium hangs off the hem, a halo rings the outline, a strip of sweep
+    # runs to the frame. Measured on `fc8e53e7`: its podium's largest piece
+    # (1.70%) touches the transparent outside, and the enclosed second piece
+    # (1.20%) is not needed to catch it.
+    try:
+        import cv2
+
+        n, lbl, stats, _c = cv2.connectedComponentsWithStats(
+            leftover.astype(np.uint8), connectivity=8)
+        outside = cv2.dilate((~opaque).astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+        biggest = 0.0
+        # Largest first, stopping at the first that reaches the outside. Capped
+        # because a speckled print can leave hundreds of fragments and none of
+        # them past the first few can be a podium.
+        for i in (np.argsort(-stats[1:, cv2.CC_STAT_AREA]) + 1)[:32] if n > 1 else []:
+            if bool((outside & (lbl == i)).any()):
+                biggest = float(stats[i, cv2.CC_STAT_AREA]) / float(kept)
+                break
+        out["largest"] = round(biggest, 4)
+    except Exception:  # noqa: BLE001 — no cv2: the bottom band still answers
+        out["largest"] = None
+    return out
+
+
+def _kept_backdrop(source: bytes, result: bytes,
+                   cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Did the cut-out keep part of the set? (ok, why)
+
+    TWO WAYS OF ASKING IT, and the second is item 7. The source's backdrop when
+    the source HAS one — the original check, unchanged, and the stricter of the
+    two because it knows the colour it is looking for. The CUT-OUT's own
+    backdrop otherwise, and additionally in the bottom band, which is where a
+    podium is whether or not the photograph's border happened to be uniform.
+
+    The two disagree only in one direction: the source path can see a podium
+    the same colour as the garment (it matches the sweep, not the shirt), and
+    the own path can see one on a photograph the source path refuses to judge.
+    Neither can pass what the other fails, so both are asked and either can
+    refuse.
+    """
+    cfg = cfg if cfg is not None else config()
+    src, src_why = _source_backdrop(source, result)
+    if src is False:
+        return False, src_why
+
+    own = _own_leftovers(result, cfg)
+    if own.get("note"):
+        # Nothing may be refused on a measurement that did not happen — but the
+        # reason is carried, because "not checked" hiding a podium is exactly
+        # what item 7 exists to end and a silent abstention is how it hid.
+        if src is True:
+            return True, f"{src_why}; own backdrop not read ({own['note']})"
+        return True, f"not checked: {src_why}, and the cut-out's own backdrop — {own['note']}"
+
+    largest, bottom = own.get("largest"), float(own.get("bottom") or 0.0)
+    region_max = float(cfg.get("leftover_region_max") or 0.01)
+    bottom_max = float(cfg.get("leftover_bottom_max") or 0.25)
+    tail = ("" if src is True else f" (the source border could not be used: {src_why})")
+
+    if largest is not None and largest > region_max:
+        return False, (f"a single {largest:.0%} region of the cut-out is its own backdrop "
+                       f"colour {own['backdrop']} outside the garment's outline — the mask "
+                       f"left the podium, the stand or a halo behind{tail}")
+    if bottom > bottom_max:
+        return False, (f"{bottom:.0%} of what the cut-out keeps in its bottom band is the "
+                       f"backdrop colour {own['backdrop']}, not garment — the garment is "
+                       f"standing on something the mask kept{tail}")
+    if largest is None and float(own.get("scattered") or 0.0) > 0.05:
+        # No cv2, so no shape information: the blunt total, over-rejecting a
+        # patterned garment, which is the failure this module can afford.
+        return False, (f"{own['scattered']:.0%} of the cut-out is its own backdrop colour "
+                       f"outside the garment (no cv2 — shape not checked){tail}")
+    return True, (f"{src_why}; own backdrop: largest region "
+                  f"{'unknown (no cv2)' if largest is None else f'{largest:.1%}'}, "
+                  f"bottom band {bottom:.0%}")
+
+
+# --------------------------------------------------------------------------- #
+# A replacement is never worse than what it replaces — item 8
+# --------------------------------------------------------------------------- #
+#
+# WHAT WENT WRONG. Test list 3: KIL-001625's BACK cut-out came back with "large
+# part of shirt back missing" and KIL-001644's with "background mask cut into
+# left strap; strap missing". Neither is a false positive — both are damage the
+# RE-MATTE caused. The chain re-mattes through `backfill-bg-removal.ts
+# --replace`, which calls `replaceWithDerived`: the new cut-out takes the slot
+# and the old one is superseded. Every check Hermes has runs AFTER that, so the
+# worse picture is already live by the time it is judged, and all the finding
+# can do is ask for the same thing to be tried again.
+#
+# So this is a PRECONDITION and not a report. A candidate that has passed every
+# other check is compared against the cut-out it would supersede, and one that
+# has materially less garment — or one contiguous piece missing at an edge — is
+# refused like any other failed candidate: the chain moves to the next
+# strategy, and if none of them beats what is on file, nothing is written and
+# `remove_background` says the existing cut-out was kept.
+#
+# CUT-OUT AGAINST CUT-OUT, never cut-out against photograph. Both have a flat
+# uniform backdrop, which is a reliable segmentation (§0, item 1); the
+# photograph has a lit studio wall, which is not (§1.3 — BOA-006151's garment
+# sits 15 from its own backdrop). The old cut-out is normally the COMPOSITED
+# one vnyx-api stores (opaque on rgb(235,235,235)) and the new one is Hermes'
+# own (transparent, white underneath), so each is segmented against its own
+# backdrop and the two masks are compared on one grid. Reading the new one's
+# alpha and the old one's colour would compare two different questions.
+
+def _garment_on(data: bytes, size: tuple[int, int],
+                cfg: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
+    """One cut-out's garment on a given grid. `(mask, info)`, mask None if unknown.
+
+    The flattening is a no-op in effect when the cut-out is already opaque
+    (every one vnyx-api stores) and paints the backdrop in when it is not, so
+    the composited old cut-out and the transparent new one arrive at
+    `garment_mask` as the same kind of picture and are segmented by the same
+    rule. Reading one's alpha and the other's colour would compare two
+    different questions and call the difference garment loss.
+    """
+    from app.imaging import cutouts
+
+    flat, _alpha, back, err = _flatten(data, cfg, size)
+    if err:
+        return None, {"note": err}
+    mask, info = cutouts.garment_mask(flat, cutouts.config(policy()))
+    info["backdrop"] = cutouts.to_hex(back)
+    return mask, info
+
+
+def garment_kept(previous: bytes, candidate: bytes,
+                 cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Is the candidate at least as complete as the cut-out it would replace?
+
+    (ok, why). ok is True when it is — and also when the two cannot honestly be
+    compared, because a replacement must be refused on evidence, not on the
+    absence of it.
+    """
+    from PIL import Image
+    import numpy as np
+
+    cfg = cfg if cfg is not None else config()
+    try:
+        old_im = Image.open(io.BytesIO(previous))
+        new_im = Image.open(io.BytesIO(candidate))
+        old_w, old_h = old_im.size
+        new_w, new_h = new_im.size
+    except Exception as exc:  # noqa: BLE001
+        return True, (f"the existing cut-out could not be read "
+                      f"({exc.__class__.__name__}), not compared")
+    if not (old_w and old_h and new_w and new_h):
+        return True, "one of the two has no size, not compared"
+
+    # THE SAME PICTURE, OR TWO PICTURES? A cut-out cropped to its bounding box
+    # and one on the photograph's frame hold the garment at different scales,
+    # and a pixel comparison between them measures the crop rather than the
+    # mask. `frame_mismatch` in cutouts.py is what catches that; here it means
+    # the two are not comparable and nothing is refused.
+    tol = float(cfg.get("replace_ratio_tolerance") or 0.05)
+    r_old, r_new = old_w / old_h, new_w / new_h
+    if abs(r_new - r_old) / r_old > tol:
+        return True, (f"the existing cut-out is {old_w}×{old_h} ({r_old:.3f}) and the new one "
+                      f"{new_w}×{new_h} ({r_new:.3f}) — different frames, not compared")
+
+    work = int(cfg.get("work_px") or 448)
+    scale = min(1.0, work / float(max(old_w, old_h)))
+    size = (max(8, int(round(old_w * scale))), max(8, int(round(old_h * scale))))
+
+    old, old_info = _garment_on(previous, size, cfg)
+    if old is None:
+        # Nothing to be more complete THAN. This is also the honest answer for
+        # a garment the colour of its own backdrop, which no mask can measure.
+        return True, f"the existing cut-out's garment could not be derived ({old_info.get('note')})"
+    new, new_info = _garment_on(candidate, size, cfg)
+    if new is None:
+        # The candidate cannot be shown to keep the garment, and it is the one
+        # asking to replace something that works. Refused, and said plainly.
+        return False, (f"the new cut-out's garment could not be derived "
+                       f"({new_info.get('note')}) — the cut-out on file was KEPT")
+
+    old_area, new_area = float(old.sum()), float(new.sum())
+    if old_area < 100:
+        return True, "the existing cut-out has almost no garment in it, not compared"
+
+    share = new_area / old_area
+    drop = 1.0 - share
+    drop_max = float(cfg.get("replace_area_drop_max") or 0.10)
+    if drop > drop_max:
+        return False, (f"the new cut-out has {drop:.0%} less garment than the one it would "
+                       f"replace ({int(new_area)} against {int(old_area)} garment pixels, "
+                       f"each against its own backdrop) — the cut-out on file was KEPT")
+
+    # ONE PIECE MISSING AT AN EDGE, which the total above cannot see: KIL-001644
+    # lost a single strap, a couple of percent of the garment. Opened first,
+    # because the thin rim two segmenters always differ by is ONE connected
+    # region around the whole outline and would otherwise read as a missing
+    # strap every time.
+    lost = old & ~new
+    if not lost.any():
+        return True, f"the new cut-out has {share:.0%} of the garment on file, nothing lost"
+    piece = None
+    try:
+        import cv2
+
+        k = max(3, int(cfg.get("replace_open_px") or 5)) | 1
+        kernel = np.ones((k, k), np.uint8)
+        opened = cv2.morphologyEx(lost.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+        # The rim of the OLD garment: a loss that touches it ate in from the
+        # outside, which is what a mask cutting into a strap or a shirt back
+        # does. A pinhole in the middle is a different defect and the total
+        # above is what would catch it.
+        rim = old & ~cv2.erode(old.astype(np.uint8), kernel).astype(bool)
+        n, lbl, stats, _c = cv2.connectedComponentsWithStats(opened, connectivity=8)
+        floor = float(cfg.get("replace_loss_region_max") or 0.02)
+        for i in range(1, n):
+            blob = float(stats[i, cv2.CC_STAT_AREA]) / old_area
+            if blob >= floor and bool((rim & (lbl == i)).any()):
+                piece = blob
+                break
+    except Exception:  # noqa: BLE001 — no cv2: the total above is all there is
+        return True, (f"the new cut-out has {share:.0%} of the garment on file "
+                      f"(no cv2 — a single missing piece was not looked for)")
+
+    if piece is not None:
+        return False, (f"one piece of {piece:.0%} of the garment is missing from the new "
+                       f"cut-out at its edge — a strap, a sleeve or part of the back that "
+                       f"the mask cut into — the cut-out on file was KEPT")
+    return True, (f"the new cut-out has {share:.0%} of the garment on file, largest single "
+                  f"loss under {float(cfg.get('replace_loss_region_max') or 0.02):.0%}")
 
 
 def _gemini(
@@ -711,15 +1197,129 @@ def _has_alpha(data: bytes) -> bool:
     return bool((alpha == 0).mean() > 0.02)
 
 
+def _intersect_alpha(mask_png: bytes, cloth_png: bytes) -> tuple[bytes | None, str | None]:
+    """Keep only what BOTH cut-outs kept. Returns (png, error).
+
+    THE SECOND SEGMENTER, AND WHY IT IS AN INTERSECTION (item 6). Measured on
+    the Nike tee (`fc8e53e7-…-original_front.jpg`): cloth-seg removed the hanger
+    and the form's neck and kept the whole podium; a matting model removed the
+    podium and kept the hanger. NEITHER IS RIGHT ALONE, and the two are wrong
+    about different things — so a pixel is garment only where both say it is.
+    The mask strategy decides that the podium is not the product; the garment
+    parser still decides what is cloth, which is the half a general matting
+    model has never been able to do.
+
+    The RGB is the mask candidate's, which is the original photograph's — this
+    only ever lowers the alpha.
+    """
+    from PIL import Image
+    import numpy as np
+
+    try:
+        a = Image.open(io.BytesIO(mask_png)).convert("RGBA")
+        b = Image.open(io.BytesIO(cloth_png)).convert("RGBA")
+    except Exception as exc:  # noqa: BLE001
+        return None, f"could not decode a cut-out to intersect ({exc.__class__.__name__})"
+    if b.size != a.size:
+        b = b.resize(a.size, Image.Resampling.BILINEAR)
+
+    arr = np.asarray(a).copy()
+    alpha = np.minimum(arr[:, :, 3], np.asarray(b)[:, :, 3])
+    kept = float((alpha >= 250).mean())
+    if kept < 0.02:
+        return None, f"the two masks barely overlap ({kept:.1%} kept) — no garment in common"
+    if kept > 0.97:
+        return None, f"the intersection is the whole frame ({kept:.1%}) — nothing removed"
+    arr[:, :, 3] = alpha
+    arr[alpha == 0] = (255, 255, 255, 0)
+
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGBA").save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), None
+
+
+# The four strategies, in the order they are tried. Named at module level
+# because a caller may now ask for a SUBSET of them by name (`strategies` /
+# `skip`) and the endpoint has to be able to say which names exist without
+# reaching into the chain below.
+STRATEGY_NAMES = ("cloth-seg", "gemini-mask", "openai-mask", "gemini-paint")
+
+# The provider a refusal carries when the candidate was good enough to keep but
+# not good enough to REPLACE what is already on file (item 8). It is not "none"
+# — nothing failed, and the caller must not re-queue the product to try the
+# same thing again.
+KEPT_EXISTING = "kept-existing"
+
+
+# What the photo audit writes when a PART OF THE GARMENT is gone, as against
+# something left in: "collar cut away by background removal" (MID-000569),
+# "large part of shirt back missing" (KIL-001625), "background mask cut into
+# left strap; strap missing" (KIL-001644), and the `missing_parts` list's own
+# "{part} missing".
+_MISSING_RE = re.compile(r"\b(missing|cut away|cut off|cut into|eaten|gone|chopped)\b")
+
+
+def rematte_strategies(reason: str, cfg: dict[str, Any] | None = None) -> list[str] | None:
+    """Which strategies a RE-matte should ask for, given why it was asked for.
+
+    None means "the default chain" — the answer for a cut-out being made again
+    because part of the GARMENT is missing, where cloth-seg is still the best
+    first answer and the fault was in the picture or the mask's edges.
+
+    A list means the cut-out has something LEFT IN it: a stand, a hanger, a
+    hand. Re-matting that with cloth-seg produces the same stand — it is a
+    clothing parser, a podium is directly beneath the clothing, and its mask
+    runs at 320px — and the same verification then passes it again, which is
+    why MID-000521 carried "stand visible at bottom" on all four cut-outs
+    through every repair run (§1.1). So the mask strategies are asked instead,
+    and the result is intersected with cloth-seg.
+
+    The words are photo_audit's own `_LEFTOVER_RE` — IMPORTED rather than
+    copied, so the list that decides what is a leftover and the list that
+    decides what to do about one cannot drift apart.
+    """
+    from app.imaging.photo_audit import _LEFTOVER_RE
+
+    text = str(reason or "").lower()
+    if not _LEFTOVER_RE.search(text):
+        return None
+    # BOTH AT ONCE IS NOT THIS CASE. A defect that says a hanger is visible AND
+    # that the collar was cut away is a mask wrong in both directions, and a
+    # second segmenter is not the answer to the second half — it would trade
+    # MID-000521's stand for MID-000569's missing neckband. The default chain,
+    # and item 8 keeps whichever cut-out has more of the garment.
+    if _MISSING_RE.search(text):
+        return None
+    names = list((cfg or config()).get("leftover_strategies") or [])
+    return [n for n in names if n in STRATEGY_NAMES] or None
+
+
 def remove_background(
-    data: bytes, timeout_s: float = 180.0
+    data: bytes, timeout_s: float = 180.0, *,
+    strategies: list[str] | None = None,
+    skip: list[str] | None = None,
+    previous: bytes | None = None,
 ) -> tuple[bytes | None, str | None, str]:
     """A cut-out, or an honest failure. Returns (png, error, provider).
 
     Never raises. A caller that cannot get a cut-out needs to record that the
     photograph is still un-matted, which is a finding, not a crash.
+
+    `strategies` is an ALLOW-LIST of the names in STRATEGY_NAMES, not an order:
+    the chain's order is a measured property of the providers (see below) and
+    not the caller's to choose. Naming a subset that leaves out `cloth-seg`
+    INTERSECTS each mask candidate with cloth-seg anyway, which is the point of
+    item 6 — the garment parser still decides what is cloth even when it is not
+    trusted to decide what is a podium. `skip` is the deny-list, and a name in
+    it is not used at all, the intersection included.
+
+    `previous` is the cut-out this one would SUPERSEDE. Given it, a candidate
+    that has less garment than what is already on file is refused rather than
+    returned (item 8, §2.1): `replaceWithDerived` cannot be undone, so the only
+    place this can be decided is before the bytes are handed back.
     """
     attempts: list[str] = []
+    cfg = config()
 
     # MASK FIRST, PAINT LAST.
     #
@@ -734,7 +1334,7 @@ def remove_background(
     # variance rather than incapacity: the same model cut one product cleanly
     # and left a mannequin stand in the next. A second ask is far cheaper than
     # a product held for a human.
-    strategies = (
+    chain = (
         # LOCAL AND FIRST. The only one of the four that measured 0% backdrop on
         # a real studio original, and it returns the FULL source resolution
         # rather than the model's render size.
@@ -750,7 +1350,38 @@ def remove_background(
         ("gemini-paint", "paint", lambda: _gemini(data, timeout_s, PROMPT)),
     )
 
-    for name, kind, fn in strategies:
+    wanted = {str(s) for s in strategies} if strategies else None
+    banned = {str(s) for s in (skip or [])}
+    unknown = sorted(n for n in ((wanted or set()) | banned) if n not in STRATEGY_NAMES)
+    if unknown:
+        # Said rather than silently ignored: a typo in a strategy name would
+        # otherwise quietly run the default chain and produce the same stand
+        # the caller asked a different segmenter for.
+        return None, f"no background-removal strategy is named {', '.join(unknown)}", "none"
+    chain = tuple(s for s in chain if (wanted is None or s[0] in wanted) and s[0] not in banned)
+    if not chain:
+        return None, "every background-removal strategy was excluded by the caller", "none"
+
+    # THE INTERSECTION (item 6). Asked for only when cloth-seg is not in the
+    # chain but has not been banned: a caller that named the mask strategies
+    # wants the podium gone and the garment parser's opinion about what is
+    # cloth kept. Computed once, however many mask candidates are tried.
+    intersect = bool(cfg.get("intersect_cloth", True)) and \
+        "cloth-seg" not in {s[0] for s in chain} and "cloth-seg" not in banned
+    cloth: dict[str, Any] = {}
+
+    def cloth_cut() -> tuple[bytes | None, str | None]:
+        if "png" not in cloth:
+            cloth["png"], cloth["err"] = _cloth_seg(data)
+        return cloth["png"], cloth["err"]
+
+    # Whether any candidate was turned away for losing garment against
+    # `previous`. It changes what the failure MEANS: nothing is wrong with the
+    # picture, the cut-out on file is simply better, and the product must not
+    # be queued to try the same thing again.
+    kept_existing: list[str] = []
+
+    for name, kind, fn in chain:
         for attempt in (1, 2) if kind != "direct" else (1,):
             label = f"{name}#{attempt}"
             started = time.perf_counter()
@@ -778,6 +1409,26 @@ def remove_background(
                 attempts.append(f"{label}: {step_err}")
                 continue
 
+            # THE GARMENT PARSER STILL DECIDES WHAT IS CLOTH (item 6). The mask
+            # strategy has said where the product is and taken the podium out;
+            # cloth-seg says which of what is left is clothing, and takes the
+            # hanger out. Its failure is not this candidate's failure — the
+            # mask alone is still better than the cut-out being replaced — so
+            # it is logged and the candidate goes on unintersected.
+            if kind == "mask" and intersect:
+                base, cloth_err = cloth_cut()
+                if base is None:
+                    log.info("bg-removal %s: cloth-seg could not be intersected (%s)",
+                             label, cloth_err)
+                else:
+                    merged, merge_err = _intersect_alpha(out, base)
+                    if merged is None:
+                        log.info("bg-removal %s: intersection unusable in %.1fs: %s",
+                                 label, took, merge_err)
+                        attempts.append(f"{label}: intersection {merge_err}")
+                        continue
+                    out, label = merged, f"{label}∩cloth-seg"
+
             # Only the paint path can reframe; the mask path preserves the
             # source dimensions by construction, so there is nothing to check.
             if kind == "paint":
@@ -797,25 +1448,47 @@ def remove_background(
 
             # The border says something was removed; this says whether what
             # remains is only the product. See _kept_backdrop.
-            clean, backdrop_why = _kept_backdrop(data, out)
+            clean, backdrop_why = _kept_backdrop(data, out, cfg)
             if not clean:
                 log.info("bg-removal %s kept part of the set in %.1fs: %s",
                          label, took, backdrop_why)
                 attempts.append(f"{label}: {backdrop_why}")
                 continue
 
+            # LAST, AND A PRECONDITION (item 8). Everything above asks whether
+            # this is a good cut-out; this asks whether it is better than the
+            # one it would destroy. A candidate that is good but worse is not a
+            # failure of the segmenter and must not read as one — see
+            # `kept_existing` and the return below.
+            if previous is not None:
+                better, keep_why = garment_kept(previous, out, cfg)
+                if not better:
+                    log.info("bg-removal %s would lose garment in %.1fs: %s",
+                             label, took, keep_why)
+                    attempts.append(f"{label}: {keep_why}")
+                    kept_existing.append(label)
+                    continue
+
             log.info("bg-removal %s produced a cut-out in %.1fs (%d KB, %s)",
                      label, took, len(out) // 1024, why)
             return out, None, name
 
+    if kept_existing:
+        # NOT A FAILURE, AND IT MUST NOT BE FILED AS ONE. Every candidate that
+        # got this far was a real cut-out; each had less of the garment than
+        # what is already on file, so the right outcome is the one that already
+        # happened — nothing was replaced. Said plainly so the chain does not
+        # queue the product to try the same thing again (§2.1).
+        return None, ("the existing cut-out was KEPT: no replacement was as complete as it "
+                      "is (" + "; ".join(attempts) + ")"), KEPT_EXISTING
     return None, "; ".join(attempts), "none"
 
 
-def remove_background_b64(data_b64: str, timeout_s: float = 180.0):
+def remove_background_b64(data_b64: str, timeout_s: float = 180.0, **kw):
     """Base64 in, base64 out — the shape the HTTP endpoint wants."""
     try:
         raw = base64.b64decode(data_b64, validate=True)
     except Exception:  # noqa: BLE001
         return None, "image_base64 is not valid base64", "none"
-    out, err, provider = remove_background(raw, timeout_s=timeout_s)
+    out, err, provider = remove_background(raw, timeout_s=timeout_s, **kw)
     return (base64.b64encode(out).decode() if out else None), err, provider

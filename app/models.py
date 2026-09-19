@@ -493,10 +493,37 @@ class AttributeVerdict(BaseModel):
     evidence: str = ""
 
 
+class TaxonomySuggestion(BaseModel):
+    """Where the PICTURE says this garment belongs in the tenant's own tree.
+
+    A separate, typed answer rather than another AttributeVerdict, because it is
+    a different kind of question. A verdict judges a claim the record already
+    makes ("is `category` right?") and answers in free text, which then fails the
+    resolver's dropdown check — a value the tenant's own control cannot select is
+    not selectable, however sensible it reads. This asks the model to CHOOSE from
+    a list that was sent with the request, so the answer is a tenant value by
+    construction, and `category` and `subcategory` arrive as a MATCHED PAIR.
+
+    That pairing is the point. Writing one without the other is what produced
+    `Women > Dresses > Men's Shirts`: two halves of a path, each defensible on
+    its own, describing nothing together.
+
+    `garment` is what the model actually saw, kept so a rejected suggestion can
+    still be read ("it saw a tank top but named a category we do not offer").
+    """
+
+    category: str | None = None
+    subcategory: str | None = None
+    garment: str | None = None
+    confidence: float = 0.0
+    reasoning: str = ""
+
+
 class VisionAudit(BaseModel):
     verdicts: list[AttributeVerdict] = Field(default_factory=list)
     visible_defects: list[str] = Field(default_factory=list)
     notes: str = ""
+    taxonomy: TaxonomySuggestion | None = None
 
 
 class Evidence(BaseModel):

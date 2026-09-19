@@ -207,6 +207,25 @@ def apply_severity_overrides(
     return out
 
 
+def _merged_overrides(
+    pol: dict[str, Any], tenant: dict[str, str] | None
+) -> dict[str, str] | None:
+    """Policy's default overrides with the tenant's own merged over them.
+
+    Keys are compared AS WRITTEN. apply_severity_overrides normalises the rule
+    half to upper case and the field half to lower when it builds its lookup,
+    and both layers are spelled the same way there (`GRADE.002`,
+    `DATA.010:material`), so a tenant entry lands on the same key as the policy
+    default it is meant to replace.
+    """
+    base = ((pol.get("rules") or {}).get("severity_overrides") or {})
+    if not base:
+        return tenant
+    if not tenant:
+        return {str(k): str(v) for k, v in base.items()}
+    return {**{str(k): str(v) for k, v in base.items()}, **tenant}
+
+
 def _all_findings(p: ProductSnapshot, pol: dict[str, Any], *,
                   split_on_both_genders: bool = False,
                   severity_overrides: dict[str, str] | None = None,
@@ -222,12 +241,17 @@ def _all_findings(p: ProductSnapshot, pol: dict[str, Any], *,
     the shadow product after a guide switch is planned, and once for the
     residual check — and a re-ranking that applied to only the first would make
     `blocking` and `field_issues` disagree about the same finding.
+
+    TWO LAYERS of overrides, and the tenant's is on top. `rules.severity_overrides`
+    in policy.yaml is the default — the rules nobody approves on, material and
+    grade today — and the tenant's Brain setting is merged over it, so a tenant
+    that has deliberately re-ranked one of those keys keeps its own answer.
     """
     findings = apply_severity_overrides(
         run_all(p, pol) + gate_rules.check_gate(
             p, pol, split_on_both_genders=split_on_both_genders
         ),
-        severity_overrides,
+        _merged_overrides(pol, severity_overrides),
     )
     # CONSIGNMENT tenants: a price outside the grade window is the consignor's
     # choice, so PRICE.002 / PRICE.003 stop blocking approval and stay visible
@@ -1008,14 +1032,26 @@ def _plan_fields(p: ProductSnapshot, pol: dict[str, Any],
     approval gate is the last place to start overriding that judgement.
     """
     from app.models import Action, Evidence
-    from app.pipeline import gather_evidence
-    from app.resolver import resolve
+    from app.pipeline import gather_evidence, wants_taxonomy
+    from app.resolver import resolve, resolve_taxonomy
 
+    # THE SECOND CLAUSE IS NOT REDUNDANT. `needs_evidence` is set by a rule that
+    # wants the photographs looked at, and no rule raises "this category is
+    # valid but describes a different garment" — that is precisely the question
+    # nothing can see from the columns. Without this the vision call is never
+    # made on a product whose record is otherwise clean, which is most of them.
     ev = Evidence()
-    if llm is not None and any(f.needs_evidence for f in findings):
+    if llm is not None and (any(f.needs_evidence for f in findings)
+                            or wants_taxonomy(p, pol)):
         ev = gather_evidence(p, findings, pol, llm)
 
-    patches = resolve(p, findings, ev, pol)
+    # WITH NO FINDINGS, ONLY THE PICTURE HAS ANYTHING TO SAY. Running the full
+    # resolver here would let `resolve_pricing` propose a cents rounding on a
+    # product no rule complained about — a behaviour change nobody asked for,
+    # arriving through the door this opened. The taxonomy planner reads no
+    # findings at all, so it is the one that can run alone.
+    patches = (resolve(p, findings, ev, pol) if findings
+               else resolve_taxonomy(p, ev, pol, set()))
 
     # FIELDS THE PLAN ALREADY SETTLED ARE NOT RE-DECIDED HERE (readiness phase 1).
     #
@@ -1030,8 +1066,23 @@ def _plan_fields(p: ProductSnapshot, pol: dict[str, Any],
         return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
 
     claimed = {_flat(a.get("field")) for a in plan if a.get("field")}
-    patches = [pt for pt in patches
-               if _flat(_COLUMN_KEYS.get(pt.field, pt.field)) not in claimed]
+    kept = [pt for pt in patches
+            if _flat(_COLUMN_KEYS.get(pt.field, pt.field)) not in claimed]
+
+    # TAX.010 MOVES BOTH HALVES OF A PATH OR NEITHER, and the filter above can
+    # break that pair. `resolve_taxonomy` guarantees the two patches agree when
+    # it emits them, but an anchor planner may have claimed one of the columns
+    # on its own — TAX.003 fires without TAX.002 whenever the subcategory is
+    # wrong under an otherwise valid category — and dropping only that half
+    # would write the picture's CATEGORY beside the tree's SUBCATEGORY. That is
+    # `Women > Dresses > Men's Shirts` again, assembled from two correct halves.
+    #
+    # The anchor wins, because it is repairing a structural fault the tree can
+    # prove; the picture's suggestion is simply withdrawn.
+    pair = [pt for pt in kept if pt.rule_id == "TAX.010"]
+    if len(pair) == 1 and pair[0].new_value is not None:
+        kept = [pt for pt in kept if pt is not pair[0]]
+    patches = kept
 
     auto = [pt for pt in patches
             if pt.action is Action.APPLY and pt.new_value is not None]
@@ -1423,6 +1474,22 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
 
         _plan_imagery(p, pol, findings, plan)
         _plan_escalations(findings, plan)
+    else:
+        # A CLEAN RECORD IS NOT THE SAME AS A CORRECT ONE, and this branch exists
+        # for the single case that proves it: a garment filed under a category
+        # that really is in the tenant's tree, under the right master, with a
+        # subcategory that really does sit under it — and describing a different
+        # garment. Every rule above reads columns and every one of them is
+        # satisfied, so `findings` is empty and, until now, nothing ran at all.
+        #
+        # MID-000615 is a tank top filed as `Women > Dresses > Casual Dress`. It
+        # reached this branch, planned nothing, and blocked on the image gate's
+        # CATEGORY_IMAGE_MISMATCH on every run — a hold with no repair behind it.
+        #
+        # Only the taxonomy planner runs here. It is the one that reads the
+        # pictures rather than the findings, so it is the only one with anything
+        # to say when there are none.
+        _plan_fields(p, pol, [], llm, plan)
 
     writes = sum(1 for a in plan if a["kind"] in
                  ("set_column", "set_property", "create_size_chart",

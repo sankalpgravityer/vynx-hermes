@@ -18,7 +18,9 @@ from google import genai
 from google.genai import types
 
 from app.llm import cache, health
-from app.models import AttributeVerdict, ProductSnapshot, RRPEvidence, VisionAudit
+from app.models import (
+    AttributeVerdict, ProductSnapshot, RRPEvidence, TaxonomySuggestion, VisionAudit,
+)
 from app.net import genai_client_args
 
 log = logging.getLogger("hermes.gemini")
@@ -49,12 +51,45 @@ _VERDICT_ITEM = {
     "required": ["field", "verdict", "observed_value", "confidence", "evidence"],
 }
 
+# WHERE THE PICTURE SAYS THE GARMENT BELONGS, chosen from the tenant's own tree.
+#
+# Asked in the SAME call as the verdicts above — the images are already attached
+# and already paid for, so this costs nothing but output tokens. It is a separate
+# object rather than another verdict because a verdict answers in free text and
+# the resolver then cannot use it: "a value the tenant's own dropdown cannot
+# offer is not selectable". Here the allowed pairs are sent WITH the request, so
+# the answer is a tenant value or it is nothing.
+_TAXONOMY_ITEM = {
+    "type": "object",
+    "properties": {
+        "garment": {
+            "type": ["string", "null"],
+            "description": "What the garment actually is, in one or two words "
+                           "(for example 'tank top', 'straight-leg jeans').",
+        },
+        "category": {
+            "type": ["string", "null"],
+            "description": "EXACTLY one CATEGORY from the allowed list, copied "
+                           "character for character. Null if none fits.",
+        },
+        "subcategory": {
+            "type": ["string", "null"],
+            "description": "EXACTLY one SUBCATEGORY listed under that category, "
+                           "copied character for character. Null if none fits.",
+        },
+        "confidence": {"type": "number", "description": "0.0 to 1.0."},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["garment", "category", "subcategory", "confidence", "reasoning"],
+}
+
 _VISION_SCHEMA = {
     "type": "object",
     "properties": {
         "verdicts": {"type": "array", "items": _VERDICT_ITEM},
         "visible_defects": {"type": "array", "items": {"type": "string"}},
         "notes": {"type": "string"},
+        "taxonomy": _TAXONOMY_ITEM,
     },
     "required": ["verdicts", "visible_defects", "notes"],
 }
@@ -77,6 +112,33 @@ _BACKGROUND_SCHEMA = {
     },
     "required": ["background", "confidence", "reasoning"],
 }
+
+
+def _taxonomy_from(raw: Any) -> TaxonomySuggestion | None:
+    """Parse the model's `taxonomy` object, or None when it said nothing.
+
+    NOT VALIDATED AGAINST THE TREE HERE. That is the resolver's job and it needs
+    the snapshot to do it; this layer only turns the response into a typed shape
+    and refuses one that is empty. A pair with no category is the model declining
+    — "nothing in the list fits" — and declining is a legitimate answer, so it
+    comes back as None rather than as a suggestion with holes in it.
+    """
+    if not isinstance(raw, dict):
+        return None
+    category = (raw.get("category") or "").strip() or None
+    if not category:
+        return None
+    try:
+        confidence = float(raw.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return TaxonomySuggestion(
+        category=category,
+        subcategory=(raw.get("subcategory") or "").strip() or None,
+        garment=(raw.get("garment") or "").strip() or None,
+        confidence=confidence,
+        reasoning=str(raw.get("reasoning") or ""),
+    )
 
 
 class GeminiEvidence:
@@ -209,7 +271,8 @@ class GeminiEvidence:
             return RRPEvidence(found=False, reasoning="RRP outside plausible range")
         return ev
 
-    def audit_images(self, p: ProductSnapshot, fields: dict[str, Any]) -> VisionAudit:
+    def audit_images(self, p: ProductSnapshot, fields: dict[str, Any],
+                     taxonomy_options: dict[str, list[str]] | None = None) -> VisionAudit:
         """Check the structured attributes against the actual product photos.
 
         CARE LABELS FIRST, and named as labels.
@@ -224,6 +287,13 @@ class GeminiEvidence:
         Budgeted separately rather than sharing `max_images` with the gallery: a
         product with five renders would otherwise fill the quota before the one
         image that answers the question was reached.
+
+        `taxonomy_options` is the tenant's own `{category: [subcategory, ...]}`
+        under this product's master category. When given, the model is asked to
+        pick a pair from it — in THIS call, over the images already attached, so
+        the answer costs output tokens and nothing else. Without it the question
+        is not asked at all: choosing from a list nobody sent is inventing, and
+        an invented category is the one thing the resolver cannot use.
         """
         cap = int(self.cfg["max_images"])
         label_urls = [str(u) for u in p.care_label_urls[:2]]
@@ -237,6 +307,12 @@ class GeminiEvidence:
             return VisionAudit()
 
         claims = json.dumps(fields, indent=2)
+        # Sorted so the same tree always produces the same prompt — and therefore
+        # the same cache key. An unordered dict would miss the cache on every run.
+        options = json.dumps(
+            {k: sorted(v) for k, v in sorted((taxonomy_options or {}).items())},
+            indent=2,
+        ) if taxonomy_options else ""
         system = ("You are a garment quality inspector. You are conservative: "
                   "you never claim to see something you cannot clearly see.")
         fetched: dict[str, int] = {}
@@ -275,6 +351,23 @@ class GeminiEvidence:
                   "rather than inferring. Also list any wear or damage you can see "
                   "(fading, snags, holes, stains, pilling, missing hardware)."
             )
+
+            if options:
+                parts.append(
+                    "Finally, FILE THE GARMENT. These are the only categories and "
+                    "subcategories this shop has, as "
+                    '{"category": ["subcategory", ...]}:\n' + options
+                    + "\n\nLooking at the GARMENT in the photographs — not at what "
+                      "the catalogue above claims, which may be wrong — return the "
+                      "`taxonomy` object: the garment in a word or two, then the one "
+                      "category and the one subcategory from THIS LIST that fit it "
+                      "best. Copy both strings exactly as they appear, and pick a "
+                      "subcategory that is listed under the category you chose. If "
+                      "nothing in the list fits the garment, return null for both "
+                      "rather than the closest miss — a wrong shelf is worse than an "
+                      "empty one. Set `confidence` to how sure you are of the pair."
+                )
+
             return self._generate(
                 model=self.cfg["model_fast"], contents=parts, schema=_VISION_SCHEMA,
                 system=system,
@@ -282,9 +375,12 @@ class GeminiEvidence:
 
         # Keyed on the claims as well as the pictures: the model is asked to
         # judge THESE claims, and a corrected brand is a different question.
+        # `options` joins the key for the same reason — a tenant that adds a
+        # category is asking a different question of the same photographs.
         raw, _ = cache.through(
             cache.key("audit_images", urls=[*label_urls, *garment_urls],
-                      text=[self.cfg["model_fast"], system, claims, _VISION_SCHEMA]),
+                      text=[self.cfg["model_fast"], system, claims, options,
+                            _VISION_SCHEMA]),
             ask, pol=self.pol,
             complete=lambda: fetched.get("n") == len(label_urls) + len(garment_urls),
         )
@@ -294,6 +390,7 @@ class GeminiEvidence:
             verdicts=self._strip_forbidden(raw.get("verdicts", [])),
             visible_defects=raw.get("visible_defects", []),
             notes=raw.get("notes", ""),
+            taxonomy=_taxonomy_from(raw.get("taxonomy")),
         )
 
     def audit_description(self, p: ProductSnapshot,
