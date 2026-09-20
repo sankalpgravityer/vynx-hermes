@@ -899,6 +899,50 @@ def _same(a: Any, b: Any) -> bool:
     return flat(a) == flat(b)
 
 
+# The drift pairs whose value has to exist in the tenant's category tree before
+# it may be proposed as a repair. `international_size` is deliberately absent:
+# sizes are not taxonomy and have no tree to check against.
+_TREE_CHECKED: dict[str, str] = {
+    "master_category": "root",
+    "subcategory": "subcategory",
+}
+
+
+def _tree_holds(p: ProductSnapshot, field: str, value: Any) -> bool:
+    """Is `value` a name this tenant's own category tree actually uses?
+
+    Returns True for anything not under _TREE_CHECKED, and True when the tenant
+    supplied no tree — with nothing to check against, refusing every taxonomy
+    repair would be worse than the drift it is meant to fix, and the same
+    reasoning the catalog rules already use for an absent option list.
+
+    Compared on letters and digits only, so "T-Shirts & Tops" and "tshirts tops"
+    are the same name and a difference in punctuation is not reported as a value
+    the tenant does not have.
+    """
+    level = _TREE_CHECKED.get(field)
+    if level is None:
+        return True
+    tree = (p.catalog.categories if p.catalog else None) or {}
+    if not tree:
+        return True
+
+    def flat(v: Any) -> str:
+        return "".join(ch for ch in str(v or "").lower() if ch.isalnum())
+
+    want = flat(value)
+    if not want:
+        return True
+    if level == "root":
+        return want in {flat(root) for root in tree}
+    return want in {
+        flat(sub)
+        for branches in tree.values()
+        for subs in branches.values()
+        for sub in subs
+    }
+
+
 def check_column_drift(p: ProductSnapshot) -> list[Finding]:
     """DRIFT.001 — a column and its `properties` twin hold different values.
 
@@ -927,6 +971,45 @@ def check_column_drift(p: ProductSnapshot) -> list[Finding]:
         if col_empty or prop_empty:
             winner = prop_value if col_empty else col_value
             loser_side = "column" if col_empty else "properties"
+
+            # A TAXONOMY VALUE THE TENANT'S TREE DOES NOT HOLD IS NOT A REPAIR.
+            #
+            # This rule's whole argument for proposing a value automatically is
+            # that one side is empty, so the other must be right. That holds for
+            # a size. It does NOT hold for `masterCategory` or `subCategory`,
+            # where the `properties` copy is written by the analyze worker from
+            # the model's own words and can say anything at all.
+            #
+            # On 18 Sep 2026 it said "Men's/Unisex" and "hoodie". Both were
+            # proposed here, both were written, and both were rejected by
+            # TAX.001/TAX.002 in the same run — after which `copy` regenerated
+            # the title from them and an Adidas t-shirt was published as a
+            # "Deep Burgundy Hoodie". The value was never plausible; nothing
+            # asked the tree before planning the write.
+            #
+            # So: still a finding, because the two copies genuinely disagree and
+            # a person should look. But `repair_to: None`, which is this rule's
+            # existing way of saying "both are real, the choice is a judgement"
+            # — and the executor never auto-writes those.
+            if not _tree_holds(p, field, winner):
+                out.append(Finding(
+                    rule_id="DRIFT.001", severity=Severity.MEDIUM, fields=[field],
+                    message=(
+                        f"'{column}' and 'properties.{prop_key}' disagree, and the "
+                        f"only value on offer ({winner!r}) is not in this tenant's "
+                        f"category tree — so it cannot be written. A person has to "
+                        f"say what this product is."
+                    ),
+                    detail={
+                        "column": column, "column_value": col_value,
+                        "property": prop_key, "property_value": prop_value,
+                        "repair_to": None, "rejected_value": winner,
+                        "why": "not a value in the tenant's category tree",
+                    },
+                    needs_evidence=True,
+                ))
+                continue
+
             out.append(Finding(
                 rule_id="DRIFT.001", severity=Severity.HIGH, fields=[field],
                 message=(

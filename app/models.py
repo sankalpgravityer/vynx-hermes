@@ -80,6 +80,23 @@ class TenantCatalog(BaseModel):
     colors: list[str] = Field(default_factory=list)
     materials: list[str] = Field(default_factory=list)
     brands: list[str] = Field(default_factory=list)
+    # How often this tenant's OTHER products use each subcategory value — the
+    # tenant's working vocabulary, counted from its catalogue rather than read
+    # from its tree. A tie-breaker only: when a title names several valid
+    # subcategories, the one the tenant already files things under wins. Empty
+    # means not supplied, and the planner decides nothing on it.
+    subcategory_usage: dict[str, int] = Field(
+        default_factory=dict, alias="subcategoryUsage"
+    )
+    # The tenant's filing, one level up: how many live products sit on each
+    # `Master>Category>Sub` path. Readiness phase 1 reads it when a category is
+    # not under its master and several branches could take the subcategory —
+    # the one this tenant already files under wins, at >= 2x the runner-up.
+    branch_usage: dict[str, int] = Field(default_factory=dict, alias="branchUsage")
+    # Which sizing guide the tenant puts on each `Master>Category` branch, as
+    # `Master>Category>Guide` -> n. Breaks a tie between two charts that both
+    # fit a product's gender, side and size ("Men Uppers" vs "Men DressShirts").
+    guide_usage: dict[str, int] = Field(default_factory=dict, alias="guideUsage")
 
     def eu_for_size(self, guide: str | None, size: str | None) -> str | None:
         """The EU size this guide pairs with `size`, or None if it cannot say.
@@ -128,6 +145,20 @@ class MediaAsset(BaseModel):
     # opposite meanings for whether the asset should ever come back.
     deleted_at: str | None = None
     position: int = 0
+
+    # --- what the row knows about its own pixels (readiness phase 3) ---------
+    # The row's id, so a cut-out's `derived_from_id` can be followed to the
+    # original it was cut from — the pairing the canvas check (IMG.026) needs.
+    id: str | None = None
+    # Stored on 1% of rows today. The chain fills them from the file header
+    # before the canvas check, and the matte path stores them as it works.
+    width: int | None = None
+    height: int | None = None
+    derived_from_id: str | None = None
+    # A border measurement app/imaging/cutouts.judge writes back after looking
+    # at the file: {"transparent": fraction, "rgb": [r, g, b], "coverage":
+    # fraction, "stddev": float}. Evidence for IMG.027; never stored.
+    border: dict[str, Any] | None = None
 
     @property
     def live(self) -> bool:
@@ -240,6 +271,10 @@ class ProductSnapshot(BaseModel):
     supplier: str | None = None
 
     images: list[str] = Field(default_factory=list)
+    # A person dragged the gallery into shape (`Product.mediaManualOrder`). Their
+    # order is respected everywhere in vnyx-api and IMG.025 respects it too
+    # (readiness phase 5).
+    media_manual_order: bool = False
 
     # The typed `ProductMedia` rows behind `images` above, when the caller sent
     # them. `images` is VNYX's own denormalized cache of the same assets and stays
@@ -458,10 +493,37 @@ class AttributeVerdict(BaseModel):
     evidence: str = ""
 
 
+class TaxonomySuggestion(BaseModel):
+    """Where the PICTURE says this garment belongs in the tenant's own tree.
+
+    A separate, typed answer rather than another AttributeVerdict, because it is
+    a different kind of question. A verdict judges a claim the record already
+    makes ("is `category` right?") and answers in free text, which then fails the
+    resolver's dropdown check — a value the tenant's own control cannot select is
+    not selectable, however sensible it reads. This asks the model to CHOOSE from
+    a list that was sent with the request, so the answer is a tenant value by
+    construction, and `category` and `subcategory` arrive as a MATCHED PAIR.
+
+    That pairing is the point. Writing one without the other is what produced
+    `Women > Dresses > Men's Shirts`: two halves of a path, each defensible on
+    its own, describing nothing together.
+
+    `garment` is what the model actually saw, kept so a rejected suggestion can
+    still be read ("it saw a tank top but named a category we do not offer").
+    """
+
+    category: str | None = None
+    subcategory: str | None = None
+    garment: str | None = None
+    confidence: float = 0.0
+    reasoning: str = ""
+
+
 class VisionAudit(BaseModel):
     verdicts: list[AttributeVerdict] = Field(default_factory=list)
     visible_defects: list[str] = Field(default_factory=list)
     notes: str = ""
+    taxonomy: TaxonomySuggestion | None = None
 
 
 class Evidence(BaseModel):

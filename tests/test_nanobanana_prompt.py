@@ -249,6 +249,17 @@ def test_any_is_never_sent_as_a_literal_trait():
     assert "hair" not in prompt.split("IMPORTANT STYLING")[0]
 
 
+def test_identity_from_a_reference_render_leaves_the_traits_out_of_the_prompt():
+    """A trait in words that differs from the person in the reference picture
+    is an instruction to draw someone else (MID-000569)."""
+    s = apply_personality(cast_settings(), CAST[0])
+    prompt = build_prompt("closeup", ctx(settings=s, gender="female", identity_from_reference=True), True)
+    assert "fair skin tone" not in prompt and "long sleek straight hair" not in prompt
+    assert "EXACT SAME" in prompt                       # the reference carries the identity
+    # Without the flag the same settings describe the model, as before.
+    assert "fair skin tone" in build_prompt("closeup", ctx(settings=s, gender="female"), True)
+
+
 def test_kids_get_no_personality_traits():
     s = apply_personality(cast_settings(), CAST[0])
     prompt = build_prompt("front", ctx(settings=s, mannequin_type="Kids"), False)
@@ -555,7 +566,11 @@ def test_shipped_chain_is_one_gemini_then_gpt_image():
     which is stricter than Google's own consumer surface on exactly the
     garments this catalogue is full of."""
     gen = policy()["imagery"]["generation"]
-    assert gen["model"] == "gemini-3-pro-image-preview"
+    # `gemini-3.1-flash-image` since 18 Sep 2026 — same wall-clock as the pro
+    # preview on the trial render (39.0s against 39.2s) at half the token cost.
+    # The SHAPE of the chain is what this test defends; the name is pinned so a
+    # model switch is a deliberate edit rather than a silent drift.
+    assert gen["model"] == "gemini-3.1-flash-image"
     assert gen["fallback_models"] == []
     assert gen.get("openai_fallback") is True
     assert gen.get("safety_relaxed") is True
@@ -571,18 +586,17 @@ def test_shipped_chain_escalates_to_openai_only_with_a_key(monkeypatch):
     from app.imaging import openai_image
 
     monkeypatch.setenv("OPENAI_IMAGE_MODEL", "gpt-image-1.5")
+    # Read from policy, not spelled out: this test is about the LENGTH of the
+    # chain following the key, and hardcoding the Gemini model here made an
+    # ordinary model switch fail three tests instead of the one that pins it.
+    shipped = policy()["imagery"]["generation"]["model"]
 
     # Overriding the suite-wide `available -> False` guard, per its docstring.
     monkeypatch.setattr(openai_image, "available", lambda: True)
-    assert NanoBanana("k", policy())._model_chain(None) == [
-        "gemini-3-pro-image-preview",
-        "gpt-image-1.5",
-    ]
+    assert NanoBanana("k", policy())._model_chain(None) == [shipped, "gpt-image-1.5"]
 
     monkeypatch.setattr(openai_image, "available", lambda: False)
-    assert NanoBanana("k", policy())._model_chain(None) == [
-        "gemini-3-pro-image-preview"
-    ]
+    assert NanoBanana("k", policy())._model_chain(None) == [shipped]
 
 
 def test_shipped_openai_quality_is_set_explicitly():

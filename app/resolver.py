@@ -373,6 +373,9 @@ def resolve_attributes(p: ProductSnapshot, findings: list[Finding],
             ), pol, p))
             handled.add("defects")
 
+    # -- where the PICTURE says the garment belongs ------------------------- #
+    patches.extend(resolve_taxonomy(p, ev, pol, handled))
+
     # -- evidence-backed repairs from the vision + copy audits -------------- #
     blocked = set(pol["guardrails"]["llm_forbidden_fields"])
     for v in list(ev.vision.verdicts) + list(ev.text_verdicts):
@@ -440,6 +443,171 @@ def resolve_attributes(p: ProductSnapshot, findings: list[Finding],
         handled.add(v.field)
 
     return patches
+
+
+# --------------------------------------------------------------------------- #
+# The taxonomy the picture supports
+# --------------------------------------------------------------------------- #
+
+def _tenant_branch(p: ProductSnapshot) -> dict[str, list[str]]:
+    """The `{category: [subcategory, ...]}` under this product's master, or {}."""
+    from app.readiness import flat
+
+    if not (p.catalog and p.catalog.categories and p.master_category):
+        return {}
+    want = flat(p.master_category)
+    for root, branch in p.catalog.categories.items():
+        if flat(root) == want:
+            return {str(c): [str(s) for s in (subs or [])]
+                    for c, subs in (branch or {}).items()}
+    return {}
+
+
+def _match(name: Any, options: list[str]) -> str | None:
+    """The tenant's own spelling of `name`, or None.
+
+    Case, punctuation and a trailing plural are ignored on both sides, which is
+    the same comparison `_plan_category` makes — 'T Shirts' and 'T-Shirts' are
+    one category and a model asked to copy a string exactly will still
+    occasionally drop a hyphen.
+    """
+    from app.readiness import _singular
+
+    if not name:
+        return None
+    want = _singular(name)
+    return next((o for o in options if _singular(o) == want), None)
+
+
+def resolve_taxonomy(p: ProductSnapshot, ev: Evidence, pol: dict[str, Any],
+                     handled: set[str]) -> list[Patch]:
+    """Category and subcategory from the garment photographs, chosen from the
+    tenant's own tree.
+
+    THE GAP THIS CLOSES. Every other taxonomy repair reads COLUMNS: TAX.002 asks
+    whether the category sits under the master, TAX.003 whether the subcategory
+    sits under the category. Both pass on a path that is structurally perfect and
+    describes the wrong garment — MID-000615 is a tank top filed under
+    `Women > Dresses > Casual Dress`, and the tree says that path exists, so
+    nothing fired. The quality gate DID notice (CATEGORY_IMAGE_MISMATCH) but
+    returns `review` by design: "a human decides whether the category or the
+    photograph is wrong". Nothing proposed a category, so the product blocked on
+    every run with no way out.
+
+    The picture is the only evidence that can settle it, and the model was
+    already looking at the pictures and already naming the garment — `tank top`
+    at 0.90 confidence, read once to phrase a gender sentence and then dropped.
+
+    FOUR THINGS MAKE THIS SAFE TO WRITE.
+
+      1. The tenant's own list was sent WITH the request, so the answer is a
+         tenant value, not a plausible invention. A reply that is not in the
+         tree after all is dropped here, not written and not proposed: this is
+         the one field where an off-catalog value has already caused damage
+         (18 Sep 2026 — `category: 'hoodie'` on an Adidas t-shirt, published as
+         a "Deep Burgundy Hoodie" by the copy step).
+
+      2. The two move TOGETHER or not at all. A category written without a
+         subcategory that sits under it is how `Women > Dresses > Men's Shirts`
+         happens: two halves each defensible alone, describing nothing together.
+
+      3. The master category is never touched. It is the anchor the branch was
+         narrowed by, and `readiness.master.photo_check` is explicit that a
+         render may not rewrite the record it is judged by. A photograph may
+         move a product within its root; it may not move it between roots.
+
+      4. Its own floor, ABOVE the generic one. `llm_apply_threshold` is 0.85 for
+         a single field; this writes two at once and the cost of getting it
+         wrong is a re-render as well as a mis-filed product, because
+         `classify_garment_type` picks the render prompt's framing off the
+         category. `min_confidence` defaults to 0.9 and is a separate knob so it
+         can be raised without moving every other AI write with it.
+    """
+    cfg = pol.get("taxonomy_from_picture") or {}
+    if not cfg.get("enabled", True):
+        return []
+
+    sug = getattr(ev.vision, "taxonomy", None)
+    if sug is None or not sug.category:
+        return []
+
+    branch = _tenant_branch(p)
+    if not branch:
+        return []
+
+    category = _match(sug.category, list(branch))
+    if category is None:
+        log.info(
+            "taxonomy from picture: %s is not a category under %r — dropped "
+            "(saw %r)", sug.category, p.master_category, sug.garment,
+        )
+        return []
+
+    subs = branch.get(category) or []
+    subcategory = _match(sug.subcategory, subs) if sug.subcategory else None
+    if subcategory is None and subs:
+        # The category resolved and the subcategory did not. The current one is
+        # only usable if it already sits under the NEW category; otherwise this
+        # is half a path and a person has to choose the leaf.
+        subcategory = _match(p.subcategory, subs)
+        if subcategory is None:
+            return [Patch(
+                field="category", old_value=p.category, new_value=None,
+                action=Action.ESCALATE, rule_id="TAX.010",
+                reason=(
+                    f"The photographs show {sug.garment or 'a different garment'}, "
+                    f"which belongs under '{category}' rather than '{p.category}' "
+                    f"— but no subcategory there was identified, and moving the "
+                    f"category alone would leave '{p.subcategory}' under a branch "
+                    f"that does not offer it. Choose the pair."
+                ),
+                confidence=sug.confidence, provenance=Provenance.AI,
+            )]
+
+    same_cat = _match(p.category, [category]) is not None
+    same_sub = subcategory is None or _match(p.subcategory, [subcategory]) is not None
+    if same_cat and same_sub:
+        # The picture agrees with the record. Nothing to write — and worth
+        # nothing in the plan either, or every clean product would carry a
+        # no-op entry.
+        handled.update({"category", "subcategory"})
+        return []
+
+    floor = float(cfg.get("min_confidence") or 0.9)
+    confident = sug.confidence >= floor
+    reason = (
+        f"The photographs show {sug.garment or 'this garment'}"
+        + (f"; {sug.reasoning}" if sug.reasoning else "")
+        + f" (confidence {sug.confidence:.2f}"
+        + ("" if confident else f", below the {floor:.2f} floor")
+        + ")"
+    )
+    action = Action.APPLY if confident else Action.PROPOSE
+
+    out = [_gate(Patch(
+        field="category", old_value=p.category, new_value=category,
+        action=action, rule_id="TAX.010", reason=reason,
+        confidence=sug.confidence, provenance=Provenance.AI,
+    ), pol, p)]
+    if subcategory is not None:
+        out.append(_gate(Patch(
+            field="subcategory", old_value=p.subcategory, new_value=subcategory,
+            action=action, rule_id="TAX.010", reason=reason,
+            confidence=sug.confidence, provenance=Provenance.AI,
+        ), pol, p))
+
+    # BOTH OR NEITHER, and `_gate` is why this check exists rather than being
+    # implied by the code above. It downgrades a patch on a human-locked or
+    # low-confidence field independently, so one half can come back APPLY and
+    # the other PROPOSE — which would write exactly the split path this function
+    # exists to prevent. Any disagreement demotes the pair.
+    actions = {pt.action for pt in out}
+    if len(actions) > 1:
+        for pt in out:
+            pt.action = Action.PROPOSE
+
+    handled.update({"category", "subcategory"})
+    return out
 
 
 def resolve(p: ProductSnapshot, findings: list[Finding], ev: Evidence,

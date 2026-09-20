@@ -57,6 +57,7 @@ from app.rules import gate as gate_rules
 from app.rules import imagery as imagery_rules
 from app.rules.pricing import assess, verify_invariants
 from app.vnyx_client import to_snapshot
+from app import readiness
 
 log = logging.getLogger("approval-gate")
 
@@ -206,6 +207,25 @@ def apply_severity_overrides(
     return out
 
 
+def _merged_overrides(
+    pol: dict[str, Any], tenant: dict[str, str] | None
+) -> dict[str, str] | None:
+    """Policy's default overrides with the tenant's own merged over them.
+
+    Keys are compared AS WRITTEN. apply_severity_overrides normalises the rule
+    half to upper case and the field half to lower when it builds its lookup,
+    and both layers are spelled the same way there (`GRADE.002`,
+    `DATA.010:material`), so a tenant entry lands on the same key as the policy
+    default it is meant to replace.
+    """
+    base = ((pol.get("rules") or {}).get("severity_overrides") or {})
+    if not base:
+        return tenant
+    if not tenant:
+        return {str(k): str(v) for k, v in base.items()}
+    return {**{str(k): str(v) for k, v in base.items()}, **tenant}
+
+
 def _all_findings(p: ProductSnapshot, pol: dict[str, Any], *,
                   split_on_both_genders: bool = False,
                   severity_overrides: dict[str, str] | None = None,
@@ -221,13 +241,41 @@ def _all_findings(p: ProductSnapshot, pol: dict[str, Any], *,
     the shadow product after a guide switch is planned, and once for the
     residual check — and a re-ranking that applied to only the first would make
     `blocking` and `field_issues` disagree about the same finding.
+
+    TWO LAYERS of overrides, and the tenant's is on top. `rules.severity_overrides`
+    in policy.yaml is the default — the rules nobody approves on, material and
+    grade today — and the tenant's Brain setting is merged over it, so a tenant
+    that has deliberately re-ranked one of those keys keeps its own answer.
     """
-    return apply_severity_overrides(
+    findings = apply_severity_overrides(
         run_all(p, pol) + gate_rules.check_gate(
             p, pol, split_on_both_genders=split_on_both_genders
         ),
-        severity_overrides,
+        _merged_overrides(pol, severity_overrides),
     )
+    # CONSIGNMENT tenants: a price outside the grade window is the consignor's
+    # choice, so PRICE.002 / PRICE.003 stop blocking approval and stay visible
+    # as MEDIUM. PRICE.001 (at or above retail) is arithmetic, not a choice, and
+    # keeps its severity. Applied here for the same reason the overrides are:
+    # every one of run_gate's three passes must see the same ranking.
+    if is_consignment(p.tenant_id, pol):
+        findings = [
+            f.model_copy(update={"severity": Severity.MEDIUM})
+            if f.rule_id in _CONSIGNMENT_SOFT_RULES and _RANK[f.severity] > _RANK[Severity.MEDIUM]
+            else f
+            for f in findings
+        ]
+    return findings
+
+
+# The price findings a consignment contract makes advisory. Not PRICE.001.
+_CONSIGNMENT_SOFT_RULES = frozenset({"PRICE.002", "PRICE.003", "PRICE.011"})
+
+
+def is_consignment(tenant_id: str | None, pol: dict[str, Any]) -> bool:
+    """Is this tenant on `pricing.consignment_tenants`? Ids compared as strings."""
+    ids = (pol.get("pricing") or {}).get("consignment_tenants") or []
+    return bool(tenant_id) and str(tenant_id) in {str(x) for x in ids}
 
 
 # --------------------------------------------------------------------------- #
@@ -377,6 +425,20 @@ def _pick_guide(p: ProductSnapshot, candidates: list[str]) -> str | None:
     # No specialised chart claimed it, so the general one is the answer.
     if len(general) == 1:
         return general[0]
+
+    # STILL OPEN: the tenant's own filing breaks the tie (readiness phase 1).
+    #
+    # `guide_usage` counts which chart this tenant puts on each
+    # `Master>Category` branch. Two general charts that both fit — or two
+    # specialised ones — are a human's call in the abstract, but when the
+    # tenant has already answered it a few hundred times for this branch, at
+    # twice the rate of the runner-up, that answer is theirs, not a guess.
+    if p.catalog is not None and p.master_category and p.category:
+        counts = readiness.guide_counts(p.catalog.guide_usage,
+                                        p.master_category, p.category)
+        pick = readiness.usage_pick(counts, candidates, policy())
+        if pick:
+            return pick
     return None
 
 
@@ -449,14 +511,128 @@ def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
     return str(suggested)
 
 
-def _plan_gender(p: ProductSnapshot, findings: list[Finding],
-                 plan: list[dict[str, Any]]) -> None:
-    """Fill in a gender that was never written, from the master category.
+def _plan_master(p: ProductSnapshot, pol: dict[str, Any],
+                 plan: list[dict[str, Any]]) -> str | None:
+    """Settle the master category — the anchor every other field hangs off.
 
-    ABSENT ONLY. A multi-valued gender is GENDER.001's business and is
-    deliberately left alone — split-gender.worker.ts owns that decision and
-    narrowing the row here would make its both-gender guard skip the second
-    product entirely. See the note on GENDER.001.
+    Readiness phase 1 (docs/READINESS-PLAN.md §4 step 1). Runs FIRST, and the
+    caller re-plans everything else against the master it returns, the same
+    way a guide switch re-plans the size fields: the gender property follows
+    the master, the category and subcategory must sit under it, the guide is
+    chosen for its gender, and the rig is derived from it.
+
+    The decision itself is `readiness.decide_master` — data only, in a fixed
+    order of evidence (the tenant's spelling, the gender property, the category
+    path), never the mannequin and never the render. A product no root fits is
+    escalated under MASTER_CATEGORY_UNRESOLVED; nothing downstream can be
+    settled until a person names the root, and the outcome says so by name.
+    """
+    decision = readiness.decide_master(p, pol)
+    action = decision["action"]
+    if action in ("keep", "skip"):
+        return None
+    if action == "set":
+        plan.append({
+            "kind": "set_column", "field": "masterCategory",
+            "value": decision["master"], "reason": decision["rule"],
+            "basis": decision["basis"], "detail": decision["detail"],
+        })
+        return str(decision["master"])
+    plan.append({
+        "kind": "escalate", "field": "masterCategory", "reason": decision["rule"],
+        "code": "MASTER_CATEGORY_UNRESOLVED", "detail": decision["detail"],
+    })
+    return None
+
+
+def _plan_category(p: ProductSnapshot, pol: dict[str, Any],
+                   findings: list[Finding],
+                   plan: list[dict[str, Any]]) -> str | None:
+    """TAX.002 — the category is not under the master (readiness phase 1).
+
+    Three answers, in order, and a human when none of them holds:
+
+      1. the tenant SPELLS it differently under this master ("Jacket" vs
+         "Jackets") — a spelling repair, the same test TAX.003 applies;
+      2. exactly one category under this master OFFERS the product's
+         subcategory — the tree names the branch;
+      3. several do, and the tenant files this subcategory under one of them
+         at least twice as often as any other (`branch_usage`) — the house
+         choice, the same ratio the subcategory tie-break uses.
+
+    Returns the new category so the caller can re-plan the subcategory against
+    the branch the product is about to be on.
+    """
+    if not p.catalog or not any(f.rule_id == "TAX.002" for f in findings):
+        return None
+    branch = (p.catalog.categories or {}).get(p.master_category or "") or {}
+    if not branch or not p.category:
+        return None
+
+    want = readiness._singular(p.category)
+    same = [c for c in branch if readiness._singular(c) == want]
+    if len(same) == 1:
+        plan.append({
+            "kind": "set_column", "field": "category", "value": same[0],
+            "reason": "TAX.002",
+            "detail": f"'{p.category}' is spelled '{same[0]}' under '{p.master_category}'",
+        })
+        return same[0]
+
+    if p.subcategory:
+        want_sub = readiness._singular(p.subcategory)
+        offering = [c for c, subs in branch.items()
+                    if any(readiness._singular(s) == want_sub for s in (subs or []))]
+        if len(offering) == 1:
+            plan.append({
+                "kind": "set_column", "field": "category", "value": offering[0],
+                "reason": "TAX.002",
+                "detail": (f"'{p.subcategory}' is offered only under "
+                           f"'{p.master_category} > {offering[0]}'"),
+            })
+            return offering[0]
+        if len(offering) > 1:
+            counts = readiness.branch_counts(
+                p.catalog.branch_usage, p.master_category or "", subcategory=p.subcategory)
+            pick = readiness.usage_pick(counts, offering, pol)
+            if pick:
+                plan.append({
+                    "kind": "set_column", "field": "category", "value": pick,
+                    "reason": "TAX.002",
+                    "detail": (f"{len(offering)} categories under '{p.master_category}' "
+                               f"offer '{p.subcategory}'; '{pick}' is where this tenant "
+                               f"files it ({counts.get(pick, 0)} products)"),
+                })
+                return pick
+
+    plan.append({
+        "kind": "escalate", "field": "category", "reason": "TAX.002",
+        "detail": (f"'{p.category}' is not under '{p.master_category}' in any spelling "
+                   f"and nothing names a replacement; the branch offers "
+                   f"{sorted(branch)}"),
+    })
+    return None
+
+
+def _plan_gender(p: ProductSnapshot, pol: dict[str, Any],
+                 findings: list[Finding],
+                 plan: list[dict[str, Any]]) -> None:
+    """The gender property FOLLOWS the master category (readiness phase 1).
+
+    Three faults, one answer:
+
+      DATA.010    absent — filled from the master when the master implies one;
+      TAX.004     present and contradicting a Men/Women master — brought to it
+                  (decision 6: the master is the anchor, not the rig);
+      GENDER.001  multi-valued — repaired only when no split owns it, which the
+                  rule settles from the tenant's setting (`detail.repairable`).
+                  split-gender.worker.ts otherwise narrows the row itself and
+                  creates the second product, and pre-empting it here would
+                  make its both-gender guard skip that product entirely.
+
+    NEVER FROM THE MANNEQUIN. The rig is derived from these fields now, so
+    reading it back here would be circular. A genderless root (Unisex, Kids)
+    implies nothing, and an absent gender there is a person's call.
 
     Written as a single-element LIST because that is the stored shape:
     `normalizeGenderToArray` returns `string[]`, and the split worker writes
@@ -469,41 +645,37 @@ def _plan_gender(p: ProductSnapshot, findings: list[Finding],
     unresolved = next(
         (f for f in findings if f.rule_id == "GENDER.001"), None
     )
+    contradicts = next(
+        (f for f in findings if f.rule_id == "TAX.004"), None
+    )
 
-    # An UNRESOLVED gender is repairable only when no split owns it — the rule
-    # settles that from the tenant's setting and says so in `detail.repairable`.
     if unresolved is not None and not unresolved.detail.get("repairable"):
         return
-    if not absent and unresolved is None:
+    if not absent and unresolved is None and contradicts is None:
         return
 
-    rule = "DATA.010" if absent else "GENDER.001"
+    rule = ("DATA.010" if absent else
+            "TAX.004" if contradicts is not None else "GENDER.001")
 
-    # Master category first, mannequin second — the same precedence
-    # analyze.worker's `resolvedGender` uses, so the two paths cannot reach
-    # different answers for one product.
-    derived = (
-        gate_rules.resolve_gender(p.master_category)
-        or gate_rules.resolve_gender(p.mannequin)
-    )
+    derived = readiness.root_gender(p.master_category, pol)
     if not derived:
-        plan.append({
-            "kind": "escalate", "field": "gender", "reason": rule,
-            "detail": "neither the master category nor the mannequin implies a "
-                      "gender",
-        })
+        if not p.master_category:
+            why = "there is no master category to derive it from"
+        elif readiness.is_genderless_root(p.master_category, pol):
+            why = (f"'{p.master_category}' holds either gender, so the property "
+                   f"has to be chosen")
+        else:
+            why = f"master category '{p.master_category}' implies no gender"
+        plan.append({"kind": "escalate", "field": "gender", "reason": rule,
+                     "detail": why})
         return
 
     plan.append({
-        # A single-element LIST: the shape normalizeGenderToArray produces and
-        # split-gender.worker writes. A bare string is a shape the readers
-        # tolerate and no writer in the codebase creates.
         "kind": "set_property", "field": "gender", "value": [derived],
         "reason": rule,
         "detail": (
-            f"derived from master category '{p.master_category}'"
-            if gate_rules.resolve_gender(p.master_category)
-            else f"derived from mannequin '{p.mannequin}'"
+            f"follows master category '{p.master_category}'"
+            + (f"; was {p.gender!r}" if p.gender else "")
         ),
     })
 
@@ -519,6 +691,58 @@ def _singular(text: str) -> str:
     """
     flat = "".join(ch for ch in str(text or "").lower() if ch.isalnum())
     return flat[:-1] if flat.endswith("s") and len(flat) > 3 else flat
+
+
+def _subcategory_from_title(p: ProductSnapshot,
+                            subs: list[str]) -> tuple[str, str] | None:
+    """The one option on this branch the TITLE names, or None.
+
+    Shared by the blank-subcategory (DATA.010) and off-branch (TAX.003)
+    repairs, so the two cannot accept different evidence. Returns the value and
+    the sentence that justifies it.
+
+    "Relaxed Sweatshirt in Black size M" under Women > Sweaters & Hoodies, whose
+    branch offers Sweatshirts / Fleece Pullover / Hoodies / Sweaters: the title
+    says which one. Matched WORD BY WORD against the tenant's entries rather
+    than by substring, so "Sweatshirt" finds "Sweatshirts" and "Vest" cannot
+    quietly match "Puffer Vests" — and only accepted when exactly one entry
+    matches, or when several do and the tenant's own vocabulary
+    (`subcategory_usage`) breaks the tie at >= 2x the runner-up.
+
+    This is not "pick something from the category". Measured on production, 28
+    products have a blank subcategory and their branches offer four to eleven
+    options each; choosing one without evidence would be wrong most of the
+    time and indistinguishable afterwards from a value somebody meant. The
+    title is evidence. Where there is none, this returns None.
+
+    TWO shapes of entry, matched differently on purpose. A one-word entry
+    ("Sweatshirts") is matched against the title's WORDS, so a bare "Vest" in
+    a title cannot pick one of four vest TYPES. A multi-word entry ("Leather
+    Vests") can never equal a single word, so it is matched against the title
+    with the spaces taken out — "leathervest" inside "vintagebrownleathervest".
+    That direction is safe where the reverse is not: the entry has to appear in
+    the title, not the other way round, so "Puffer Vests" does not match a
+    faux-fur one.
+    """
+    words = {_singular(w) for w in re.findall(r"[A-Za-z]+", p.title or "")}
+    flat_title = _singular(p.title or "")
+    named = [
+        s for s in subs
+        if (_singular(s) in words
+            or (len(s.split()) > 1 and _singular(s) in flat_title))
+    ]
+    if len(named) == 1:
+        return named[0], (f"the title names it, and '{named[0]}' is the only "
+                          f"option on this branch that it matches")
+    if len(named) > 1 and p.catalog is not None:
+        usage = p.catalog.subcategory_usage or {}
+        ranked = sorted(named, key=lambda s: usage.get(s, 0), reverse=True)
+        top, second = usage.get(ranked[0], 0), usage.get(ranked[1], 0)
+        if top > 0 and top >= 2 * max(second, 1):
+            return ranked[0], (f"the title names {len(named)} options on this "
+                               f"branch; '{ranked[0]}' is the one this tenant "
+                               f"files under ({top} products vs {second})")
+    return None
 
 
 def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
@@ -562,50 +786,17 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
             })
             return
 
-        # THE TITLE, when it names exactly one of the branch's own options.
-        #
-        # "Relaxed Sweatshirt in Black size M" under Women > Sweaters & Hoodies,
-        # whose branch offers Sweatshirts / Fleece Pullover / Hoodies / Sweaters:
-        # the title says which one. Matched WORD BY WORD against the tenant's
-        # entries rather than by substring, so "Sweatshirt" finds "Sweatshirts"
-        # and "Vest" cannot quietly match "Puffer Vests" — and only accepted
-        # when exactly one entry matches.
-        #
-        # This is not "pick something from the category". Measured on
-        # production, 28 products have a blank subcategory and their branches
-        # offer four to eleven options each; choosing one without evidence would
-        # be wrong most of the time and indistinguishable afterwards from a
-        # value somebody meant. The title is evidence. Where there is none, this
-        # stays silent — it recovers 1 of the 28, and the other 27 genuinely
-        # cannot be known from the record.
-        # TWO shapes of entry, matched differently on purpose.
-        #
-        # A one-word entry ("Sweatshirts") is matched against the title's WORDS,
-        # so a bare "Vest" in a title cannot pick one of four vest TYPES.
-        # A multi-word entry ("Leather Vests") can never equal a single word, so
-        # it is matched against the title with the spaces taken out —
-        # "leathervest" inside "vintagebrownleathervestwomen". That direction is
-        # safe where the reverse is not: the entry has to appear in the title,
-        # not the other way round, so "Puffer Vests" does not match a faux-fur
-        # one. Restricted to multi-word entries because a three-letter
-        # normalised token would start finding itself inside unrelated words.
-        words = {_singular(w) for w in re.findall(r"[A-Za-z]+", p.title or "")}
-        flat_title = _singular(p.title or "")
-        named = [
-            s for s in subs
-            if (_singular(s) in words
-                or (len(s.split()) > 1 and _singular(s) in flat_title))
-        ]
-        if len(named) == 1:
+        # THE TITLE, when it names exactly one of the branch's own options, or
+        # the tenant's house spelling among several — see _subcategory_from_title.
+        named = _subcategory_from_title(p, subs)
+        if named:
             plan.append({
                 "kind": "set_column", "field": "subCategory", "value": named[0],
-                "reason": "DATA.010",
-                "detail": (f"the title names it, and '{named[0]}' is the only "
-                           f"option on this branch that it matches"),
+                "reason": "DATA.010", "detail": named[1],
             })
-        # Several or none: left for the evidence layer or a human. No escalate
-        # entry here — _plan_escalations already names an unrepaired DATA.010
-        # field, and a second one would double-count it.
+        # None named, or no clear house spelling: left for the evidence layer or
+        # a human. No escalate entry here — _plan_escalations already names an
+        # unrepaired DATA.010 field, and a second one would double-count it.
         return
 
     off_tree = any(
@@ -628,6 +819,23 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
                 f"'{p.master_category} > {p.category}', so the dropdown renders "
                 f"blank. The tenant's tree spells it '{matches[0]}'."
             ),
+        })
+        return
+
+    # THE TITLE, the same evidence the blank case accepts (readiness phase 1).
+    #
+    # A master category that just moved — or was wrong all along — leaves a
+    # subcategory the new branch never offered. 478 of 1,784 approved products
+    # on the local clone carry one. The title is what says which of the
+    # branch's own options the garment is; where it names none, this falls
+    # through to the escalation below.
+    named = _subcategory_from_title(p, subs)
+    if named:
+        plan.append({
+            "kind": "set_column", "field": "subCategory", "value": named[0],
+            "reason": "TAX.003",
+            "detail": (f"'{p.subcategory}' is not offered under "
+                       f"'{p.master_category} > {p.category}'; {named[1]}"),
         })
         return
 
@@ -714,63 +922,40 @@ def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
 
 def _plan_mannequin(findings: list[Finding],
                     plan: list[dict[str, Any]]) -> None:
-    """TAX.005 — swap the rig for the one the taxonomy calls for.
+    """TAX.005 / TAX.007 — write the rig the master category calls for.
 
-    Only the DERIVED form, which carries `suggested`: the policy-map form knows
-    a list of allowed names and not which of them is right, so it escalates.
+    THE RIG IS DERIVED, NEVER READ (readiness phase 1, decision 6). Until this
+    phase the rule made the mannequin the anchor and planned masterCategory and
+    the gender property to match it. That is reversed: `suggested` on both
+    findings is `readiness.derive_rig(master, gender, category, subcategory)`,
+    in the vocabulary the edit screen offers, and the only write here is the
+    rig itself. The master and the gender are settled by `_plan_master` and
+    `_plan_gender` before this runs.
 
     Worth repairing rather than escalating because it is the single commonest
     approval blocker on this catalog — 255 wrong-gender rigs in a 1,762-product
-    review queue — and the correct value is arithmetic over two facts the record
-    already holds, not a judgement about the garment. It also feeds forward: the
-    renderer picks the model from this and the master category, so a product
-    approved with a Women rig on a men's coat renders the wrong model.
+    review queue, plus every product with no rig at all, which the pre-flight
+    refuses with "no mannequin selected" — and the correct value is arithmetic
+    over two facts the record already holds, not a judgement about the garment.
     """
     for f in findings:
-        if f.rule_id != "TAX.005":
+        if f.rule_id not in ("TAX.005", "TAX.007"):
             continue
-
-        # ---- the gender fields follow the RIG -----------------------------
-        #
-        # Planned BEFORE the rig itself, and usually instead of changing it.
-        # See the note in rules/consistency.py: the operator's rig selection is
-        # a human act about the garment in their hands, while masterCategory is
-        # the extractor's branch guess. Bringing the other two fields to the rig
-        # is what keeps the mannequin, the gender, the master category, the size
-        # chart and the rendered model describing one garment instead of two.
-        #
-        # `master_category_should_be` is only set when the tenant's own taxonomy
-        # holds the same category path under the other gender — the rule checks
-        # that against catalog.categories rather than assuming it.
-        master = f.detail.get("master_category_should_be")
-        gender = f.detail.get("gender_should_be")
-        if master:
-            plan.append({
-                "kind": "set_column", "field": "masterCategory", "value": master,
-                "reason": "TAX.005",
-                "detail": (f'the {f.detail.get("rig_gender")} rig is the anchor; '
-                           f'was {f.detail.get("product_gender")!r}'),
-            })
-            if gender:
-                plan.append({
-                    "kind": "set_property", "field": "gender", "value": [gender],
-                    "reason": "TAX.005",
-                    "detail": f'brought into line with the {gender} rig',
-                })
-
-        # ---- and the rig, only if its SIDE is wrong ------------------------
-        #
-        # `suggested` now carries the rig's own gender, so it differs from the
-        # stored rig only when the top/bottom side is wrong — which is a fact
-        # about the garment type and still comes from the subcategory. Skipping
-        # the write when they match stops the plan reporting a repair that
-        # changes nothing.
+        current = f.detail.get("mannequin")
         suggested = f.detail.get("suggested")
-        if suggested and suggested != f.detail.get("mannequin"):
+        if suggested and suggested != current:
             plan.append({
                 "kind": "set_column", "field": "mannequinType", "value": suggested,
-                "reason": "TAX.005",
-                "detail": f'was {f.detail.get("mannequin")!r}',
+                "reason": f.rule_id,
+                "detail": f"was {current!r}" if current else "no rig was selected",
+            })
+        elif not suggested:
+            plan.append({
+                "kind": "escalate", "field": "mannequinType", "reason": f.rule_id,
+                "detail": ("no rig can be derived from the master category and "
+                           "the garment's side"
+                           + (f"; the policy map allows {f.detail.get('allowed')}"
+                              if f.detail.get("allowed") else "")),
             })
         return
 
@@ -847,17 +1032,76 @@ def _plan_fields(p: ProductSnapshot, pol: dict[str, Any],
     approval gate is the last place to start overriding that judgement.
     """
     from app.models import Action, Evidence
-    from app.pipeline import gather_evidence
-    from app.resolver import resolve
+    from app.pipeline import gather_evidence, wants_taxonomy
+    from app.resolver import resolve, resolve_taxonomy
 
+    # THE SECOND CLAUSE IS NOT REDUNDANT. `needs_evidence` is set by a rule that
+    # wants the photographs looked at, and no rule raises "this category is
+    # valid but describes a different garment" — that is precisely the question
+    # nothing can see from the columns. Without this the vision call is never
+    # made on a product whose record is otherwise clean, which is most of them.
     ev = Evidence()
-    if llm is not None and any(f.needs_evidence for f in findings):
+    if llm is not None and (any(f.needs_evidence for f in findings)
+                            or wants_taxonomy(p, pol)):
         ev = gather_evidence(p, findings, pol, llm)
 
-    patches = resolve(p, findings, ev, pol)
+    # WITH NO FINDINGS, ONLY THE PICTURE HAS ANYTHING TO SAY. Running the full
+    # resolver here would let `resolve_pricing` propose a cents rounding on a
+    # product no rule complained about — a behaviour change nobody asked for,
+    # arriving through the door this opened. The taxonomy planner reads no
+    # findings at all, so it is the one that can run alone.
+    patches = (resolve(p, findings, ev, pol) if findings
+               else resolve_taxonomy(p, ev, pol, set()))
+
+    # FIELDS THE PLAN ALREADY SETTLED ARE NOT RE-DECIDED HERE (readiness phase 1).
+    #
+    # The anchor planners above write the rig, the gender, the branch and the
+    # leaf FROM the master category. The resolver's own TAX.005 repair picks the
+    # first rig the policy map allows by name, so without this a product got
+    # two writes for one column — `Bottom` from the anchor, then `Women Bottom`
+    # from the resolver, and the executor applies them in order. An escalation
+    # counts as settled too: a field readiness handed to a person is not written
+    # behind their back.
+    def _flat(s: Any) -> str:
+        return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
+
+    claimed = {_flat(a.get("field")) for a in plan if a.get("field")}
+    kept = [pt for pt in patches
+            if _flat(_COLUMN_KEYS.get(pt.field, pt.field)) not in claimed]
+
+    # TAX.010 MOVES BOTH HALVES OF A PATH OR NEITHER, and the filter above can
+    # break that pair. `resolve_taxonomy` guarantees the two patches agree when
+    # it emits them, but an anchor planner may have claimed one of the columns
+    # on its own — TAX.003 fires without TAX.002 whenever the subcategory is
+    # wrong under an otherwise valid category — and dropping only that half
+    # would write the picture's CATEGORY beside the tree's SUBCATEGORY. That is
+    # `Women > Dresses > Men's Shirts` again, assembled from two correct halves.
+    #
+    # The anchor wins, because it is repairing a structural fault the tree can
+    # prove; the picture's suggestion is simply withdrawn.
+    pair = [pt for pt in kept if pt.rule_id == "TAX.010"]
+    if len(pair) == 1 and pair[0].new_value is not None:
+        kept = [pt for pt in kept if pt is not pair[0]]
+    patches = kept
 
     auto = [pt for pt in patches
             if pt.action is Action.APPLY and pt.new_value is not None]
+
+    # CONSIGNMENT: the price is the consignor's under contract, not vnyx's to
+    # correct. A price the resolver would have written becomes an escalation
+    # that says so, and the reconcile step (which executes this plan inside
+    # vnyx-api) therefore never touches it. Retail stays repairable — it is the
+    # anchor, not the agreed price.
+    if is_consignment(p.tenant_id, pol):
+        for pt in [x for x in auto if x.field == "price"]:
+            plan.append({
+                "kind": "escalate", "field": "price", "reason": pt.rule_id,
+                "detail": ("consignment tenant — the selling price is the "
+                           "consignor's and is not written by the agent"),
+            })
+        auto = [pt for pt in auto if pt.field != "price"]
+        patches = [pt for pt in patches
+                   if not (pt.field == "price" and pt.action is not Action.APPLY)]
 
     for pt in patches:
         if pt.action is Action.APPLY:
@@ -1129,6 +1373,20 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
     # wrong chart forever. "Advisory" describes whether it blocks approval, not
     # whether it is worth fixing.
     if findings:
+        # THE ANCHOR FIRST (readiness phase 1). Every planner below reads the
+        # master category — the gender follows it, the branch must sit under
+        # it, the guide is chosen for its gender, the rig is derived from it —
+        # so it is settled before any of them run, and the rules are re-run on
+        # a shadow carrying the new master so they plan against the product as
+        # it is about to be, not as it was.
+        anchored = _plan_master(p, pol, plan)
+        if anchored:
+            p = p.model_copy(update={"master_category": anchored})
+            findings = _all_findings(
+                p, pol, split_on_both_genders=split_on_both_genders,
+                severity_overrides=severity_overrides,
+            )
+
         # Order matters for the CALLER, which executes in sequence: the chart
         # comes first because SIZE.002 cannot produce a correct euSize
         # expectation until the product points at one, so a size repair computed
@@ -1159,7 +1417,17 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
                 severity_overrides=severity_overrides,
             )
 
-        _plan_gender(p, findings, plan)
+        _plan_gender(p, pol, findings, plan)
+        # The branch under the (possibly new) master, then the leaf under the
+        # (possibly new) branch: a category that moved changes which
+        # subcategories exist, so the rules are re-run once more in between.
+        recategorised = _plan_category(p, pol, findings, plan)
+        if recategorised:
+            p = p.model_copy(update={"category": recategorised})
+            findings = _all_findings(
+                p, pol, split_on_both_genders=split_on_both_genders,
+                severity_overrides=severity_overrides,
+            )
         _plan_subcategory(p, findings, plan)
         _plan_mannequin(findings, plan)
         # Before _plan_fields, for the same reason the chart is: a drift repair
@@ -1206,6 +1474,22 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
 
         _plan_imagery(p, pol, findings, plan)
         _plan_escalations(findings, plan)
+    else:
+        # A CLEAN RECORD IS NOT THE SAME AS A CORRECT ONE, and this branch exists
+        # for the single case that proves it: a garment filed under a category
+        # that really is in the tenant's tree, under the right master, with a
+        # subcategory that really does sit under it — and describing a different
+        # garment. Every rule above reads columns and every one of them is
+        # satisfied, so `findings` is empty and, until now, nothing ran at all.
+        #
+        # MID-000615 is a tank top filed as `Women > Dresses > Casual Dress`. It
+        # reached this branch, planned nothing, and blocked on the image gate's
+        # CATEGORY_IMAGE_MISMATCH on every run — a hold with no repair behind it.
+        #
+        # Only the taxonomy planner runs here. It is the one that reads the
+        # pictures rather than the findings, so it is the only one with anything
+        # to say when there are none.
+        _plan_fields(p, pol, [], llm, plan)
 
     writes = sum(1 for a in plan if a["kind"] in
                  ("set_column", "set_property", "create_size_chart",

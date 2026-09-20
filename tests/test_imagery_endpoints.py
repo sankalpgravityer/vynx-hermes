@@ -558,6 +558,50 @@ def test_generate_logs_a_reused_model_as_reused(
     assert "REUSED from the product (Emma Smith)" in first
 
 
+RENDER_FRONT = {"url": "https://r2.dev/products/a-gen-front.jpg", "view": "AI_FRONT", "origin": "AI",
+                "processing": "GENERATED", "mediaType": "IMAGE", "isCurrent": True, "position": 2}
+RENDER_FRONT_34 = {"url": "https://r2.dev/products/a-gen-front-34.jpg", "view": "AI_FRONT_34", "origin": "AI",
+                   "processing": "GENERATED", "mediaType": "IMAGE", "isCurrent": True, "position": 0}
+
+
+def test_generate_copies_the_identity_from_an_existing_render_instead_of_casting(
+    client: TestClient, stub_generation, caplog: pytest.LogCaptureFixture
+):
+    """MID-000569 (17 Sep 2026): a close-up re-rendered beside four renders of a
+    blonde woman came back dark-haired — the product stored no traits, a fresh
+    personality was cast on top of the reference, and its name was then stored
+    as if it had made all five. With a render in hand: no cast, no traits
+    stored."""
+    with caplog.at_level("INFO", logger="model-image-generator"):
+        r = client.post("/v1/imagery/generate", json={
+            "product": PRODUCT, "media": [*MEDIA, RENDER_FRONT], "settings": SETTINGS,
+            "views": ["AI_CLOSEUP"],
+        })
+    assert r.status_code == 200
+    first = [x.getMessage() for x in caplog.records if x.name == "model-image-generator"][0]
+    assert "REFERENCE — identity from the product's existing AI_FRONT render, no cast" in first
+    assert "CAST pick" not in first
+    assert stub_generation["ctx"].identity_from_reference is True
+    body = r.json()
+    assert any("no personality cast" in n for n in body["notes"])
+    assert "personalityName" not in body["image_settings"] and "hairColor" not in body["image_settings"]
+    assert body["image_settings"]["bodyType"] == "m"           # the rest is still recorded
+
+
+def test_generate_anchors_a_redone_front_on_the_three_quarter_render(
+    client: TestClient, stub_generation
+):
+    """Re-rendering the AI_FRONT itself must still show the person in the other
+    four: any render not being redone is the reference, the front first."""
+    r = client.post("/v1/imagery/generate", json={
+        "product": PRODUCT, "media": [*MEDIA, RENDER_FRONT_34], "settings": SETTINGS,
+        "views": ["AI_FRONT"],
+    })
+    assert r.status_code == 200
+    assert any("existing AI_FRONT_34 render" in n for n in r.json()["notes"])
+    assert stub_generation["ctx"].identity_from_reference is True
+
+
 def test_generate_says_so_when_the_tenant_has_no_cast(
     client: TestClient, stub_generation, caplog: pytest.LogCaptureFixture
 ):

@@ -12,16 +12,39 @@
     python scripts/repair_product.py --db "..." \
         --from-sheet reports/generated/prod-review.xlsx --limit 10 --apply
 
+    # OFFLINE. The rule engine over a saved product: no database, no network,
+    # nothing written. Save one with --dump-fixture; tests/fixtures/repair/ ships one.
+    python scripts/repair_product.py --fixture tests/fixtures/repair/
+    python scripts/repair_product.py --db "..." --product <uuid> \
+        --dump-fixture reports/fixtures/<sku>.json
+
 Four steps, each SKIPPED when the product does not need it. Nothing here is a new
 implementation: every step shells out to the script that already owns that work,
 so a render produced by this and one produced by the Model images button are the
 same render.
 
+    0  master       app.readiness                    which root the product belongs to
+                                                     — the anchor; written by reconcile
     1  matte        scripts/backfill-bg-removal.ts   cut out the garment photos
     2  extract      scripts/backfill-product-data.ts read the care label -> brand,
                                                      size, material, description
     3  reconcile    app.product_audit                drift, taxonomy, sizing guide
     4  render       scripts/backfill-imagery.ts      the five on-model views
+    4b gate         app.imaging.quality_gate         one look at the lead render:
+                                                     model, face, body, gender, BUILD
+    4c photos       app.imaging.photo_audit          the cut-outs and EVERY render:
+                                                     wear vs grade, a part of the
+                                                     garment the mask ate, render
+                                                     defects, one model across the set
+    4c rematte      scripts/backfill-bg-removal.ts   re-cut a cut-out the photo audit
+                                                     refused (--replace), then look again
+    4c regen        scripts/backfill-imagery.ts      re-render what the gate or the
+                                                     photo audit refused (--views,
+                                                     once), then look again
+    4d order        scripts/rebuild-media-cache.ts   the gallery in the catalog order
+    4e copy         scripts/regenerate-copy.ts       title + description from the
+                                                     settled record, when a field
+                                                     they read changed
     5  approve      scripts/approve-products.ts      REVIEW -> APPROVED, if ready
     6  re-audit     app.product_audit                the verdict that counts
 
@@ -103,6 +126,7 @@ import argparse
 import json
 import builtins
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -114,7 +138,8 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import product_audit  # noqa: E402
-from app.config import settings  # noqa: E402
+from app.config import policy, settings  # noqa: E402
+from app.llm import cache as vision_cache  # noqa: E402
 
 # Where the TypeScript half lives. Every write this script causes happens in
 # there, because that is where R2, the ProductMedia invariants, the price mirror
@@ -184,6 +209,18 @@ def _trailing_int(line: str) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+# The words and finish reasons that mean the image model CHOSE not to render
+# (nanobanana._REFUSAL_REASONS), as they reach the render script's notes.
+_REFUSAL_TOKENS = ("declin", "refus", "image_other", "image_safety",
+                   "prohibited", "safety", "blocklist", "recitation")
+
+
+def _refusal_text(line: str) -> bool:
+    """Does a render note say the model declined, rather than failed?"""
+    low = (line or "").lower()
+    return any(tok in low for tok in _REFUSAL_TOKENS)
+
+
 # Which of vnyx-api's scripts each step runs. The REMOTE transport names the
 # step rather than the script — the server resolves it through its own closed
 # map, so nothing this file sends can become a filename over there.
@@ -195,6 +232,10 @@ STEP_FOR_SCRIPT = {
     "fix-selling-price.ts": "price",
     "reject-products.ts": "reject",
     "backfill-imagery.ts": "render",
+    # Readiness phases 2 and 5: the title/description regeneration and the
+    # gallery cache rebuild, both on vnyx-api since deploy ①.
+    "regenerate-copy.ts": "copy",
+    "rebuild-media-cache.ts": "reorder",
     "approve-products.ts": "approve",
     "resync-listings.ts": "resync",
 }
@@ -222,6 +263,86 @@ def vnyx_api_url() -> str | None:
     CLI both still work with VNYX_API_DIR alone.
     """
     return (os.getenv("VNYX_API_URL") or "").rstrip("/") or None
+
+
+# What the step runner said it accepts, cached for the process. `None` means not
+# asked yet; an empty set means asked and it would not say. The sentinel below
+# means there was nobody to ask because the steps are spawned locally.
+_LOCAL_TRANSPORT = "*local*"
+_REMOTE_OPTIONS: set[str] | None = None
+
+
+def remote_options() -> set[str]:
+    """The option names this deployment of vnyx-api accepts.
+
+    `GET /internal/auto-approval/ping` has listed them since readiness phase 2,
+    precisely so a Hermes about to send an option the server does not know can
+    tell before the 400. Nothing consulted it until now.
+
+    It matters because `--bg-strategies` and `--keep-better` (items 6 and 8 of
+    docs/PICTURE-CHECK-FIXES.md) are sent by the chain but land on a vnyx-api
+    whose `backfill-bg-removal.ts` does not take them yet. Without this probe the
+    first re-matte of every run dies on a 400 halfway through the chain — after
+    the master, matte and reconcile steps have already written.
+
+    Failing open is not available here. `--keep-better` is the guard that stops a
+    re-matte STORING a cut-out worse than the one it replaces (KIL-001625 lost a
+    large part of a shirt back exactly that way), so dropping it silently and
+    re-cutting anyway is the one outcome worse than not re-cutting at all. The
+    caller's answer is to skip the re-matte and say so.
+
+    Never raises: a ping that fails answers "nothing", which is the same
+    conservative branch as an old server.
+    """
+    global _REMOTE_OPTIONS
+    if _REMOTE_OPTIONS is not None:
+        return _REMOTE_OPTIONS
+
+    base = vnyx_api_url()
+    if not base:
+        # LOCAL TRANSPORT: there is no schema to answer 400, because the step is
+        # a spawn of the checkout's own script. Nothing can be asked and nothing
+        # needs to be — an argument the script does not know is a flag it does
+        # not read, not a rejected request. So this reports the sentinel and
+        # `remote_supports` lets the call through, leaving the checkout's
+        # currency to whoever maintains the checkout.
+        _REMOTE_OPTIONS = {_LOCAL_TRANSPORT}
+        return _REMOTE_OPTIONS
+
+    import httpx
+
+    try:
+        r = httpx.get(
+            f"{base}/internal/auto-approval/ping",
+            headers={"x-internal-secret": os.getenv("AUTO_APPROVAL_INTERNAL_SECRET", "")},
+            timeout=20,
+        )
+        body = r.json() if r.status_code == 200 else {}
+        _REMOTE_OPTIONS = {str(o) for o in (body.get("options") or [])}
+    except Exception:  # noqa: BLE001 — a probe that cannot run is not a failure
+        _REMOTE_OPTIONS = set()
+    return _REMOTE_OPTIONS
+
+
+def remote_supports(*options: str) -> bool:
+    """May the chain send these options?
+
+    VETOES ONLY ON POSITIVE EVIDENCE. False is returned in exactly one case: a
+    server answered the ping, listed the options it takes, and one of these was
+    not on the list. That is the case that would 400 mid-chain, and it is the
+    only one worth stopping for.
+
+    Everything else is a yes — the local transport, where there is no request to
+    reject; and a ping that did not answer, because a server that cannot be
+    reached will not run the step either, and inventing a skip for it would
+    replace a clear connection error with a misleading "left the cut-outs
+    alone". A guess in either direction is wrong here, so this only acts on what
+    it was actually told.
+    """
+    known = remote_options()
+    if not known or _LOCAL_TRANSPORT in known:
+        return True
+    return all(o in known for o in options)
 
 
 def run_remote(script: str, args: list[str], *, timeout_s: int,
@@ -264,6 +385,61 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
         options["authorize"] = True
     if "--provider" in args:
         options["bgProvider"] = args[args.index("--provider") + 1]
+    # Re-matte a view that already has a cut-out (readiness phase 3). The
+    # option exists on vnyx-api since deploy ① (phase 2); before that deploy
+    # the strict body schema answers 400 and the step fails loudly, which is
+    # the intended order of operations.
+    if "--replace" in args:
+        options["replace"] = True
+    # WHICH SEGMENTERS THE RE-MATTE MAY ASK (item 6 of
+    # docs/PICTURE-CHECK-FIXES.md). Sent as a list of the names
+    # app/imaging/cutout.py defines (`STRATEGY_NAMES`) and validated against a
+    # closed enum on the server, like `views` below — the rule that nothing
+    # from a request becomes a free-form argv value holds here too. vnyx-api
+    # forwards them to /v1/imagery/remove-background as `strategies`.
+    if "--bg-strategies" in args:
+        options["bgStrategies"] = [
+            s.strip()
+            for s in args[args.index("--bg-strategies") + 1].split(",")
+            if s.strip()
+        ]
+    # DO NOT REPLACE A CUT-OUT WITH A WORSE ONE (item 8). The script sends the
+    # cut-out being superseded to Hermes as `previous_url`, and writes nothing
+    # when Hermes answers `kept_existing`. Both options need the vnyx-api
+    # deploy that carries them; before it the strict body schema answers 400
+    # and the step fails loudly, which is the same order of operations
+    # `--replace` itself went through and is preferable to a silent no-op that
+    # would let the KIL-001625 damage through again.
+    if "--keep-better" in args:
+        options["keepBetter"] = True
+    # `--views` MEANS TWO DIFFERENT THINGS, and the script decides which.
+    #
+    # On backfill-imagery.ts it is the on-model views to (re)generate —
+    # AI_FRONT and friends (readiness phase 4). On backfill-bg-removal.ts it is
+    # the GARMENT views to re-cut, FRONT and BACK. Both are closed enums on the
+    # server and they do not overlap, so sending one under the other's key is a
+    # 400: "Invalid enum value. Expected 'AI_FRONT' | ... , received 'FRONT'".
+    #
+    # Keyed off the script rather than off the values, because guessing from
+    # the content would quietly pick a key for an unknown view instead of
+    # failing where the mistake is.
+    if "--views" in args:
+        picked = [
+            v.strip().upper()
+            for v in args[args.index("--views") + 1].split(",")
+            if v.strip()
+        ]
+        key = "matteViews" if script == "backfill-bg-removal.ts" else "views"
+        options[key] = picked
+    # The copy step's two halves (readiness phase 5). Neither flag means both.
+    if "--title" in args:
+        options["title"] = True
+    if "--description" in args:
+        options["description"] = True
+    # reorder: rebuild a gallery flagged mediaManualOrder too (policy says the
+    # flag is not to be trusted — readiness.gallery.respect_manual).
+    if "--include-manual" in args:
+        options["includeManual"] = True
     if "--allow-stage" in args:
         options["allowStage"] = [
             s.strip().upper()
@@ -381,10 +557,22 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
     Uses the audit's own view rather than a second set of queries, so "needs a
     description" here and "description missing" on the sheet cannot disagree.
     """
-    loaded = product_audit.load(dsn, product_id)
+    return needs_from(product_audit.load(dsn, product_id))
+
+
+def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
+    """`needs()` on a product already loaded — from the database or a fixture.
+
+    Split out so `--fixture` judges a file with exactly the predicates the live
+    chain uses; a second copy of "is this view matted" would drift.
+    """
     record, media = loaded["record"], loaded["media"]
 
-    live = [m for m in media if m["mediaType"] == "IMAGE"]
+    # ON the product. The loader also carries the superseded RAW originals a
+    # cut-out was made from (readiness phase 3, `isCurrent: false`); counting
+    # them here would report every matted view as still having a raw beside it.
+    live = [m for m in media if m["mediaType"] == "IMAGE"
+            and m.get("isCurrent", True) and not m.get("deletedAt")]
     garments = [m for m in live if m["view"] in ("FRONT", "BACK", "OTHER")]
     render_rows = [m for m in live if m["view"].startswith("AI_")]
     renders = {m["view"] for m in render_rows}
@@ -406,6 +594,17 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
     # skipped is visible rather than mysterious.
     leftover_raw = len([m for m in garments
                         if m["processing"] == "RAW" and m["view"] in matted_views])
+    # The views whose cut-out EXISTS and can therefore be judged (readiness
+    # phase 3): on its canvas, on the tenant's backdrop. FRONT/BACK only — the
+    # views generation seeds from and the matte step pays for.
+    cutout_views = sorted({m["view"] for m in garments
+                           if m["view"] in ("FRONT", "BACK") and m["processing"] != "RAW"})
+    # Garment PHOTOGRAPHS on file — what a render is seeded from (readiness
+    # phase 4). A size chart filed under OTHER is not one (imagery.is_size_chart).
+    markers = [str(k).lower() for k in
+               ((policy().get("imagery") or {}).get("size_chart_url_markers") or [])]
+    garment_photos = [m for m in garments
+                      if not any(k in str(m.get("url") or "").lower() for k in markers)]
 
     summary = (record.get("summary") or "").strip()
     return {
@@ -422,9 +621,19 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
         "unmatted": len(unmatted_views),
         "unmatted_views": unmatted_views,
         "leftover_raw": leftover_raw,
+        "cutout_views": cutout_views,
+        "garment_photos": len(garment_photos),
+        "master": record.get("masterCategory"),
+        "mannequin": record.get("mannequinType"),
+        "size": record.get("size") or record.get("internationalSize"),
         "renders": len(renders),
         "render_rows": len(render_rows),
         "renders_missing": 5 - len(renders),
+        # Read before and after the chain by the canary in repair(): a flip to
+        # GENERATING that the render step did not cause means a repair write is
+        # triggering paid regeneration.
+        "generation_status": record.get("generationStatus"),
+        "is_regenerating": bool(record.get("isRegenerating")),
         "attributes_missing": [
             name for name, value in (
                 ("brand", record.get("brand")),
@@ -437,9 +646,292 @@ def needs(dsn: str, product_id: str) -> dict[str, Any]:
     }
 
 
+def _generation_in_flight(state: dict[str, Any]) -> bool:
+    """Is a generation genuinely running for this product right now?
+
+    GENERATING / isRegenerating, AND touched within `imagery.stale_generation_hours`
+    (the same threshold IMG.011 and vnyx-api's generation reaper use). Older than
+    that the flag is a stranded row and must not block a repair forever.
+    """
+    if state.get("generation_status") != "GENERATING" and not state.get("is_regenerating"):
+        return False
+    stamp = state["loaded"]["record"].get("updatedAt")
+    if not stamp:
+        return True
+    try:
+        touched = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        if touched.tzinfo is None:
+            touched = touched.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    hours = float((policy().get("imagery") or {}).get("stale_generation_hours") or 1)
+    age_h = (datetime.now(timezone.utc) - touched).total_seconds() / 3600
+    return age_h < hours
+
+
 # --------------------------------------------------------------------------- #
 # The chain
 # --------------------------------------------------------------------------- #
+
+# ATTRIBUTES THAT DO NOT JUSTIFY A VISION CALL ON THEIR OWN.
+#
+# `material` is the case this exists for. It is missing on most of the catalogue,
+# and the bulk extractor only recovers it when the fibre composition happens to be
+# printed legibly on the tag — the three BOAS products checked most recently were
+# all "missing material" with two care labels each. A seventeen-field pass costs
+# 60-250 seconds and a paid vision call, and usually returns "Unknown" anyway,
+# which the placeholder list then reads as still empty. Material is not a
+# condition of approval either (`rules.severity_overrides` in policy.yaml), so
+# the call buys nothing on any axis.
+#
+# Brand and size are NOT in here and should not be: they are on every tag, and
+# the narrow care-label pass reads them cheaply and better.
+#
+# `--infer` overrides it. That flag means "look at the garment, not just the
+# label", which is the one way material is sometimes recoverable, so asking for
+# it explicitly is asking for this too.
+#
+# MODULE LEVEL so `needs()` (live) and `needs_from()` (fixture) read the SAME
+# set. While this lived inside the chain runner the offline report promised an
+# `extract` step on a product whose only gap was material — a step the live run
+# then skipped, so the fixture and the chain disagreed about the same record.
+NOT_WORTH_EXTRACT = frozenset({"material"})
+
+# The rules that say "this record does not describe this garment".
+#
+# NAMED ONE BY ONE, not matched on a `TAX.` prefix. The first version of this did
+# use the prefix and swept in TAX.005 and TAX.007, which are about the MANNEQUIN
+# RIG — a rendering choice the title never mentions. A product with no rig
+# configured would then have had its copy withheld forever, which is the opposite
+# of the point: this guard exists to stop ONE specific failure, not to stop the
+# copy step working.
+#
+#   TAX.001-004   the master category, category or sub-category is not one the
+#                 tenant's tree holds, or they disagree with the gender
+#   GENDER.001    the gender itself is inconsistent
+#   SIZE.011      the sizing guide belongs to the other gender
+#   DRIFT.001     the column and its `properties` twin disagree about one of them
+#
+# These are exactly the fields the generated title is written from. A price, a
+# care label or a missing rig says nothing about whether the title describes the
+# garment, so none of them withholds the copy.
+_COPY_BLOCKING_RULES = frozenset({
+    "TAX.001", "TAX.002", "TAX.003", "TAX.004",
+    "GENDER.001", "SIZE.011", "DRIFT.001",
+})
+
+
+def _blocking_taxonomy(snap: Any) -> list[Any]:
+    """Findings that mean the record misdescribes the garment.
+
+    NO SEVERITY FLOOR, and that is deliberate. The first version required HIGH,
+    borrowing the approval gate's own bar, and it let TAX.003 through — an
+    invalid SUB-category, which the rules rank MEDIUM because it needs a
+    reviewer's eye rather than stopping the product. But the title is generated
+    from the sub-category, so a MEDIUM TAX.003 still produces a title naming a
+    garment type this tenant's catalogue does not have.
+
+    Severity answers "should this stop an approval". The question here is
+    different and narrower: "does the record still misdescribe the garment". The
+    rule list above already answers it, so ranking it a second time only
+    reintroduces the gap.
+
+    Run against the STORED record — a step can report success and leave the field
+    unwritten, so a check that trusted the plan would clear a product whose
+    repair never landed.
+    """
+    from app.rules import run_all
+    from app.rules import gate as gate_rules
+
+    pol = policy()
+    return [f for f in run_all(snap, pol) + gate_rules.check_gate(snap, pol)
+            if str(f.rule_id) in _COPY_BLOCKING_RULES]
+
+# --------------------------------------------------------------------------- #
+# Offline: fixtures
+# --------------------------------------------------------------------------- #
+FIXTURE_KEYS = ("record", "media", "catalog", "grade_ladder", "imagery_settings", "chart")
+
+
+def dump_fixture(dsn: str, product_id: str, path: Path) -> Path:
+    """Write one product exactly as `product_audit.load()` sees it.
+
+    The file is the rule engine's whole input — the record, the typed media
+    rows, the tenant's option lists, grade ladder, imagery settings and chart
+    facts — so `--fixture` later judges the product the database held at this
+    moment, with no database. It is REAL TENANT DATA (SKU, title, URLs, every
+    attribute): keep it under reports/ unless it has been trimmed for a test,
+    the way tests/fixtures/repair/ was.
+    """
+    loaded = product_audit.load(dsn, product_id)
+    doc: dict[str, Any] = {k: loaded.get(k) for k in FIXTURE_KEYS}
+    doc["_fixture"] = {
+        "source": "scripts/repair_product.py --dump-fixture",
+        "sku": (loaded["record"] or {}).get("sku"),
+        "product_id": product_id,
+        "database": _redact(dsn),
+        "dumped_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=1, default=str, ensure_ascii=False),
+                    encoding="utf-8")
+    return path
+
+
+def run_fixture(path: Path, *,
+                severity_overrides: dict[str, str] | None = None) -> dict[str, Any]:
+    """The rule engine over one fixture file. No database, no network, no writes.
+
+    WHAT RUNS: `needs_from` (which chain steps the product would get) and
+    `approval.run_gate` — every rule, every planner, the price assessment —
+    exactly as the live chain's reconcile step runs them, minus the evidence
+    layer: no model is called, so a finding that wanted a photograph looked at
+    stays a finding. WHAT DOES NOT: the sub-scripts (matte, relabel, extract,
+    render, approve) live in vnyx-api and need its database; the image gate
+    needs the model. This is the auditor's `--fixture` self-test — does the
+    engine run end to end, and what does it say about a product whose answer is
+    known — not a rehearsal of a repair.
+    """
+    from app import approval, twins
+
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not isinstance(data.get("record"), dict):
+        raise ValueError(f"{path}: not a fixture — no 'record'. Write one with --dump-fixture.")
+    loaded: dict[str, Any] = {k: data.get(k) for k in FIXTURE_KEYS}
+    loaded["media"] = loaded["media"] or []
+    state = needs_from(loaded)
+    gate = approval.run_gate({**loaded["record"], "media": loaded["media"]},
+                             catalog=loaded["catalog"],
+                             imagery_settings=loaded["imagery_settings"],
+                             llm=None, severity_overrides=severity_overrides)
+
+    # The chain's own predicates, so the fixture's answer and a live dry run
+    # cannot disagree about the shape of the work. Relabel is left out: its
+    # test is the sub-script's, run against the media rows on the host.
+    would: list[str] = []
+    # The anchor: listed when the master would move or cannot be settled, the
+    # same test the chain's `master` step prints.
+    from app import readiness
+    from app.vnyx_client import to_snapshot
+
+    master_decision = readiness.decide_master(
+        to_snapshot({**loaded["record"], "media": loaded["media"]},
+                    catalog=loaded["catalog"],
+                    imagery_settings=loaded["imagery_settings"]),
+        policy())
+    if master_decision["action"] in ("set", "unresolved"):
+        would.append("master")
+    if twins.parent_sku(state["sku"], policy()):
+        would.append("twin")
+    # A missing cut-out, or one the stored dimensions already show on the wrong
+    # canvas (IMG.026 — the fixture carries no pixels, so IMG.027 cannot fire
+    # here). The live chain measures; the fixture reads what is on the rows.
+    if state["unmatted"] or any(rid in ("IMG.026", "IMG.027") for rid in gate["findings"]):
+        would.append("matte")
+    # Same test the live chain makes — a gap the extractor is not worth calling
+    # for (material) must not appear here as a step that would run.
+    if state["description_missing"] or (
+        set(state["attributes_missing"]) - NOT_WORTH_EXTRACT
+    ):
+        would.append("extract")
+    if state["care_label"] and any(a in ("brand", "size") for a in state["attributes_missing"]):
+        would.append("care label")
+    if gate["repair_plan"]:
+        would.append("reconcile")
+    if state["renders_missing"]:
+        would.append("render")
+
+    return {
+        "fixture": str(path),
+        "sku": state["sku"], "title": state["title"], "tenant": state["tenant"],
+        "stage": state["stage"],
+        "verified": bool(gate["verified"]),
+        "blocking": gate["blocking"],
+        "advisory": gate["advisory"],
+        "findings": gate["findings"],
+        "repair_plan": gate["repair_plan"],
+        "price": gate.get("price"),
+        "master": master_decision,
+        "would_run": would,
+        "state": {k: state[k] for k in ("description_chars", "care_label", "unmatted",
+                                        "renders", "attributes_missing")},
+        "dumped": data.get("_fixture") or {},
+    }
+
+
+def _fixture_paths(args: list[str]) -> list[Path]:
+    """Files as given; a directory means every *.json in it, sorted."""
+    out: list[Path] = []
+    for a in args:
+        p = Path(a)
+        if p.is_dir():
+            out.extend(sorted(p.glob("*.json")))
+        else:
+            out.append(p)
+    return out
+
+
+def run_fixtures(paths: list[Path], *, out: str | None = None) -> int:
+    """`--fixture`: every file, one report each. Exit 0 when all of them ran —
+    a blocked product is a result, not a failure of the self-test."""
+    print(paint("OFFLINE — fixtures only. No database, no network, nothing written; "
+                "the rules and planners run, the model and the sub-scripts do not.",
+                YELLOW))
+    if not paths:
+        print(paint("  no fixture files found", RED))
+        return 1
+    results: list[dict[str, Any]] = []
+    failed = 0
+    width = len(str(len(paths)))
+    for n, path in enumerate(paths, start=1):
+        head = f'[{str(n).rjust(width)}/{len(paths)}]'
+        try:
+            r = run_fixture(path)
+        except Exception as exc:  # noqa: BLE001 — report it and run the rest
+            failed += 1
+            print(f'{paint(head, BOLD)}  '
+                  f'{paint(f"{path.name}: {type(exc).__name__}: {exc}", RED)}')
+            continue
+        results.append(r)
+        st = r["state"]
+        print(f'{paint(head, BOLD)}  {path.name} {DOT} {r["sku"]} {DOT} '
+              f'{(r["title"] or "")[:60]}')
+        print(paint(f'        {r["tenant"]} {DOT} {r["stage"]} {DOT} '
+                    f'{st["description_chars"]} chars {DOT} care label {st["care_label"]} '
+                    f'{DOT} {st["unmatted"]} unmatted {DOT} {st["renders"]}/5 renders {DOT} '
+                    f'missing {", ".join(st["attributes_missing"]) or "nothing"}', DIM))
+        verdict = (paint("verified", GREEN) if r["verified"]
+                   else paint(f'{len(r["blocking"])} blocking', RED))
+        print(f'        {verdict} {DOT} {len(r["advisory"])} advisory {DOT} '
+              f'{len(r["repair_plan"])} planned action(s)')
+        for f in r["blocking"]:
+            print(f'          - {f["rule_id"]} [{f["severity"]}] {f["message"]}')
+        for f in r["advisory"]:
+            print(paint(f'          · {f["rule_id"]} [{f["severity"]}] {f["message"]}', DIM))
+        for a in r["repair_plan"]:
+            target = a.get("field") or a.get("view") or ""
+            value = a.get("value")
+            shown = f' = {str(value)[:60]}' if value is not None else ""
+            print(paint(f'          plan {a.get("kind")} {target}{shown} ({a.get("reason")})', DIM))
+        if r["would_run"]:
+            print(paint(f'        chain would run: {", ".join(r["would_run"])}', DIM))
+
+    if out:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(
+            json.dumps({"generated": datetime.now(timezone.utc).isoformat(),
+                        "fixtures": results}, indent=2, default=str),
+            encoding="utf-8")
+        print()
+        print(paint("  json: ", DIM) + out)
+
+    ok = sum(1 for r in results if r["verified"])
+    print()
+    print(f'  {len(results)} fixture(s) ran {DOT} {ok} verified {DOT} '
+          f'{len(results) - ok} blocked'
+          + (f' {DOT} {paint(f"{failed} could not run", RED)}' if failed else ''))
+    return 1 if failed else 0
+
 
 def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
                   apply: bool, skip_bin: bool,
@@ -504,6 +996,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     state = needs(dsn, product_id)
     steps: list[dict[str, Any]] = []
 
+    # Steps whose VISION READ failed at the provider — an API error, a timeout,
+    # a rejected key — rather than returning an answer. Reported to the caller
+    # because the difference decides a verdict: "the label could not be read"
+    # and "the label reader was down" must not both become "no size". The
+    # runner retries a product on this list instead of judging it.
+    vision_unavailable: list[str] = []
+
     print()
     print(f'{paint(progress, BOLD) + "  " if progress else ""}'
           f'{paint(str(state["title"] or "(no title)"), BOLD)} '
@@ -526,6 +1025,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         try:
             note = run()
             ok = True
+            # The in-process steps (twin, care label, gate) have no subprocess
+            # output to show, so their one-line result is printed here — the
+            # same line the run log records as the step's note. Subprocess
+            # steps get their summary echoed too, which costs one dim line.
+            if note:
+                print(f'        {paint(note, DIM)}')
         except StepFailed as exc:
             note, ok = str(exc), False
             print(f'        {paint("FAILED: " + note, RED)}')
@@ -535,8 +1040,131 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     common = ["--db", dsn, "--product", product_id]
     live = ["--apply"] if apply else []
 
+    # ---- 0. twin ----------------------------------------------------------
+    #
+    # BEFORE EVERYTHING, because it changes what "missing" means for every step
+    # that follows. A C-twin is the same garment as its parent listed under the
+    # other gender; duplication copied the pictures and not the measurements, so
+    # the twin arrives with blank brand / size and the default rules would
+    # reject it for facts its parent already carries. Gender-neutral fields only
+    # — see app/twins.py for the two lists and why.
+    #
+    # Through apply_plan like the care-label pass: one transaction, guarded on
+    # updatedAt, both copies of a doubled value written.
+    twin_note = ""
+
+    def _twin() -> str:
+        nonlocal state, twin_note
+        from app import twins
+
+        record = state["loaded"]["record"]
+        parent_sku = twins.parent_sku(record.get("sku"), policy())
+        parent = twins.load_parent(dsn, parent_sku or "", str(record["tenantId"]))
+        if parent is None:
+            return f"parent {parent_sku} is not in this tenant — nothing to inherit"
+        plan = twins.inheritance_plan(record, parent, policy())
+        if not plan:
+            return f"parent {parent_sku} holds nothing the twin lacks"
+        summary = ", ".join(f'{a["field"]}={a["value"]!r}' for a in plan)
+        if apply:
+            outcome = product_audit.apply_plan(
+                dsn, product_id, plan, record.get("updatedAt"))
+            if outcome["conflict"]:
+                raise StepFailed(outcome.get("message", "changed mid-repair"))
+            if outcome["skipped"]:
+                raise StepFailed("; ".join(
+                    s.get("why", "?") for s in outcome["skipped"]))
+            # Re-read: the extract / care-label decisions below key off what is
+            # still missing, and that just changed.
+            state = needs(dsn, product_id)
+        twin_note = f'from {parent_sku}: {summary}'
+        return f'{"inherited" if apply else "would inherit"} {summary} from {parent_sku}'
+
+    from app import twins as _twins
+
+    is_twin = _twins.parent_sku(state["sku"], policy()) is not None
+    step("twin", "" if is_twin else "not a C-twin", _twin)
+
+    # ---- 0b. master -------------------------------------------------------
+    #
+    # THE ANCHOR, said out loud at the head of the run (readiness phase 1,
+    # docs/READINESS-PLAN.md §4 step 1). Every field the approval hangs off is
+    # settled from the master category — the gender follows it, the branch must
+    # sit under it, the guide is chosen for its gender, the rig is derived from
+    # it — so which root this product belongs to is decided first and printed,
+    # before anything is paid for.
+    #
+    # REPORT-ONLY HERE. The same decision (`readiness.decide_master`) is what
+    # `approval._plan_master` makes inside run_gate, and the reconcile step
+    # executes that plan through vnyx-api's updateProduct — the one writer that
+    # owns `categoryId` and the taxonomy columns. `apply_plan` refuses
+    # masterCategory by design (see product_audit._WRITABLE_COLUMNS), so this
+    # step never writes; it says what reconcile is about to do, or that no root
+    # fits and the product will hold as MASTER_CATEGORY_UNRESOLVED.
+    master_decision: dict[str, Any] = {}
+
+    def _master() -> str:
+        nonlocal master_decision
+        from app import readiness
+        from app.vnyx_client import to_snapshot
+
+        loaded = state["loaded"]
+        snap = to_snapshot({**loaded["record"], "media": loaded["media"]},
+                           catalog=loaded.get("catalog"),
+                           imagery_settings=loaded.get("imagery_settings"))
+        master_decision = readiness.decide_master(snap, policy())
+        action = master_decision["action"]
+        if action == "keep":
+            return f'{master_decision["master"]!r} is a tenant root — the anchor stands'
+        if action == "set":
+            return (f'{loaded["record"].get("masterCategory")!r} {ARROW} '
+                    f'{master_decision["master"]!r} ({master_decision["basis"]}: '
+                    f'{master_decision["detail"]}); reconcile writes it')
+        if action == "unresolved":
+            return (f'UNRESOLVED — {master_decision["detail"]}; the product holds '
+                    f'as MASTER_CATEGORY_UNRESOLVED')
+        return master_decision["detail"]
+
+    from app import readiness as _readiness
+
+    master_why = ("" if _readiness.enabled(policy())
+                  else "disabled in policy (readiness.enabled)")
+    step("master", master_why, _master)
+
     # ---- 1. matte ---------------------------------------------------------
+    #
+    # TWO QUESTIONS NOW, not one (readiness phase 3, docs/READINESS-PLAN.md §4
+    # step 3). "Does every garment view have a cut-out?" — as before, from the
+    # rows. And "is each cut-out RIGHT?" — on its photograph's own canvas and
+    # on the tenant's backdrop — from the pixels, because 91% of the cut-outs
+    # with stored dimensions sit zoomed on a different canvas than their
+    # original and nothing in a row says so. A wrong cut-out is re-cut from
+    # the raw archive through `--replace` (phase 2: Hermes segmenter, source
+    # canvas, tenant backdrop) and measured again; one still wrong after that
+    # is CUTOUT_UNFIXABLE — a flag while `readiness.cutouts.hold` is soft, a
+    # hold once it is block. Enforced by _approve exactly like the gate. See
+    # app/imaging/cutouts.py.
+    cutout_before: Any = None     # measured before the segmenter ran
+    cutout_verdict: Any = None    # what _approve enforces
+    # Whether this run's matte step re-cut the product's cut-outs (or would,
+    # in a dry run) — the rematte step below asks before cutting them again.
+    matte_state: dict[str, Any] = {"replaced": False}
+
+    def _cutouts_now() -> Any:
+        """Measure the live cut-outs against their originals and the backdrop."""
+        from app.imaging import cutouts
+        from app.vnyx_client import to_snapshot
+
+        fresh = needs(dsn, product_id)["loaded"]
+        snap = to_snapshot({**fresh["record"], "media": fresh["media"]},
+                           catalog=fresh.get("catalog"),
+                           imagery_settings=fresh.get("imagery_settings"))
+        return cutouts.judge(snap, policy())
+
     def _matte() -> str:
+        nonlocal cutout_before, cutout_verdict
+        from app.imaging import cutouts as _cut
+
         # FORCE THE SEGMENTER HERE, not in vnyx-api's environment.
         #
         # BG_REMOVAL_RETIRED would do it globally, but that re-points every
@@ -552,8 +1180,90 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # Settable per deployment, and emptying it restores the old behaviour.
         provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
         force = ["--provider", provider] if provider else []
-        ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts",
-                           [*common, *live, *force], timeout_s=600, quiet=quiet)
+
+        # WHAT IS WRONG WITH THE CUT-OUTS THAT EXIST, measured before anything
+        # runs. Two downloads and two header reads at most; no model.
+        replace: list[str] = []
+        parts: list[str] = []
+        if cutouts_on and state.get("cutout_views"):
+            cutout_before = _cutouts_now()
+            # Stands as the verdict until the re-check replaces it, so a
+            # re-matte that FAILS leaves the measured defect on record rather
+            # than nothing.
+            cutout_verdict = cutout_before
+            if cutout_before.action == "bad":
+                replace = list(cutout_before.bad_views)
+                fixable = [r for r in cutout_before.reasons
+                           if r not in set(getattr(cutout_before, "unfixable_reasons", []))]
+                if replace:
+                    parts.append(f're-matte {", ".join(replace)} ({"; ".join(fixable)})')
+                # A flaw no re-cut can clear (the form's neck where the inside
+                # of the collar should be): said, never re-matted for.
+                if getattr(cutout_before, "unfixable_views", None):
+                    parts.append("not fixable by a re-cut — "
+                                 + "; ".join(cutout_before.unfixable_reasons))
+            elif cutout_before.action == "unknown":
+                parts.append("cut-outs could not be measured: "
+                             + "; ".join(cutout_before.reasons))
+        if state["unmatted"]:
+            parts.append("matte " + ", ".join(state["unmatted_views"]))
+
+        if not state["unmatted"] and not replace:
+            # Nothing for the segmenter. The measurement is the step's result.
+            return (cutout_before.summary() if cutout_before is not None
+                    else "every garment view already has a cut-out")
+
+        if not apply and replace:
+            # A DRY RUN NEVER HOLDS ON WHAT IT WOULD FIX. The re-matte would
+            # run and the re-check would follow; neither can here, so the
+            # verdict says so instead of carrying the pre-repair defect into
+            # the approval decision.
+            cutout_verdict = _cut.CutoutVerdict(
+                "pending", cutout_before.hold, reasons=list(cutout_before.reasons),
+                bad_views=list(cutout_before.bad_views), checks=cutout_before.checks,
+                expected=cutout_before.expected)
+
+        args = [*common, *live, *force]
+        if replace:
+            # `--keep-better` beside `--replace`, always (item 8 of
+            # docs/PICTURE-CHECK-FIXES.md). `replaceWithDerived` supersedes the
+            # old row and cannot be undone, so "is the new one at least as
+            # complete" has to be asked BEFORE the swap; Hermes answers it from
+            # the two cut-outs' garments, each segmented against its own flat
+            # backdrop, and writes nothing when the answer is no.
+            #
+            # A server that cannot take the guard does not get the replace. Not
+            # the other way round: re-cutting without it is how KIL-001625 lost a
+            # large part of its shirt back, and a silent downgrade to the unsafe
+            # call is worse than leaving the existing cut-out alone.
+            if not remote_supports("keepBetter"):
+                matte_state["replace_skipped"] = "vnyx-api does not accept keepBetter"
+                # NAME THE DEFECT IN THE REFUSAL. Without this the note said only
+                # that the re-cut was declined, so a reader learned the chain
+                # could not act and never learned WHAT it had found — the
+                # measurement was on the row in the JSON and nowhere a person
+                # would look. A refusal that hides its own finding reads as the
+                # check having found nothing.
+                return ("left the existing cut-outs alone — this vnyx-api cannot take "
+                        "--keep-better, and re-cutting without it can store a cut-out "
+                        "worse than the one it replaces. STILL WRONG, unrepaired: "
+                        + "; ".join(fixable or cutout_before.reasons))
+            args.extend(["--replace", "--keep-better"])
+            # ONLY THE VIEWS THAT ARE WRONG. `--replace` on its own redoes every
+            # covered view, so a product with one defective cut-out paid for two
+            # segmenter calls and had a sound picture re-cut for no reason — and
+            # the note above already said "re-matte FRONT" while both were being
+            # redone, which made the log a poor guide to what had happened.
+            #
+            # Gated like `keepBetter`: a deployment that cannot take the option
+            # keeps the old whole-product behaviour rather than losing the
+            # re-matte over it. The guard is what may never be dropped; this is
+            # an economy.
+            if remote_supports("matteViews"):
+                args.extend(["--views", ",".join(replace)])
+            matte_state["replaced"] = True
+        ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args,
+                              timeout_s=600, quiet=quiet)
         if not ok:
             raise StepFailed("background removal returned non-zero")
 
@@ -574,11 +1284,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         #
         # So the summary the script already prints is parsed, and a step that
         # wrote nothing while failing something says so.
-        written = failed = None
+        written = failed = kept = None
         for line in (out or "").splitlines():
             low = line.lower()
             if "cut-outs written" in low:
                 written = _trailing_int(line)
+            elif "kept" in low and ":" in line:
+                kept = _trailing_int(line)
             elif "failed" in low and ":" in line:
                 failed = _trailing_int(line)
         if failed and not written:
@@ -587,13 +1299,47 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 f"failed). The segmenter is unreachable or timing out — see the "
                 f"vnyx-api log for the provider's response."
             )
+        note = ("would " if not apply else "") + "; ".join(parts)
         if failed:
-            return (f'{", ".join(state["unmatted_views"])} '
-                    f'({written} written, {failed} FAILED)')
-        return f'{", ".join(state["unmatted_views"])}'
+            note += f' ({written} written, {failed} FAILED)'
+        if kept:
+            # NOT A FAILURE, AND IT MUST NOT READ AS ONE (item 8). Every
+            # candidate was a real cut-out; each had less garment than the one
+            # already on file, so nothing was replaced and the picture the
+            # catalog shows is unchanged. Said out loud because the alternative
+            # — a defect on record with no explanation — is what queues the
+            # product to be sent through the identical re-matte next run.
+            note += (f' ({kept} view(s): the re-matte lost part of the garment, so the '
+                     f'ORIGINAL CUT-OUT WAS KEPT — re-cutting it again will do the same)')
 
+        # THE RE-CHECK. Every fix is followed by the check that asked for it
+        # (§4, principles): the cut-outs are measured again from the rows the
+        # step just wrote. Still wrong is a verdict, not a retry.
+        if apply and cutouts_on and (replace or state["unmatted"]):
+            cutout_verdict = _cutouts_now()
+            if cutout_verdict.action == "bad":
+                note += (" — STILL WRONG after the re-matte: "
+                         + "; ".join(cutout_verdict.reasons)
+                         + (" (holds as CUTOUT_UNFIXABLE)" if cutout_verdict.blocks
+                            else " (soft — readiness.cutouts.hold)"))
+            elif cutout_verdict.action == "ok":
+                note += " — re-checked: on canvas and on the tenant's backdrop"
+            elif cutout_verdict.action == "unknown":
+                note += " — re-check could not measure the new cut-outs"
+        return note
+
+    from app.imaging import cutouts as _cutouts_mod
+
+    cutouts_on = _cutouts_mod.enabled(policy())
     matte_why = ""
-    if not state["unmatted"]:
+    if state["unmatted"]:
+        matte_why = ""
+    elif cutouts_on and state.get("cutout_views"):
+        # Every view has a cut-out; whether each is RIGHT is the step's job now.
+        matte_why = ""
+    elif cutouts_on:
+        matte_why = "no garment photograph to cut out or to check"
+    else:
         matte_why = "every garment view already has a cut-out"
         if state["leftover_raw"]:
             # Said out loud, because IMG.010 will still be in the findings and a
@@ -654,26 +1400,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             raise StepFailed("extraction returned non-zero")
         return "read the care label" + (" and the cut-outs" if infer else "")
 
-    # ATTRIBUTES THAT DO NOT JUSTIFY A VISION CALL ON THEIR OWN.
-    #
-    # `material` is the case this exists for. It is missing on most of the
-    # catalogue, and the bulk extractor only recovers it when the fibre
-    # composition happens to be printed legibly on the tag — the three BOAS
-    # products checked most recently were all "missing material" with two care
-    # labels each. A seventeen-field pass costs 60-250 seconds and a paid vision
-    # call, and usually returns "Unknown" anyway, which the placeholder list
-    # then reads as still empty.
-    #
-    # Brand and size are NOT in here and should not be: they are on every tag,
-    # and the narrow care-label pass below reads them cheaply and better.
-    #
-    # `--infer` overrides it. That flag means "look at the garment, not just the
-    # label", which is the one way material is sometimes recoverable, so asking
-    # for it explicitly is asking for this too.
-    _NOT_WORTH_EXTRACT = {"material"}
-
+    # See NOT_WORTH_EXTRACT at module level for why material is in it, and why
+    # this set has to be the same one `needs_from()` reads.
     missing = set(state["attributes_missing"])
-    worth_extracting = missing if infer else missing - _NOT_WORTH_EXTRACT
+    worth_extracting = missing if infer else missing - NOT_WORTH_EXTRACT
 
     want_extract = state["description_missing"] or worth_extracting
     # Everything still missing that ONLY the care-label pass below can do better.
@@ -736,6 +1466,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         label_read = care_label.read(urls, want=wanted,
                                      min_confidence=min_confidence,
                                      size_ladder=ladder)
+        # THE READER WAS DOWN, not the label illegible. Every provider that
+        # could be asked failed at the API, so nothing about brand or size is
+        # known — and a product must not be rejected on a silence. Marked for
+        # the runner, then recorded as a failed step like any other.
+        if label_read.get("api_failed"):
+            vision_unavailable.append("care label")
         if label_read.get("error"):
             raise StepFailed(label_read["error"])
 
@@ -829,6 +1565,33 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         note = ", ".join(applied) if applied else "nothing to reconcile"
         if failed:
             note += f' (failed: {", ".join(failed)})'
+        if not apply:
+            # A DRY RUN SAYS WHAT IT WOULD WRITE (readiness phase 1). The script
+            # applies nothing without --apply and its results carry only what
+            # was applied, so a shadow run used to read "nothing to reconcile"
+            # for a product with a five-field cascade planned. The plan is
+            # recomputed here with the same run_gate the service just ran, on
+            # the record as loaded, and listed — that is how the cascade is
+            # hand-checked before it is allowed to write.
+            from app import approval
+
+            loaded = state["loaded"]
+            gate = approval.run_gate({**loaded["record"], "media": loaded["media"]},
+                                     catalog=loaded.get("catalog"),
+                                     imagery_settings=loaded.get("imagery_settings"),
+                                     llm=None, severity_overrides=severity_overrides)
+            would = [f'{a.get("field")}={a.get("value")!r} ({a.get("reason")})'
+                     for a in gate["repair_plan"]
+                     if a["kind"] in ("set_column", "set_property")]
+            held = [f'{a.get("field")} ({a.get("code") or a.get("reason")})'
+                    for a in gate["repair_plan"] if a["kind"] == "escalate"]
+            parts = []
+            if would:
+                parts.append("would write " + ", ".join(would))
+            if held:
+                parts.append("a person decides " + ", ".join(held))
+            if parts:
+                note = "; ".join(parts)
         return note
 
     step("reconcile", "", _reconcile)
@@ -876,23 +1639,660 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         verb = "would set" if not apply else "set"
         return f'{verb} {before} {ARROW} {after} ({row.get("reason") or "clamped"})'
 
-    step("price", "", _price)
+    # CONSIGNMENT: the selling price is the consignor's under contract. The gate
+    # already refuses to plan a price write for these tenants (approval.py); this
+    # keeps the clamp step from doing what the gate declined to.
+    from app.approval import is_consignment
+    price_why = ("consignment tenant — the selling price is the consignor's, "
+                 "not written" if is_consignment(
+                     str(state["loaded"]["record"].get("tenantId") or ""), policy())
+                 else "")
+    step("price", price_why, _price)
 
     # ---- 4. render --------------------------------------------------------
+    #
+    # WHAT THE SCRIPT SAID, kept (readiness phase 4). backfill-imagery.ts
+    # exits 0 on a partial set and names the views it could not produce, and
+    # Hermes' generator tells a REFUSAL (the model declining a named athlete's
+    # kit, a licensed print — finish_reason IMAGE_OTHER / SAFETY) from a fault.
+    # A product every model declines cannot be rendered by re-running anything;
+    # that is one of decision 8's two rejections, and it is decided from these
+    # lines, not from an exit code.
+    render_report: dict[str, Any] = {"attempted": False, "views": [], "written": [],
+                                     "failed": [], "refused": False}
+    regen_report: dict[str, Any] = {"attempted": False, "views": [], "written": [],
+                                    "failed": [], "refused": False}
+
+    def _read_render(out: str, into: dict[str, Any]) -> None:
+        for line in (out or "").splitlines():
+            m = re.search(r"wrote \[([^\]]*)\]", line)
+            if m:
+                into["written"] = [v.strip() for v in m.group(1).split(",")
+                                   if v.strip() and v.strip() != "nothing"]
+            m = re.search(r"could not produce \[([^\]]*)\]", line)
+            if m:
+                into["failed"] = [v.strip() for v in m.group(1).split(",") if v.strip()]
+            if "note:" in line and _refusal_text(line):
+                into["refused"] = True
+
     def _render() -> str:
+        render_report["attempted"] = True
         ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
                            [*common, *live], timeout_s=1800, quiet=quiet)
+        _read_render(out, render_report)
         if not ok:
             raise StepFailed("imagery backfill returned non-zero")
-        return f'{state["renders_missing"]} view(s)'
+        note = f'{state["renders_missing"]} view(s)'
+        if render_report["failed"]:
+            note += f' — could not produce {", ".join(render_report["failed"])}'
+            if render_report["refused"]:
+                note += " (the image model declined the print)"
+        return note
 
+    from app import readiness as _rd
+
+    is_kids = _rd.is_kids(state.get("master"), state.get("mannequin"), policy())
     if skip_render:
         render_why = "--no-render"
     elif not state["renders_missing"]:
         render_why = "all five views already exist"
+    elif is_kids and _rd.config(policy()).get("kids_renders") == "hold":
+        # Decision 4 is `generate`; this branch exists so a tenant can turn it
+        # off without a code change, and says so.
+        render_why = "Kids — renders left to a person (readiness.kids_renders: hold)"
+    elif _generation_in_flight(state):
+        # CREDIT-RESUME SAFETY. A generation already running will deliver these
+        # renders; firing a second one pays twice for the same five pictures and
+        # races the first for the rows. backfill-imagery.ts does not check this
+        # itself. Only a LIVE run is respected: past `stale_generation_hours` the
+        # flag is a stranded row, not work in progress, and the render goes ahead.
+        render_why = ("generation already in flight — not paying for a second "
+                      "run while the first is live")
     else:
         render_why = ""
     step("render", render_why, _render)
+
+    # ---- 4b. gate ---------------------------------------------------------
+    #
+    # ONE LOOK AT THE LEAD RENDER before anything is published. Every step
+    # above reads columns; none of them looks at the picture a customer will
+    # see. A render can carry a melted face, a floating leg, no model at all,
+    # or a model of the wrong gender — and pass every rule, because the rules
+    # ask whether AI_FRONT exists, not whether it is any good.
+    #
+    # After render, so it judges what was just produced; before approve, so it
+    # can withhold the move. One Gemini flash call, ~3s. It runs in dry-run
+    # too, so a shadow run reports what the gate WOULD have refused — that is
+    # how its false-block rate is measured before it is allowed to block.
+    #
+    # A gate that could not run (provider down, image unreachable) is not a
+    # refusal: it lands on `vision_unavailable` and the step is recorded as
+    # failed, and the runner retries the product instead of holding it. See
+    # app/imaging/quality_gate.py and app/llm/health.py.
+    gate_verdict: Any = None
+
+    def _judge_lead() -> Any:
+        """One look at the lead render, on the rows as they are NOW."""
+        from app.imaging import quality_gate
+
+        # Re-read: the render step may have just produced the row this judges.
+        fresh = needs(dsn, product_id)["loaded"]
+        record = fresh["record"]
+        # THE MASTER CATEGORY IS THE REFERENCE (readiness phase 1). The render
+        # is judged against the gender the master implies; the gender property
+        # is the fallback for a root that implies none (Unisex, Kids). On a
+        # product whose property still says the other gender, reconcile has
+        # already planned it to the master — in a dry run nothing was written,
+        # and judging against the stale property would refuse a correct render.
+        #
+        # AND AGAINST THE GARMENT'S SIZE (readiness phase 4): the model's build
+        # is held to the band the size implies — never for Kids, footwear or
+        # an accessory, and never when the size implies no build.
+        from app import readiness
+
+        return quality_gate.judge(
+            fresh["media"],
+            gender=(readiness.root_gender(record.get("masterCategory"), policy())
+                    or record.get("gender")),
+            category=record.get("category"),
+            subcategory=record.get("subCategory"),
+            pol=policy(),
+            size=record.get("size") or record.get("internationalSize"),
+            kids=readiness.is_kids(record.get("masterCategory"),
+                                   record.get("mannequinType"), policy()),
+        )
+
+    def _gate() -> str:
+        nonlocal gate_verdict
+        gate_verdict = _judge_lead()
+        if gate_verdict.unavailable:
+            vision_unavailable.append("gate")
+            raise StepFailed("vision unavailable — " + "; ".join(gate_verdict.reasons))
+        return gate_verdict.summary()
+
+    gate_why = ("" if (policy().get("quality_gate") or {}).get("enabled", True)
+                else "disabled in policy (quality_gate.enabled)")
+    step("gate", gate_why, _gate)
+
+    # ---- 4c. photos -------------------------------------------------------
+    #
+    # The other picture: what the garment PHOTOGRAPHS show, which the render
+    # cannot — wear against the grade, and whether each gallery image is what
+    # its slot says. One call for both. Enforced by _approve exactly like the
+    # gate; `photo_audit.required` decides whether "could not run" holds.
+    # See app/imaging/photo_audit.py.
+    #
+    # BEFORE THE REGEN, because it is the only check that sees the four renders
+    # the gate does not. MID-000253 (17 Sep 2026): the lead AI_FRONT passed the
+    # gate while the AI_FRONT_34 beside it had the model's knees smeared to a
+    # white blur — this audit saw it and, as a soft flag, nothing followed.
+    # Now a render it calls defective (RENDER_DEFECT, `bad_views`) is one more
+    # thing the regen step re-renders.
+    photo_verdict: Any = None
+
+    def _judge_photos() -> Any:
+        """One look at the photographs and every render, on the rows as they are NOW."""
+        from app.imaging import photo_audit
+
+        fresh = needs(dsn, product_id)["loaded"]
+        record = fresh["record"]
+        # The gender the MASTER implies, so the audit can say whether the
+        # garment photographs agree with the anchor (readiness phase 1). None
+        # for Unisex / Kids, where nothing is implied and nothing is checked.
+        from app import readiness
+
+        return photo_audit.judge(
+            fresh["media"],
+            grade_severity=record.get("gradeSeverity"),
+            grade_label=record.get("gradeLabel") or record.get("grade"),
+            pol=policy(),
+            product_gender=readiness.root_gender(record.get("masterCategory"), policy()),
+        )
+
+    def _photos() -> str:
+        nonlocal photo_verdict
+        from app.imaging import photo_audit
+
+        photo_verdict = _judge_photos()
+        if photo_verdict.unavailable:
+            vision_unavailable.append("photos")
+            raise StepFailed("vision unavailable — " + "; ".join(photo_verdict.reasons))
+        return photo_audit.summary(photo_verdict)
+
+    photos_why = ("" if (policy().get("photo_audit") or {}).get("enabled", True)
+                  else "disabled in policy (photo_audit.enabled)")
+    step("photos", photos_why, _photos)
+
+    # ---- 4c. rematte ------------------------------------------------------
+    #
+    # A CUT-OUT THE PHOTO AUDIT CALLS DEFECTIVE is re-cut from the raw archive
+    # — the same call the matte step makes on a measured defect — and the
+    # audit looks again. MID-000569 (17 Sep 2026): the sweater's ribbed
+    # neckband was missing from both FRONT cut-outs, plain on the edit screen;
+    # the canvas and backdrop measurements had nothing to say about a garment
+    # part the mask ate, and only a look at the picture does. Held only under
+    # `readiness.cutouts.hold: block`; while soft, a defect the re-cut did not
+    # clear stays a flag. Skipped when the matte step re-cut this product this
+    # run already: the same segmenter would return the same cut.
+    rematte_report: dict[str, Any] = {"attempted": False, "views": [], "written": None,
+                                      "failed": None, "kept": None, "strategies": None,
+                                      "after": None}
+
+    def _cutout_defects(v: Any) -> str:
+        return "; ".join(r for r in [*v.reasons, *v.soft] if str(r).startswith("CUTOUT DEFECT"))
+
+    def _rematte() -> str:
+        nonlocal photo_verdict, cutout_verdict
+        from app.imaging import cutout as _cutout
+        from app.imaging import photo_audit
+
+        views = photo_audit.rematte_views(photo_verdict, policy())
+        why = _cutout_defects(photo_verdict)
+        # A DIFFERENT SEGMENTER, NOT THE SAME ONE (item 6 of
+        # docs/PICTURE-CHECK-FIXES.md). Which one depends on what is wrong:
+        #
+        #   something LEFT IN   a stand, a hanger, a hand. cloth-seg is a
+        #                       clothing parser and the podium is directly
+        #                       beneath the clothing, so re-running it returns
+        #                       the same podium and the same verification
+        #                       passes it again — which is exactly why
+        #                       MID-000521 carried "stand visible at bottom" on
+        #                       all four cut-outs through every repair run. The
+        #                       mask strategies are asked instead, and Hermes
+        #                       intersects their answer with cloth-seg so the
+        #                       garment parser still decides what is cloth.
+        #   something MISSING   a collar, a strap, part of a back. The default
+        #                       chain, because cloth-seg is still the best first
+        #                       answer for what IS the garment and a mask
+        #                       strategy is not more likely to find the collar.
+        plan = _cutout.rematte_strategies(why)
+
+        # A LEFTOVER WITH NOTHING CONFIGURED TO REMOVE IT IS LEFT ALONE.
+        #
+        # `[]` and `None` are different answers (see rematte_strategies): None
+        # is "the default chain is right", `[]` is "this is a stand or a hanger
+        # and every strategy that could take it out is switched off". Re-cutting
+        # anyway would ask cloth-seg — the segmenter that left the podium in —
+        # to remove the podium, which is how MID-000521 carried the same stand
+        # through every repair run. Say so and stop.
+        if plan == []:
+            rematte_report["skipped"] = "no leftover strategy configured"
+            return (f"left the existing cut-outs alone — {why}; removing a stand, a "
+                    f"hanger or a hand needs a segmenter other than cloth-seg and "
+                    f"`readiness.cutouts.leftover_strategies` is empty, so a re-cut "
+                    f"would return the same picture")
+
+        rematte_report.update({"attempted": True, "views": views, "strategies": plan})
+        if not apply:
+            tail = (f"; asking {', '.join(plan)} instead of the default chain, because "
+                    f"something was left in rather than cut out" if plan else "")
+            return (f"would re-cut {', '.join(views)} from the raw archive ({why}); "
+                    f"the photo audit would judge the new cut-outs{tail}")
+
+        # Same rule as the matte step: no guard, no re-cut. A re-matte is the one
+        # place that DELIBERATELY supersedes a live cut-out, so it is the last
+        # place to accept a best-effort call.
+        need = {"keepBetter": "--keep-better"}
+        if plan:
+            need["bgStrategies"] = "--bg-strategies"
+        # NAME ONLY WHAT IS ACTUALLY MISSING. This printed the whole `need` set,
+        # so a server that had `keepBetter` and lacked `bgStrategies` was
+        # reported as taking neither — and the reader's next move is to
+        # implement an option that is already there.
+        absent = [flag for opt, flag in need.items() if not remote_supports(opt)]
+        if absent:
+            missing = ", ".join(absent)
+            rematte_report["skipped"] = f"vnyx-api does not accept {missing}"
+            return (f"left the existing cut-outs alone — this vnyx-api cannot take "
+                    f"{missing}; re-cutting without {'them' if len(absent) > 1 else 'it'} "
+                    f"either stores a worse cut-out or asks the same segmenter that "
+                    f"left this in")
+
+        provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
+        args = [*common, *live, *(["--provider", provider] if provider else []),
+                "--replace", "--keep-better"]
+        if plan:
+            args.extend(["--bg-strategies", ",".join(plan)])
+        ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args,
+                              timeout_s=600, quiet=quiet)
+        if not ok:
+            raise StepFailed("background removal returned non-zero")
+        written = failed = kept = None
+        for line in (out or "").splitlines():
+            low = line.lower()
+            if "cut-outs written" in low:
+                written = _trailing_int(line)
+            elif "kept" in low and ":" in line:
+                kept = _trailing_int(line)
+            elif "failed" in low and ":" in line:
+                failed = _trailing_int(line)
+        rematte_report.update({"written": written, "failed": failed, "kept": kept})
+        if failed and not written:
+            raise StepFailed(f"background removal produced no cut-outs ({failed} image(s) "
+                             f"failed). The segmenter is unreachable or timing out.")
+        note = f"re-cut {', '.join(views)} from the raw archive ({why})"
+        if plan:
+            note += f" with {', '.join(plan)} — the same segmenter would return the same cut"
+        if failed:
+            note += f" ({written} written, {failed} FAILED)"
+
+        # LOOK AGAIN. The measurements on the new cut-outs, then the audit.
+        if cutouts_on and state.get("cutout_views"):
+            cutout_verdict = _cutouts_now()
+        second = _judge_photos()
+        rematte_report["after"] = second.as_dict()
+        photo_verdict = second
+        if second.unavailable:
+            vision_unavailable.append("photos")
+            raise StepFailed(note + " — vision unavailable on the second look: "
+                             + "; ".join(second.reasons))
+        still = bool(photo_audit.rematte_views(second, policy()))
+        if still:
+            note += (" — STILL flagged after the re-cut: " + _cutout_defects(second)
+                     + (" (holds as CUTOUT_DEFECT)" if second.blocks
+                        else " (soft — readiness.cutouts.hold)"))
+        elif second.action == "ok":
+            note += " — photo audit again: passed"
+        else:
+            note += f" — photo audit again: {photo_audit.summary(second)}"
+        if kept:
+            # THE PICTURE ON THE PAGE IS THE ONE THAT WAS ALREADY THERE (item
+            # 8): the replacement had less garment than it and was refused, so
+            # nothing changed. Said out loud, and said harder when the audit is
+            # still flagging — otherwise the row reads as a re-cut that did not
+            # help and the product comes back through the same step next run to
+            # be cut the same way, which is the loop §2.1 exists to break.
+            note += (f"; {kept} view(s) were NOT replaced — the new cut-out lost part of the "
+                     f"garment and the ORIGINAL WAS KEPT"
+                     + (", so this defect is the one that was already on file and a further "
+                        "re-cut will not clear it" if still else ""))
+        return note
+
+    from app.imaging import photo_audit as _pa
+
+    if photo_verdict is None or not _pa.rematte_views(photo_verdict, policy()):
+        rematte_why = "the photo audit found every cut-out whole"
+    elif matte_state["replaced"]:
+        rematte_why = ("the matte step re-cut this product this run already — the same "
+                       "segmenter would return the same cut")
+    else:
+        rematte_why = ""
+    step("rematte", rematte_why, _rematte)
+
+    # ---- 4c. regen --------------------------------------------------------
+    #
+    # THE ONE PAID RETRY (readiness phase 4, docs/READINESS-PLAN.md §4 step 5).
+    # A refusal used to be the end of it: the product held, a person opened
+    # the edit screen and pressed Regenerate, and the same picture came back
+    # unless they also fixed the gender. Now the fields are settled first
+    # (master → gender, size → build, phases 1 and 2), so a re-render has a
+    # real chance of being right, and the chain takes it — ONCE.
+    #
+    # What is re-rendered follows the refusals (quality_gate.regen_views and
+    # photo_audit.regen_views, merged): a gender or build problem is the
+    # MODEL's, and one model carries the set, so every view goes; a broken
+    # face or body on the lead is that picture's, so only the lead does; a
+    # frame the figure does not fill, or a render the photo audit calls
+    # defective, is that VIEW's, so only it does — the renderer keeps the model
+    # identity from the product's stored personality and its AI_FRONT. Through
+    # the render step's `views` option (phase 2), which retires the old render
+    # of each named view. Then every check that asked looks again, once. A
+    # second refusal holds the product with the second verdict; the budget
+    # (`readiness.max_regenerations_per_run`) is spent, never looped.
+    #
+    # The canary (repair()'s generation check) counts this step as a render
+    # the chain caused, so the flip to GENERATING it produces is not an alarm.
+    regeneration: dict[str, Any] = {"attempted": False, "views": [], "code": None,
+                                    "asked_by": [], "before": None, "after": None,
+                                    "photos_before": None, "photos_after": None}
+
+    def _regen_plan() -> dict[str, Any]:
+        """Who asked for a re-render, and of which views.
+
+        The gate's refusal and the photo audit's render defects, merged in the
+        renderer's order. `code` is the gate's when it asked (a set refusal
+        names the fix), else RENDER_DEFECT; `why` quotes each asker's reasons.
+        """
+        from app.imaging import photo_audit, quality_gate
+
+        pol = policy()
+        askers: list[tuple[str, str, list[str], list[str]]] = []      # label, code, reasons, views
+        if gate_verdict is not None and gate_verdict.action == "regen":
+            askers.append(("gate", str(gate_verdict.code), list(gate_verdict.reasons),
+                           quality_gate.regen_views(gate_verdict, pol)))
+        if photo_verdict is not None:
+            pv = photo_audit.regen_views(photo_verdict, pol)
+            if pv:
+                askers.append(("photos", "RENDER_DEFECT",
+                               [r for r in photo_verdict.reasons if r.startswith("RENDER DEFECT")]
+                               or list(photo_verdict.reasons), pv))
+        all_views = list((pol.get("imagery") or {}).get("all_views")
+                         or ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK", "AI_CLOSEUP"])
+        wanted = {v for _, _, _, vs in askers for v in vs}
+        views = [v for v in all_views if v in wanted] + sorted(v for v in wanted if v not in all_views)
+        return {
+            "askers": [a for a, _, _, _ in askers],
+            "views": views,
+            "all_views": all_views,
+            "code": next((c for a, c, _, _ in askers if a == "gate"), None)
+                    or next((c for _, c, _, _ in askers), None),
+            "why": "; ".join(f'{c}: {"; ".join(rs)}' for _, c, rs, _ in askers),
+        }
+
+    def _regen() -> str:
+        nonlocal gate_verdict, photo_verdict
+        from app.imaging import photo_audit
+
+        plan = _regen_plan()
+        views = plan["views"]
+        regeneration.update({"attempted": True, "views": views, "code": plan["code"],
+                             "asked_by": plan["askers"],
+                             "before": gate_verdict.as_dict() if gate_verdict is not None else None,
+                             "photos_before": photo_verdict.as_dict() if photo_verdict is not None else None})
+        regen_report["attempted"] = True
+        regen_report["views"] = views
+        ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
+                              [*common, *live, "--views", ",".join(views)],
+                              timeout_s=1800, quiet=quiet)
+        _read_render(out, regen_report)
+        if not ok:
+            raise StepFailed("regeneration returned non-zero")
+
+        scope = "the whole set" if set(views) >= set(plan["all_views"]) else ", ".join(views)
+        why = plan["why"]
+        if not apply:
+            # Nothing was rendered, so there is nothing new to judge. The first
+            # verdicts stand — a dry run reports what was refused and what the
+            # live run would re-render.
+            return f"would regenerate {scope} ({why}); the checks would judge the new set"
+
+        note = f"regenerated {scope} ({why})"
+        if regen_report["failed"]:
+            note += f' — could not produce {", ".join(regen_report["failed"])}'
+            if regen_report["refused"]:
+                note += " (the image model declined the print)"
+
+        # LOOK AGAIN, ONCE. Every fix is followed by the check that asked for
+        # it; the second verdicts are the ones _approve enforces. The gate
+        # always (its lead may be among the views; otherwise the cache answers
+        # for free), the photo audit when it asked.
+        outcomes: list[str] = []
+        second = _judge_lead()
+        regeneration["after"] = second.as_dict()
+        gate_verdict = second
+        if second.unavailable:
+            vision_unavailable.append("gate")
+            raise StepFailed(note + " — vision unavailable on the second look: "
+                             + "; ".join(second.reasons))
+        if second.action == "regen":
+            outcomes.append(f'REFUSED AGAIN ({second.code}: {"; ".join(second.reasons)})')
+        elif second.action == "ok":
+            outcomes.append("gate again: passed")
+        else:
+            outcomes.append(f"gate again: {second.summary()}")
+
+        if "photos" in plan["askers"]:
+            second_p = _judge_photos()
+            regeneration["photos_after"] = second_p.as_dict()
+            photo_verdict = second_p
+            if second_p.unavailable:
+                vision_unavailable.append("photos")
+                raise StepFailed(note + " — vision unavailable on the photo audit's second look: "
+                                 + "; ".join(second_p.reasons))
+            if photo_audit.regen_views(second_p, policy()):
+                outcomes.append("photo audit REFUSED AGAIN ("
+                                + "; ".join(r for r in second_p.reasons if r.startswith("RENDER DEFECT")) + ")")
+            elif second_p.action == "ok":
+                outcomes.append("photo audit again: passed")
+            else:
+                outcomes.append(f"photo audit again: {photo_audit.summary(second_p)}")
+
+        note += " — " + "; ".join(outcomes)
+        if any("REFUSED AGAIN" in o for o in outcomes):
+            note += "; the budget is spent, the product holds"
+        return note
+
+    budget = int(_rd.config(policy()).get("max_regenerations_per_run") or 0)
+    regen_plan = _regen_plan()
+    if not regen_plan["askers"]:
+        regen_why = "the gate did not ask for a re-render, nor did the photo audit"
+    elif skip_render:
+        regen_why = "--no-render"
+    elif budget < 1:
+        regen_why = "readiness.max_regenerations_per_run is 0"
+    elif not regen_plan["views"]:
+        regen_why = "nothing to regenerate for this verdict"
+    elif _generation_in_flight(state):
+        regen_why = ("generation already in flight — not paying for a second "
+                     "run while the first is live")
+    else:
+        regen_why = ""
+    step("regen", regen_why, _regen)
+
+    def _snapshot_now() -> Any:
+        """The product as the rules see it, on the rows as they are NOW."""
+        from app.vnyx_client import to_snapshot
+
+        fresh = needs(dsn, product_id)["loaded"]
+        return to_snapshot({**fresh["record"], "media": fresh["media"]},
+                           catalog=fresh.get("catalog"),
+                           imagery_settings=fresh.get("imagery_settings"))
+
+    # ---- 4d. order --------------------------------------------------------
+    #
+    # THE GALLERY IN THE CATALOG ORDER (readiness phase 5, decision 2). `images`
+    # is vnyx-api's cache of the rows in display order, rebuilt on every media
+    # mutation and never otherwise — so a product nothing touched keeps the
+    # order the day it was made, and the order changed (phase 2: uploads and
+    # the booth ahead of the portal). IMG.025 compares the cache with what the
+    # rows imply; the fix is never a position write from here, it is the
+    # rebuild vnyx-api owns (`rebuild-media-cache.ts`, the `reorder` step). A
+    # gallery a person arranged is left as arranged.
+    order_report: dict[str, Any] = {"checked": False, "in_order": None, "manual": False,
+                                    "divergence": None, "rebuilt": False}
+
+    def _order() -> str:
+        from app.rules import imagery
+
+        snap = _snapshot_now()
+        order_report["checked"] = True
+        respect_manual = bool(imagery.gallery_config(policy()).get("respect_manual", True))
+        if snap.media_manual_order:
+            order_report["manual"] = True
+            if respect_manual:
+                return "a person arranged this gallery — left as arranged"
+        divergence = imagery.gallery_divergence(snap.images, imagery.gallery_order(snap, policy()))
+        order_report["in_order"] = divergence is None
+        order_report["divergence"] = divergence
+        if divergence is None:
+            return "gallery in the catalog order" + (
+                " (flagged as arranged by a person; the flag is not trusted — readiness.gallery.respect_manual)"
+                if snap.media_manual_order else "")
+        desc = (f'position {divergence["index"] + 1} shows {divergence["actual"]} where '
+                f'{divergence["expected"]} belongs')
+        # A flagged gallery is rebuilt only because policy says the flag is not
+        # to be trusted; the script is told so explicitly.
+        extra = ["--include-manual"] if snap.media_manual_order else []
+        ok, _, _ = run_step(vnyx_api, "rebuild-media-cache.ts", [*common, *live, *extra],
+                            timeout_s=120, quiet=quiet)
+        if not ok:
+            raise StepFailed("media cache rebuild returned non-zero")
+        if not apply:
+            return f"would rebuild the media cache — {desc}"
+        order_report["rebuilt"] = True
+        # The check that asked for the fix, again.
+        again = imagery.gallery_divergence(
+            _snapshot_now().images, imagery.gallery_order(_snapshot_now(), policy()))
+        order_report["in_order"] = again is None
+        if again is None:
+            return f"rebuilt the media cache — was: {desc}; now in the catalog order"
+        return (f'rebuilt the media cache — still out of order: position '
+                f'{again["index"] + 1} shows {again["actual"]} where {again["expected"]} belongs')
+
+    from app.rules import imagery as _imagery
+
+    order_why = ("" if _imagery.gallery_enabled(policy())
+                 else "disabled in policy (readiness.gallery)")
+    step("order", order_why, _order)
+
+    # ---- 4e. copy ---------------------------------------------------------
+    #
+    # THE TITLE AND DESCRIPTION, FROM THE SETTLED RECORD (readiness phase 5,
+    # §4 step 8). The title template is "Vintage [Brand] [Colour] [Subcategory]
+    # [Gender] [Size]"; every one of those may have moved this run — the master
+    # cascade, the care-label size, the extractor's brand — and the copy that
+    # was written before they did now says the wrong thing (TEXT.007 on a
+    # C-twin, TEXT.008 on a re-sized product). So: when a field the copy reads
+    # CHANGED this run, or the TEXT rules already disagree with the record,
+    # regenerate both through `regenerate-copy.ts` — the same two services the
+    # edit screen's buttons call, writing only title and summary — and run the
+    # TEXT rules again on the result. Not charged (decision 5 open).
+    copy_report: dict[str, Any] = {"triggers": [], "changed": [], "rules": [], "ran": False,
+                                   "title_before": None, "title_after": None, "rules_after": None}
+
+    def _norm(value: Any) -> str:
+        if isinstance(value, (list, tuple)):
+            return ",".join(sorted(str(v).strip().lower() for v in value if str(v).strip()))
+        return str(value or "").strip().lower()
+
+    def _copy_triggers() -> tuple[list[str], list[str]]:
+        from app.rules.consistency import check_copy
+
+        cfg = _rd.config(policy()).get("copy") or {}
+        before_rec = state["loaded"]["record"]
+        fresh = needs(dsn, product_id)["loaded"]
+        now_rec = fresh["record"]
+        changed = [f for f in (cfg.get("trigger_fields") or [])
+                   if _norm(before_rec.get(f)) != _norm(now_rec.get(f))]
+        from app.vnyx_client import to_snapshot
+
+        snap = to_snapshot({**now_rec, "media": fresh["media"]}, catalog=fresh.get("catalog"),
+                           imagery_settings=fresh.get("imagery_settings"))
+        wanted = set(cfg.get("trigger_rules") or [])
+        rules = sorted({f.rule_id for f in check_copy(snap, policy()) if f.rule_id in wanted})
+        return changed, rules
+
+    def _copy() -> str:
+        from app.rules.consistency import check_copy
+
+        why = ", ".join([*(f"{f} changed" for f in copy_report["changed"]), *copy_report["rules"]])
+        ok, _, payload = run_step(vnyx_api, "regenerate-copy.ts", [*common, *live],
+                                  timeout_s=180, quiet=quiet, results_name="copy.json")
+        if payload is None:
+            raise StepFailed("regenerate-copy.ts returned no result"
+                             + ("" if ok else " and exited non-zero"))
+        if not payload.get("ok"):
+            raise StepFailed(f'{payload.get("outcome") or "failed"}: '
+                             f'{payload.get("error") or ", ".join(payload.get("failed") or []) or "no detail"}')
+        if not apply:
+            return f"would regenerate title and description ({why})"
+        copy_report["ran"] = True
+        title = payload.get("title") or {}
+        copy_report["title_before"], copy_report["title_after"] = title.get("before"), title.get("after")
+        # THE TEXT RULES AGAIN on the result — every fix is followed by the
+        # check that asked for it.
+        after = sorted({f.rule_id for f in check_copy(_snapshot_now(), policy())
+                        if f.rule_id.startswith("TEXT.")})
+        copy_report["rules_after"] = after
+        return (f'regenerated title and description ({why}) — title now '
+                f'"{title.get("after")}"; TEXT rules after: {", ".join(after) or "clean"}')
+
+    if not (_rd.config(policy()).get("copy") or {}).get("enabled", True):
+        copy_why = "disabled in policy (readiness.copy)"
+    else:
+        changed_fields, text_rules = _copy_triggers()
+        copy_report["changed"], copy_report["rules"] = changed_fields, text_rules
+        copy_report["triggers"] = [*(f"{f} changed" for f in changed_fields), *text_rules]
+        # NEVER DESCRIBE DATA THE RULES HAVE ALREADY REJECTED.
+        #
+        # The title is generated FROM the taxonomy, gender and size. If those are
+        # still blocking after `reconcile` ran, regenerating the copy does not
+        # repair anything — it launders a known-bad record into prose and makes
+        # the damage much harder to see, because a wrong title reads as a real
+        # product while a wrong `subCategory` reads as a bug.
+        #
+        # 18 Sep 2026 is the case. `reconcile` wrote `category: 'hoodie'` on an
+        # Adidas t-shirt and TAX.002 rejected it on the next line; `copy` then
+        # ran on "category changed" and produced "Vintage Adidas Deep Burgundy
+        # Hoodie Women S". Same run: "Men's/Unisex" on one product, a New Balance
+        # title that stopped naming New Balance on another.
+        #
+        # Checked against the STORED record after reconcile, not against the plan
+        # — a step can report success and leave the field unwritten.
+        blocking_now = sorted({
+            f.rule_id for f in _blocking_taxonomy(_snapshot_now())
+        })
+        if not copy_report["triggers"]:
+            copy_why = ("nothing the title or description reads changed, "
+                        "and the copy agrees with the record")
+        elif blocking_now:
+            copy_report["withheld"] = blocking_now
+            copy_why = (f'the record still fails {", ".join(blocking_now)} — the title is '
+                        f'generated from those fields, so regenerating it now would only '
+                        f'describe the wrong product convincingly')
+        else:
+            copy_why = ""
+    step("copy", copy_why, _copy)
 
     # ---- 5. approve -------------------------------------------------------
     #
@@ -902,11 +2302,45 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     def _approve() -> str:
         nonlocal verdict
+        # THE GATE'S REFUSAL IS ENFORCED HERE, not by skipping the step. The
+        # pre-flight still runs without --apply so the product's readiness is
+        # known and recorded; only the move is withheld. `approved` cannot come
+        # back from a call that was never allowed to apply.
+        # Three picture verdicts, one rule: any refusing withholds the move.
+        # The gate comes first because it is the definition of "may this leave
+        # Review"; the photo audit is evidence added to it; the cut-outs
+        # (readiness phase 3) refuse only once `readiness.cutouts.hold` is
+        # block, and only for a defect the re-matte did not clear.
+        refusing = [(label, v) for label, v in (("image gate", gate_verdict),
+                                                ("photo audit", photo_verdict),
+                                                ("cut-outs", cutout_verdict))
+                    if v is not None and v.blocks]
+        blocked = bool(refusing)
         # Only ever passes --apply when BOTH flags are set. `--apply` alone
         # repairs; publishing has to be asked for separately.
         verdict = approve_check(vnyx_api, dsn, product_id,
-                                apply=apply and approve, skip_bin=skip_bin,
+                                apply=apply and approve and not blocked,
+                                skip_bin=skip_bin,
                                 quiet=quiet, allow_stage=allow_stage)
+        if blocked:
+            gate_problems = [f"{label}: {r}" for label, v in refusing for r in v.reasons]
+            # A real refusal names its code; only when EVERY refusing verdict is
+            # "could not run" is the outcome the retryable gate_unavailable.
+            real = [v for _, v in refusing if not v.unavailable]
+            if verdict.get("outcome") in ("would_approve", "approved"):
+                # Ready by every column check, refused on the picture. A
+                # distinct outcome, so the verdict names the gate rather than
+                # reporting "ready, not moved".
+                verdict = {**verdict,
+                           "outcome": ("gate_blocked" if real else "gate_unavailable"),
+                           "problems": gate_problems}
+            else:
+                # Not ready anyway. The gate's reasons ride along so the row
+                # shows everything a human has to fix, not just the first thing.
+                verdict = {**verdict,
+                           "problems": [*(verdict.get("problems") or []),
+                                        *gate_problems]}
+            verdict["gate_code"] = (real or [refusing[0][1]])[0].code
         outcome = verdict.get("outcome", "?")
         problems = verdict.get("problems") or []
         if outcome == "approved":
@@ -914,6 +2348,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                     f'{ARROW} {verdict.get("stageAfter")}, Shopify upsert enqueued')
         if outcome == "would_approve":
             return "ready — pass --approve to move it"
+        if outcome == "gate_blocked":
+            return "NOT approved — refused on the pictures: " + "; ".join(problems)
+        if outcome == "gate_unavailable":
+            return "NOT approved — the picture check could not run: " + "; ".join(problems)
         if outcome == "skipped_preflight":
             return "NOT ready: " + "; ".join(problems)
         return f'{outcome}: {"; ".join(problems)}' if problems else outcome
@@ -932,6 +2370,47 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # stopped blocking on would still come back held.
     final = product_audit.audit(dsn, product_id, apply=False, write_sheet=False,
                                 severity_overrides=severity_overrides)
+
+    # THE ANCHOR'S VERDICT (readiness phase 1). Unresolved at the head of the
+    # chain, or still blocking after reconcile had its turn (TAX.001, or the
+    # master among DATA.010's empty fields): either way no root fits, nothing
+    # downstream can be settled, and the outcome names it rather than whichever
+    # rule sorted first.
+    master_unresolved = master_decision.get("action") == "unresolved" or any(
+        f.get("rule_id") == "TAX.001"
+        or (f.get("rule_id") == "DATA.010"
+            and "master_category" in (f.get("fields") or []))
+        for f in final["remaining"]
+    )
+
+    # UNFIXABLE BY ANY RE-RUN (readiness phase 4, decision 8). Two defects no
+    # step can repair: no garment photograph to render from (IMG.003), and a
+    # print every image model declines. Named here with the reason a person
+    # would read; whether that becomes a REJECTION is the runner's call under
+    # `readiness.unfixable` — the chain reports, the agent archives.
+    #
+    # FROM THE RULE, NOT FROM A COUNT. IMG.003 is silent when the loader saw no
+    # media rows at all, by design — and 185 approved products on the local
+    # clone carry a populated `images` cache and not one ProductMedia row. A
+    # zero-row count read as "no photograph" would have rejected every one of
+    # them; the rule's silence is the protection.
+    remaining_ids = [f["rule_id"] for f in final["remaining"]]
+    unfixable: dict[str, str] | None = None
+    if "IMG.003" in remaining_ids:
+        unfixable = {
+            "code": "NO_GARMENT_PHOTO",
+            "reason": ("NO_GARMENT_PHOTO — no garment photograph to render from; "
+                       "reshoot required"),
+        }
+    elif any(r["attempted"] and r["refused"] and not r["written"]
+             for r in (render_report, regen_report)):
+        unfixable = {
+            "code": "RENDER_REFUSED",
+            "reason": ("RENDER_REFUSED — the image models decline this print; "
+                       "photograph it on a model or list it without renders"),
+        }
+
+    render_ran = any(s.get("step") in ("render", "regen") and s.get("ran") for s in steps)
 
     return {
         "product_id": product_id,
@@ -956,6 +2435,49 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             "blockers": verdict.get("problems") or [],
             "stage_before": verdict.get("stageBefore"),
             "stage_after": verdict.get("stageAfter"),
+            "gate_code": verdict.get("gate_code"),
+        },
+        "gate": gate_verdict.as_dict() if gate_verdict is not None else None,
+        "photos": photo_verdict.as_dict() if photo_verdict is not None else None,
+        # The cut-outs as measured BEFORE the matte step and AFTER it (readiness
+        # phase 3). `after` is what _approve enforced; in a dry run it is the
+        # `pending` verdict, never the pre-repair defect.
+        "cutouts": {
+            "before": cutout_before.as_dict() if cutout_before is not None else None,
+            "after": cutout_verdict.as_dict() if cutout_verdict is not None else None,
+        },
+        "master": master_decision,
+        "master_unresolved": master_unresolved,
+        # The one paid retry (readiness phase 4): what the gate refused, what was
+        # re-rendered, and what the gate said the second time.
+        "regeneration": regeneration,
+        "render_report": render_report,
+        # A cut-out the photo audit refused, re-cut from the raw archive, and
+        # what the audit said afterwards.
+        "rematte": rematte_report,
+        # Readiness phase 5: the gallery order as checked and rebuilt, and the
+        # copy regeneration with its triggers.
+        "order": order_report,
+        "copy": copy_report,
+        # A defect no re-run can clear, with the reason a person would read; the
+        # runner turns it into a rejection under `readiness.unfixable`.
+        "unfixable": unfixable,
+        "vision_unavailable": vision_unavailable,
+        # THE CANARY'S EVIDENCE. `regeneration_triggered` is the one fact the
+        # runner stops a run on: the status flipped to GENERATING across the
+        # chain and the render step is not what did it. A flip WITH the render
+        # step running is reported but not acted on — the generation path owns
+        # that transition and this cannot tell an intended one from an accident.
+        "generation": {
+            "before": state["generation_status"],
+            "after": after["generation_status"],
+            # The regen step is a render the chain caused (readiness phase 4).
+            "render_ran": render_ran,
+            "regeneration_triggered": (
+                after["generation_status"] == "GENERATING"
+                and state["generation_status"] != "GENERATING"
+                and not render_ran
+            ),
         },
         "verified": final["verified_after"],
         "remaining": [f["rule_id"] for f in final["remaining"]],
@@ -982,6 +2504,87 @@ def report(r: dict[str, Any]) -> None:
          ", ".join(a["attributes_missing"]) or "none")
     print(f'    {"issues left":14} {r["issues"]}'
           + (f'  ({", ".join(r["remaining"])})' if r["remaining"] else ""))
+
+    # The gate's one line, coloured by what it decided: a refusal is the thing
+    # this block exists to make visible, a pass is quiet, and "could not run"
+    # is neither — it is the provider, not the product.
+    gate = r.get("gate") or {}
+    if gate:
+        action = gate.get("action")
+        text = "; ".join(gate.get("reasons") or []) or action or "?"
+        if gate.get("soft"):
+            text += f'  (soft: {", ".join(gate["soft"])})'
+        colour = {"regen": RED, "review": YELLOW, "ok": DIM}.get(action, DIM)
+        label = {"ok": "passed", "regen": "REFUSED", "review": "could not decide",
+                 "skipped": "skipped"}.get(action, action)
+        print(f'    {"image gate":14} {paint(label, colour)} {paint(text, DIM)}'
+              + (f'  {paint("on " + gate["lead_view"], DIM)}' if gate.get("lead_view") else ""))
+
+    # The one paid retry (readiness phase 4): what was re-rendered and what the
+    # gate said afterwards. Quiet when the gate never asked.
+    regen = r.get("regeneration") or {}
+    if regen.get("attempted"):
+        after_g = regen.get("after") or {}
+        outcome_txt = ({"ok": "gate again: passed", "regen": "REFUSED AGAIN — held",
+                        "review": "gate again: could not decide"}
+                       .get(after_g.get("action"), "not re-judged (dry run)"))
+        print(f'    {"regenerated":14} '
+              f'{paint(", ".join(regen.get("views") or []) or "nothing", DIM)} '
+              f'{paint("for " + str(regen.get("code")), DIM)}  '
+              f'{paint(outcome_txt, GREEN if after_g.get("action") == "ok" else YELLOW)}')
+
+    rem = r.get("rematte") or {}
+    if rem.get("attempted"):
+        after_p = rem.get("after") or {}
+        still = any(str(s).startswith("CUTOUT DEFECT") for s in
+                    [*(after_p.get("reasons") or []), *(after_p.get("soft") or [])])
+        outcome_txt = ("not re-judged (dry run)" if not after_p
+                       else "STILL flagged" if still else "photo audit again: passed")
+        if rem.get("kept"):
+            # The one outcome that is neither a fix nor a failure (item 8): the
+            # replacement had less garment than what is on file and was
+            # refused, so the picture is unchanged and nothing should re-queue
+            # it. Said on the line a person actually reads.
+            outcome_txt += f' — ORIGINAL KEPT on {rem["kept"]} view(s), the re-cut lost garment'
+        asked = "for CUTOUT_DEFECT" + (
+            " with " + ", ".join(rem["strategies"]) if rem.get("strategies") else "")
+        good = bool(after_p) and not still and not rem.get("kept")
+        print(f'    {"re-cut":14} {paint(", ".join(rem.get("views") or []) or "nothing", DIM)} '
+              f'{paint(asked, DIM)}  {paint(outcome_txt, GREEN if good else YELLOW)}')
+
+    unfix = r.get("unfixable") or {}
+    if unfix:
+        print(f'    {"unfixable":14} {paint(unfix.get("code") or "?", RED)} '
+              f'{paint(unfix.get("reason") or "", DIM)}')
+
+    # Phase 5: the gallery order and the copy, one line each when they did something.
+    order = r.get("order") or {}
+    if order.get("checked") and order.get("divergence"):
+        d = order["divergence"]
+        state_txt = ("rebuilt" if order.get("rebuilt") else "would rebuild") + (
+            "" if order.get("in_order") or not order.get("rebuilt") else " — still out of order")
+        print(f'    {"gallery order":14} {paint(state_txt, GREEN if order.get("in_order") else YELLOW)} '
+              f'{paint(f"was: position {d["index"] + 1} {d["actual"]} where {d["expected"]} belongs", DIM)}')
+    cp = r.get("copy") or {}
+    if cp.get("triggers"):
+        print(f'    {"copy":14} {paint("regenerated" if cp.get("ran") else "would regenerate", GREEN if cp.get("ran") else YELLOW)} '
+              f'{paint(", ".join(cp["triggers"]), DIM)}'
+              + (f'  {paint("TEXT after: " + (", ".join(cp["rules_after"]) or "clean"), DIM)}'
+                 if cp.get("rules_after") is not None else ""))
+
+    # The photo audit's line, same colouring: a hold (GRADE SUSPECT, or an
+    # IMAGE DEFECT when policy blocks on it) and a render it refused
+    # (RENDER DEFECT — re-rendered by the regen step) are red; soft flags ride
+    # in grey.
+    photos = r.get("photos") or {}
+    if photos:
+        action = photos.get("action")
+        text = "; ".join(photos.get("reasons") or []) or action or "?"
+        if photos.get("soft"):
+            text += f'  (soft: {"; ".join(photos["soft"])})'
+        colour = {"review": RED, "regen": RED, "ok": DIM}.get(action, DIM)
+        label = {"ok": "passed", "regen": "REFUSED", "review": "HELD", "skipped": "skipped"}.get(action, action)
+        print(f'    {"photo audit":14} {paint(label, colour)} {paint(text, DIM)}')
 
     ap = r.get("approval") or {}
     if ap.get("outcome") == "approved":
@@ -1230,8 +2833,13 @@ def main() -> int:
     ap.add_argument("--db", "--dsn", dest="db")
     ap.add_argument("--product", "--products", dest="products",
                     help="one uuid, or a comma-separated list.")
-    ap.add_argument("--from-sheet", dest="from_sheet",
-                    help="Product IDs from an audit sheet, worst-first.")
+    # NOT `--sheet`: that is the OUTPUT workbook, below. The input list and the
+    # output report are both xlsx and one letter apart in the head, so they are
+    # named for their direction.
+    ap.add_argument("--from-sheet", "--product-sheet", dest="from_sheet",
+                    help=("INPUT: run every product listed in this xlsx, in sheet "
+                          "order (worst-first in an audit workbook). The column of "
+                          "product ids is found by its header or by its shape."))
     ap.add_argument("--limit", type=int)
     ap.add_argument("--apply", action="store_true",
                     help="ACTUALLY do it. Spends money on the render step.")
@@ -1257,16 +2865,40 @@ def main() -> int:
                     help=f"path to the vnyx-api repo. Default {DEFAULT_VNYX_API}")
     ap.add_argument("--out", help="write a JSON summary here.")
     ap.add_argument("--sheet",
-                    help=("xlsx path. Defaults to "
-                          "reports/generated/repair-<stamp>.xlsx."))
+                    help=("OUTPUT: where to write this run's report. Defaults to "
+                          "reports/generated/repair-<stamp>.xlsx. The product "
+                          "LIST to run is --from-sheet."))
     ap.add_argument("--no-sheet", action="store_true")
     ap.add_argument("--quiet", action="store_true",
                     help="hide the sub-scripts' own output.")
+    ap.add_argument(
+        "--fixture", nargs="+", metavar="PATH",
+        help=("OFFLINE SELF-TEST: run the rule engine over fixture file(s) written "
+              "by --dump-fixture. No database, no network, no writes; --out "
+              "writes the verdicts as JSON. A directory means every *.json in it. "
+              "tests/fixtures/repair/ ships one."))
+    ap.add_argument(
+        "--dump-fixture", metavar="PATH",
+        help=("write the one --product as a fixture for --fixture, then stop. "
+              "The file is real tenant data; keep it under reports/."))
     args = ap.parse_args()
+
+    # ---- offline: a fixture, the rules, nothing else ------------------------
+    if args.fixture:
+        return run_fixtures(_fixture_paths(args.fixture), out=args.out)
 
     dsn = args.db or os.getenv("DATABASE_URL") or settings().database_url
     if not dsn:
         sys.exit("No --db, and no DATABASE_URL.")
+
+    if args.dump_fixture:
+        ids = [s.strip() for s in (args.products or "").split(",") if s.strip()]
+        if len(ids) != 1:
+            sys.exit("--dump-fixture takes exactly one --product <uuid>.")
+        path = dump_fixture(dsn, ids[0], Path(args.dump_fixture))
+        print(f'fixture: {path}')
+        print(paint("  real tenant data — keep it under reports/ unless trimmed for a test", DIM))
+        return 0
 
     vnyx_api = Path(args.vnyx_api)
     if vnyx_api_url():
@@ -1313,8 +2945,12 @@ def main() -> int:
         print(paint(f'{available:,} named — running the first {len(ids):,}', DIM))
 
     if not args.apply:
-        print(paint("DRY RUN — nothing is written and no model is called. "
-                    "Pass --apply to do it.", YELLOW))
+        # Not "no model is called" any more: the image gate judges the lead
+        # render in dry-run too, one flash call per product, so a shadow pass
+        # reports what it would refuse. Nothing generates and nothing is written.
+        print(paint("DRY RUN — nothing is written. Up to two vision calls per "
+                    "product (the image gate, the photo audit); no renders, no "
+                    "repairs. Pass --apply to do it.", YELLOW))
     elif args.approve:
         print(paint(
             "--approve: products passing the pre-flight will be MOVED to "
@@ -1418,6 +3054,10 @@ def main() -> int:
     if args.approve and args.apply:
         line += f' {DOT} {moved} moved to APPROVED'
     print(line)
+    # What the vision cache saved this run, when it was consulted at all.
+    cache_line = vision_cache.summary()
+    if cache_line:
+        print(paint(f'  {cache_line}', DIM))
     if ready and not (args.approve and args.apply):
         print(paint('  Add --approve to move the ready ones (publishes to '
                     'Shopify).', DIM))

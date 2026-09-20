@@ -381,6 +381,14 @@ class PromptContext:
     custom_prompt: str | None = None
     # No back photograph exists, so the rear is inferred rather than observed.
     back_inferred: bool = False
+    # The model's identity comes from a render the product ALREADY has (the
+    # reference image), not from a description: the personality trait lines are
+    # left out of the prompt, so nothing in words can contradict the picture.
+    # MID-000569 (17 Sep 2026): a close-up re-rendered beside four renders of a
+    # blonde woman came back with a dark-haired one — the reference said one
+    # person, a freshly cast personality described another, and the description
+    # won. No stored traits, a reference in hand: describe nobody.
+    identity_from_reference: bool = False
 
 
 def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> str:
@@ -571,7 +579,11 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
     # Without this every render is a generic model and the tenant's cast of 20
     # named personalities has no effect on anything, which makes a catalog that
     # looks like one person wearing the entire shop.
-    if not is_kids:
+    #
+    # Also skipped when the identity comes from a reference render (see
+    # PromptContext.identity_from_reference): a trait in words that differs from
+    # the person in the picture is an instruction to draw someone else.
+    if not is_kids and not ctx.identity_from_reference:
         skin_tone = _trait(s.skin_tone)
         if skin_tone:
             prompt += f", {skin_tone} skin tone"
@@ -920,7 +932,10 @@ class NanoBanana:
         ]
         if back is not None:
             parts.append(types.Part.from_bytes(data=back, mime_type="image/jpeg"))
-        if front_reference is not None and view != "front":
+        # The reference rides along for every view but the front — which, in a
+        # set, IS the reference — unless the identity is being copied from a
+        # render the product already has, in which case the front needs it too.
+        if front_reference is not None and (view != "front" or ctx.identity_from_reference):
             parts.append(types.Part.from_text(
                 text="This is the front view reference - use the EXACT SAME model "
                      "with identical characteristics."

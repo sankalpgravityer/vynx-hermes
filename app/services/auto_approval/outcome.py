@@ -110,6 +110,39 @@ def classify(result: dict[str, Any]) -> Verdict:
             retryable=False,
         )
 
+    # ---- ready by every column check, refused on the picture ----------------
+    #
+    # repair() replaces `would_approve` with these two when the image gate
+    # spoke. They are tested BEFORE would_approve because they arrive in its
+    # place: the pre-flight passed, the move was withheld, and the reason is
+    # the render, not a field. `gate_code` names which — IMAGE_QUALITY,
+    # MODEL_GENDER_MISMATCH, CATEGORY_IMAGE_MISMATCH from the gate; GRADE_SUSPECT,
+    # IMAGE_DEFECT from the photo audit; CUTOUT_UNFIXABLE from the cut-out
+    # check (readiness phase 3) — so the Review tab can group by cause.
+    if outcome == "gate_blocked":
+        return Verdict(
+            status="HELD_FOR_HUMAN",
+            outcome=str(approval.get("gate_code") or "IMAGE_QUALITY"),
+            reason=("; ".join(blockers) or "The image gate refused the lead render.")[:500],
+            approved=False,
+            retryable=False,
+        )
+
+    # The gate could not RUN — provider down, image unreachable. Not a verdict
+    # about the product, so retryable: the runner puts it back with a backoff
+    # and only records this outcome once the attempts are spent.
+    if outcome == "gate_unavailable":
+        return Verdict(
+            status="HELD_FOR_HUMAN",
+            outcome="VISION_UNAVAILABLE",
+            reason=(
+                "; ".join(blockers)
+                or "The image gate could not run, so the render was not judged."
+            )[:500],
+            approved=False,
+            retryable=True,
+        )
+
     # ---- ready, but the move was not asked for ----------------------------
     if outcome == "would_approve":
         return Verdict(
@@ -185,6 +218,25 @@ def classify(result: dict[str, Any]) -> Verdict:
     # refused on a required field. Both are HELD_FOR_HUMAN, but the recorded
     # cause differs, and Hermes' rule wins when both fired: it is the more
     # specific statement about what is wrong.
+    #
+    # THE ANCHOR FIRST (readiness phase 1). A master category no root of the
+    # tenant's tree fits is the one defect every other field hangs off — the
+    # gender, the branch, the guide and the rig cannot be settled until a
+    # person names the root — so it is recorded under its own code rather than
+    # as whichever of TAX.001 / DATA.010 happened to sort first.
+    if result.get("master_unresolved") and (remaining or blockers):
+        detail = (result.get("master") or {}).get("detail")
+        return Verdict(
+            status="HELD_FOR_HUMAN",
+            outcome="MASTER_CATEGORY_UNRESOLVED",
+            reason=(
+                f"No master category fits this product: {detail}"
+                if detail else "No master category fits this product."
+            )[:500],
+            approved=False,
+            retryable=False,
+        )
+
     rule = _worst_rule(remaining)
     if rule:
         return Verdict(

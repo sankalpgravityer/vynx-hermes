@@ -722,6 +722,24 @@ class CutoutRequest(BaseModel):
     image_base64: str | None = None
     image_url: str | None = None
     timeout_s: float = 180.0
+    # WHICH SEGMENTERS TO ASK (item 6 of docs/PICTURE-CHECK-FIXES.md). Omitted,
+    # the default chain runs — cloth-seg, then the two mask strategies, then
+    # paint. A RE-matte asked for because a stand or a hanger was left in names
+    # the mask strategies instead: re-running cloth-seg on a podium returns the
+    # same podium (§1.1), which is why MID-000521 carried "stand visible at
+    # bottom" through every repair. Excluding cloth-seg from the list still
+    # INTERSECTS with it, so the garment parser decides what is cloth; `skip`
+    # is the way to leave it out altogether.
+    strategies: list[str] | None = None
+    skip: list[str] | None = None
+    # THE CUT-OUT THIS ONE WOULD SUPERSEDE (item 8). `backfill-bg-removal.ts
+    # --replace` calls `replaceWithDerived`, which cannot be undone, so a
+    # replacement that has less garment than what is on file has to be refused
+    # HERE — before the bytes are handed back — rather than measured afterwards.
+    # KIL-001625 lost a large part of a shirt back and KIL-001644 a strap that
+    # way (§2.1). Omitted, nothing is compared and nothing is refused.
+    previous_base64: str | None = None
+    previous_url: str | None = None
 
 
 class CutoutResponse(BaseModel):
@@ -730,6 +748,13 @@ class CutoutResponse(BaseModel):
     provider: str = "none"
     error: str | None = None
     duration_ms: int = 0
+    # TRUE WHEN NOTHING IS WRONG AND NOTHING WAS REPLACED: every candidate was
+    # a real cut-out and each had less garment than the one already on file, so
+    # the existing cut-out stands. The caller must not write a row and must not
+    # queue the product to try the same thing again — which is the difference
+    # between this and `ok: false` with an error, and the reason it is a field
+    # of its own rather than a sentence in one.
+    kept_existing: bool = False
 
 
 @app.post("/v1/imagery/remove-background", response_model=CutoutResponse)
@@ -748,6 +773,12 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
     So a provider that hands back the picture unchanged is treated as having
     failed, and the next one is tried.
 
+    IT ALSO DECIDES WHETHER TO REPLACE (item 8 of docs/PICTURE-CHECK-FIXES.md).
+    Given `previous_*` — the cut-out this one would supersede — a candidate
+    with less garment than what is on file is refused instead of returned, and
+    the answer carries `kept_existing: true`. `replaceWithDerived` cannot be
+    undone, so this is the only place that decision can be made.
+
     Every attempt is logged at INFO under `hermes.cutout`, which is the point of
     moving it here: the whole chain is visible in one service's log.
     """
@@ -758,6 +789,21 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
 
     started = _time.perf_counter()
 
+    def fetch(url: str, what: str) -> bytes:
+        # Fetched here rather than asking the caller to inline megabytes of
+        # JPEG. make_client, not a bare httpx.Client: it carries the IPv4 pin
+        # this host needs, without which an R2 fetch stalls ~43s on the IPv6
+        # attempt before falling back. See app/net.py.
+        try:
+            from app.net import make_client
+
+            with make_client(30.0) as client:
+                resp = client.get(url)
+                resp.raise_for_status()
+                return resp.content
+        except Exception as exc:
+            raise HTTPException(400, f"could not fetch {what}: {exc}")
+
     raw: bytes | None = None
     if req.image_base64:
         try:
@@ -765,29 +811,31 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
         except Exception:
             raise HTTPException(400, "image_base64 is not valid base64")
     elif req.image_url:
-        # Fetched here rather than asking the caller to inline megabytes of
-        # JPEG. Same IPv4 pin the render path uses — see app/net.py.
-        try:
-            from app.net import make_client
-
-            # make_client, not a bare httpx.Client: it carries the IPv4 pin this
-            # host needs, without which an R2 fetch stalls ~43s on the IPv6
-            # attempt before falling back.
-            with make_client(30.0) as client:
-                resp = client.get(req.image_url)
-                resp.raise_for_status()
-                raw = resp.content
-        except Exception as exc:
-            raise HTTPException(400, f"could not fetch image_url: {exc}")
+        raw = fetch(req.image_url, "image_url")
     else:
         raise HTTPException(400, "pass image_base64 or image_url")
 
-    out, err, provider = cutout.remove_background(raw, timeout_s=req.timeout_s)
+    previous: bytes | None = None
+    if req.previous_base64:
+        try:
+            previous = _b64.b64decode(req.previous_base64, validate=True)
+        except Exception:
+            raise HTTPException(400, "previous_base64 is not valid base64")
+    elif req.previous_url:
+        # A PREVIOUS THAT WILL NOT DOWNLOAD IS NOT A REASON TO REPLACE IT
+        # BLIND. The caller asked for the comparison; failing it open would put
+        # the KIL-001625 damage back, so the request fails instead.
+        previous = fetch(req.previous_url, "previous_url")
+
+    out, err, provider = cutout.remove_background(
+        raw, timeout_s=req.timeout_s,
+        strategies=req.strategies, skip=req.skip, previous=previous)
     return CutoutResponse(
         ok=out is not None,
         image_base64=_b64.b64encode(out).decode() if out else None,
         provider=provider,
         error=err,
+        kept_existing=provider == cutout.KEPT_EXISTING,
         duration_ms=int((_time.perf_counter() - started) * 1000),
     )
 
@@ -1012,18 +1060,28 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
     # set: generating only the missing back view against the product's own
     # AI_FRONT costs one call and matches what is already in the gallery, where
     # regenerating all five costs five and replaces images nobody complained about.
+    #
+    # ANY render that is not being redone will do, the front first and the back
+    # last (no face on it): re-rendering the AI_FRONT itself for a defect must
+    # still show the person in the other four, and the three-quarter view is a
+    # perfectly good likeness of them.
     front_reference = None
+    reference_view: str | None = None
     notes: list[str] = []
-    existing_front = next(
-        (m for m in imagery_rules.ai_renders(snapshot) if m.view == "AI_FRONT"), None
-    )
-    if existing_front and "AI_FRONT" not in wanted:
-        got = generator.fetch([existing_front.url])
-        if existing_front.url in got:
-            front_reference = got[existing_front.url]
+    existing_renders: dict[str, Any] = {}
+    for m in imagery_rules.ai_renders(snapshot):
+        existing_renders.setdefault(m.view, m)
+    for candidate in ("AI_FRONT", "AI_FRONT_34", "AI_CLOSEUP", "AI_BACK_34", "AI_BACK"):
+        m = existing_renders.get(candidate)
+        if m is None or candidate in wanted:
+            continue
+        got = generator.fetch([m.url])
+        if m.url in got:
+            front_reference, reference_view = got[m.url], candidate
             notes.append(
-                "Kept the model identity from the product's existing AI_FRONT render."
+                f"Kept the model identity from the product's existing {candidate} render."
             )
+            break
 
     # ---- which model wears it ------------------------------------------------
     #
@@ -1039,6 +1097,7 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
     gender = _product_gender(snapshot)
     stored = req.product.get("imageSettings") or {}
     chosen: dict[str, Any] | None = None
+    identity_from_reference = False
 
     if any(stored.get(k) for k in ("skinTone", "hairColor", "hairStyle")):
         gen_settings = nanobanana.apply_personality(gen_settings, stored)
@@ -1046,6 +1105,22 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
             f"Reused the model already on this product"
             + (f" ({stored.get('personalityName')})."
                if stored.get("personalityName") else ".")
+        )
+    elif front_reference is not None:
+        # NO CAST ON TOP OF A REFERENCE. The product has renders and no stored
+        # traits (made before the traits were kept, or by a path that kept
+        # none). MID-000569 (17 Sep 2026): its close-up was re-rendered beside
+        # four renders of a blonde woman; a personality was drawn — "Anna
+        # Miller", dark hair — and described in the prompt while the reference
+        # showed the original, and the description won. Worse, that name was
+        # then STORED on the product as if it had made all five. With a
+        # reference in hand the person is already decided: describe nobody,
+        # let the picture carry the identity, and store no traits.
+        identity_from_reference = True
+        notes.append(
+            f"Model identity taken from the product's existing {reference_view} "
+            f"render; no personality cast, so the new view shows the person "
+            f"already in the gallery."
         )
     else:
         chosen = nanobanana.choose_personality(gen_settings, gender)
@@ -1066,6 +1141,9 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
         stored.get(k) for k in ("skinTone", "hairColor", "hairStyle")
     ):
         _source = f"REUSED from the product ({stored.get('personalityName') or 'unnamed'})"
+    elif identity_from_reference:
+        _source = (f"REFERENCE — identity from the product's existing {reference_view} "
+                   f"render, no cast")
     elif chosen:
         _source = (
             f"CAST pick '{chosen.get('name') or 'unnamed'}' "
@@ -1093,6 +1171,7 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
         mannequin_type=snapshot.mannequin,
         gender=gender,
         back_inferred=back_bytes is None,
+        identity_from_reference=identity_from_reference,
     )
     if ctx.back_inferred:
         notes.append(
@@ -1135,18 +1214,11 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
             f"the same person — regenerate every view to get a consistent set."
         )
 
-    return ImageryGenerateResponse(
-        product_id=snapshot.id,
-        views=views,
-        failed=[v.view for v in views if not v.ok],
-        back_inferred=ctx.back_inferred,
-        model=generator.model,
-        llm_calls=generator.calls,
-        duration_ms=int((time.perf_counter() - started) * 1000),
-        notes=notes + generator.errors,
-        # Only when something was actually produced — recording a model against a
-        # product with no renders would pin a face to images that do not exist.
-        image_settings=({
+    # Only when something was actually produced — recording a model against a
+    # product with no renders would pin a face to images that do not exist.
+    image_settings: dict[str, Any] | None = None
+    if any(v.ok for v in views):
+        image_settings = {
             "personalityName": gen_settings.personality_name,
             "age": gen_settings.age,
             "skinTone": gen_settings.skin_tone,
@@ -1161,7 +1233,28 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
             # The model these renders came from. Read back on the next run so a
             # view added later is made by the same one.
             "generatedWith": used,
-        } if any(v.ok for v in views) else None),
+        }
+        if identity_from_reference:
+            # Nothing about the PERSON is stored: these views copied the one
+            # already in the gallery, and any description written now would be
+            # this run's guess about them — the guess that pinned "Anna Miller"
+            # to MID-000569 beside four renders of someone else. The caller
+            # merges this over the stored settings, so absent keys stay as
+            # they were.
+            for key in ("personalityName", "age", "skinTone", "hairColor",
+                        "hairStyle", "tattoos", "piercings"):
+                image_settings.pop(key, None)
+
+    return ImageryGenerateResponse(
+        product_id=snapshot.id,
+        views=views,
+        failed=[v.view for v in views if not v.ok],
+        back_inferred=ctx.back_inferred,
+        model=generator.model,
+        llm_calls=generator.calls,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        notes=notes + generator.errors,
+        image_settings=image_settings,
     )
 
 
