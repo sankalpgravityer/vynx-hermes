@@ -112,6 +112,19 @@ CLAUSES: list[tuple[str, str]] = [
 # absent from both: approving a rejected product resurrects it.
 APPROVABLE_STAGES = ("REVIEW", "LABEL", "MISSING_LABEL", "PHOTOBOOTH")
 
+# WHICH STAGES A SHEET MAY NAME — a wider question than which stages a product
+# may be approved FROM, and 21 Sep 2026 is when the two came apart.
+#
+# The backlog this script now gets pointed at is the APPROVED tab: 356 Klekt and
+# 145 Midtex products that passed review months ago and fail checks that did not
+# exist then (a studio rig behind the model, a close-up showing the back). They
+# need the repair chain, not approval — they are already approved.
+#
+# So APPROVED is selectable but never approvable: it is absent from
+# APPROVABLE_STAGES above, which is what `allow_stage` is validated against, so
+# widening the sheet cannot widen what the approval pre-flight will move.
+SELECTABLE_STAGES = (*APPROVABLE_STAGES, "APPROVED")
+
 
 class _Tee:
     """Write to the terminal AND a file, from inside the process.
@@ -172,12 +185,31 @@ def read_sheet(path: Path, reason_col: str | None = None) -> list[dict[str, str]
     from openpyxl import load_workbook
 
     wb = load_workbook(path, read_only=True, data_only=True)
-    ws = wb.worksheets[0]
-    rows = list(ws.iter_rows(values_only=True))
-    if not rows:
-        sys.exit(f"{path} is empty.")
 
-    header = [str(h).strip().lower() if h else "" for h in rows[0]]
+    # THE PRODUCTS ARE NOT ALWAYS ON THE FIRST SHEET. This read `worksheets[0]`,
+    # which is `Summary` in every workbook `audit_approved_window.py` writes —
+    # the one an operator naturally points this at. Its first row is a title, so
+    # the run died with "has neither a 'Product id' nor a 'SKU' column" while
+    # pointing at a file whose second sheet is nothing but product ids.
+    #
+    # So every sheet is tried, in order, and the first with a usable header
+    # wins. `audit_review_products.read_sheet_ids` — the reader `--from-sheet`
+    # uses for the same workbooks — already scans this way; the two disagreeing
+    # about which sheet holds the products is the bug, not the fix.
+    def header_of(ws: Any) -> tuple[list[str], list[Any]] | None:
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return None
+        head = [str(h).strip().lower() if h else "" for h in rows[0]]
+        has_id = any(h in ("product id", "productid", "id") for h in head)
+        return (head, rows) if (has_id or "sku" in head) else None
+
+    found = next((f for f in (header_of(ws) for ws in wb.worksheets) if f), None)
+    if found is None:
+        names = ", ".join(ws.title for ws in wb.worksheets)
+        sys.exit(f"{path} has neither a 'Product id' nor a 'SKU' column "
+                 f"on any sheet (looked at: {names}).")
+    header, rows = found
 
     def col(*names: str) -> int | None:
         for n in names:
@@ -188,8 +220,6 @@ def read_sheet(path: Path, reason_col: str | None = None) -> list[dict[str, str]
     i_id = col("product id", "productid", "id")
     i_sku = col("sku")
     i_tenant = col("tenant")
-    if i_id is None and i_sku is None:
-        sys.exit(f"{path} has neither a 'Product id' nor a 'SKU' column.")
 
     i_reason = col(reason_col.strip().lower()) if reason_col else None
     if reason_col and i_reason is None:
@@ -216,7 +246,7 @@ def resolve(entry: dict[str, str], include_failed: bool,
     """The product row, plus which eligibility clauses it fails."""
     where = 'p.id = %(id)s::uuid' if entry["id"] else 'p.sku = %(sku)s'
     clauses = [c for c in CLAUSES if not (retry and c[0] == "never verified")]
-    if stages and any(s not in APPROVABLE_STAGES for s in stages):
+    if stages and any(s not in SELECTABLE_STAGES for s in stages):
         # These names are interpolated into SQL below, so they are checked
         # against a closed set rather than trusted. They come from a flag today;
         # this keeps that true if a caller ever passes them from elsewhere.
@@ -234,6 +264,20 @@ def resolve(entry: dict[str, str], include_failed: bool,
             if name == "in Review" else (name, sql)
             for name, sql in clauses
         ]
+        if "APPROVED" in stages:
+            # A SECOND CLAUSE SAYS THE SAME THING IN THE OTHER VOCABULARY.
+            # `reviewStatus` is ACCEPTED on an approved product, so widening
+            # the stage alone still refuses every row with "review status
+            # pending" — which reads as a different problem and is not one.
+            # The two columns are one fact (ProductStage.APPROVED is defined as
+            # reviewStatus=ACCEPTED in the schema), so they widen together.
+            clauses = [
+                (name,
+                 'p."reviewStatus" = ANY(ARRAY[\'PENDING\',\'PENDING_DECISON\','
+                 '\'ACCEPTED\']::"ProductReviewStatus"[])')
+                if name == "review status pending" else (name, sql)
+                for name, sql in clauses
+            ]
     checks = ",\n               ".join(
         f'({sql}) AS "chk_{i}"' for i, (_, sql) in enumerate(clauses)
     )
@@ -278,8 +322,16 @@ def open_run(tenant_id: str, cfg_row: dict[str, Any]) -> tuple[str, bool]:
 
 
 def enqueue_one(run_id: str, row: dict[str, Any], max_attempts: int,
-                retry: bool = False) -> bool:
+                retry: bool = False) -> str:
     """One queue row, and flip the product to QUEUED.
+
+    Returns what happened, because the caller has to act on the difference:
+
+        'queued'          enqueued now, or re-queued from a terminal status
+        'already_queued'  a row from an earlier invocation, still waiting —
+                          work to pick up, not a reason to skip
+        'open'            IN_PROGRESS; another worker holds it
+
 
     ON CONFLICT DO NOTHING against the partial unique index, and the Product
     update is conditional — so a product the live agent grabbed a moment ago is
@@ -406,7 +458,23 @@ def enqueue_one(run_id: str, row: dict[str, Any], max_attempts: int,
                         {"r": run_id},
                     )
         conn.commit()
-    return bool(n and n[0])
+    if n and n[0]:
+        return "queued"
+
+    # NOT ENQUEUED — and the two reasons need different answers (23 Sep 2026).
+    #
+    # The ON CONFLICT above declines a row that is already QUEUED or IN_PROGRESS,
+    # and the caller used to skip both as "it already has an open row". For
+    # IN_PROGRESS that is right: another worker holds it. For QUEUED it threw
+    # away the work it was asked to do — a Klekt invocation skipped 78 rows that
+    # were queued and waiting for exactly this run to drain them, and nothing
+    # else ever would, because only the process that enqueues a row submits it.
+    open_row = db.fetch_one(
+        'SELECT status::text AS status FROM "AutoApprovalRunProduct"'
+        ' WHERE "runId" = %(r)s::uuid AND "productId" = %(p)s::uuid',
+        {"r": run_id, "p": str(row["id"])},
+    )
+    return "already_queued" if (open_row or {}).get("status") == "QUEUED" else "open"
 
 
 def release_one(run_id: str, product_id: str, reason: str) -> None:
@@ -734,7 +802,9 @@ class Parallel:
     """
 
     def __init__(self, rs_for_run: dict[str, Any], workers: int,
-                 stages: list[str], reject_attrs: bool, apply: bool) -> None:
+                 stages: list[str], reject_attrs: bool, apply: bool,
+                 skip_matte: bool = False,
+                 price_rounding_only: bool = False) -> None:
         import queue
         import threading
 
@@ -746,6 +816,8 @@ class Parallel:
         self.stages = stages
         self.reject_attrs = reject_attrs
         self.apply = apply
+        self.skip_matte = skip_matte
+        self.price_rounding_only = price_rounding_only
         self.submitted = 0
         # Set by the first worker that sees a run-level stop — the canary or
         # a vision outage. The main loop reads it before every submit and the
@@ -820,6 +892,8 @@ class Parallel:
         try:
             abort = runner.verify_one(job["claimed"], rs, ignore_stop=True,
                                       allow_stage=stages, expect_status="QUEUED",
+                                      skip_matte=self.skip_matte,
+                                      price_rounding_only=self.price_rounding_only,
                                       silent=True)
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             with lock:
@@ -970,6 +1044,14 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--sheet", required=True, help="xlsx with a Product id or SKU column")
+    ap.add_argument("--db", "--dsn", dest="db", metavar="URL",
+                    help=("database URL, for parity with repair_product.py. Sets "
+                          "DATABASE_URL for this process so the queue, the events "
+                          "and every repair step resolve the SAME database — "
+                          "db.dsn() reads that variable first. Without it the "
+                          "environment wins, then Hermes' .env; neither is "
+                          "guessed, and an absent value is an error rather than "
+                          "a default."))
     ap.add_argument("--apply", action="store_true",
                     help="let the repairs write. Without it every step is a dry run.")
     ap.add_argument("--approve", action="store_true",
@@ -994,6 +1076,18 @@ def main() -> int:
                          "notes on the Parallel class. Measured 1.5-1.7x on two "
                          "workers, so 725 products at 4 is roughly 12 hours "
                          "rather than 32.")
+    ap.add_argument("--price-rounding-only", action="store_true",
+                    help=("the price step checks ONLY that the price ends in "
+                          ".99 and fixes it when it does not; the grade window "
+                          "is not consulted. Passes repair_product.py's flag of "
+                          "the same name straight through."))
+    ap.add_argument("--no-matte", action="store_true",
+                    help=("skip background removal AND the re-cut, as "
+                          "repair_product.py's own --no-matte does. The CPU "
+                          "segmenter costs 45s plus 168s per image, which on a "
+                          "batch this size is most of the wall clock; the price "
+                          "is that a CUTOUT_DEFECT is reported and not repaired "
+                          "on this pass."))
     ap.add_argument("--hold-only", metavar="REASON",
                     help="do NOT verify anything: record every eligible product "
                          "in the sheet as HELD_FOR_HUMAN with this reason, and "
@@ -1030,6 +1124,14 @@ def main() -> int:
                          "approval pre-flight move them. Every required-field "
                          "check still applies; only the stage clause is "
                          "relaxed.")
+    ap.add_argument("--include-approved", action="store_true",
+                    help=("also accept products already at stage APPROVED — the "
+                          "backlog case: a product that passed review months ago "
+                          "and fails a check added since. It is repaired, never "
+                          "re-approved: this widens the sheet, NOT the approval "
+                          "pre-flight, which still moves products out of Review "
+                          "(or Label) only. Pair with --retry for anything the "
+                          "agent has already judged once."))
     ap.add_argument("--retry", action="store_true",
                     help="re-verify a product that already has a verdict — which "
                          "a dry run leaves behind. Refuses one that is in flight.")
@@ -1040,6 +1142,13 @@ def main() -> int:
                          "APPROVE prompt, and Start-Transcript does not capture "
                          "a native command's output on PowerShell 5.1.")
     args = ap.parse_args()
+
+    # BEFORE ANYTHING READS A DATABASE. Every module in this feature resolves
+    # through db.dsn(), which prefers this variable — so setting it here, once,
+    # is what keeps the queue rows, the event log and the repair steps on one
+    # database. Setting it any later would let an earlier reader take .env's.
+    if args.db:
+        os.environ["DATABASE_URL"] = args.db
 
     # HOLD-ONLY IS EXCLUSIVE. It never runs the chain, so pairing it with
     # --approve reads as "approve these" and would do the opposite; pairing it
@@ -1098,6 +1207,12 @@ def main() -> int:
     # far side of the step runner. They have to agree or a product is admitted
     # and then refused.
     stages = ["REVIEW", "LABEL"] if args.include_label else ["REVIEW"]
+    # THE ONE PLACE THEY DIVERGE, and deliberately. An APPROVED product may be
+    # SELECTED for repair but must never be handed to the approval pre-flight
+    # as a stage to move FROM — it is already there. So the widening applies to
+    # the eligibility predicate alone, and `stages` (which becomes
+    # `allow_stage`) is left as it was.
+    eligible_stages = [*stages, "APPROVED"] if args.include_approved else stages
 
     ok = held = failed = skipped = 0
     pool: Parallel | None = None
@@ -1106,7 +1221,7 @@ def main() -> int:
     for n, entry in enumerate(entries, 1):
         label = entry["sku"] or entry["id"]
         row = resolve(entry, args.include_failed, retry=args.retry,
-                      stages=stages)
+                      stages=eligible_stages)
         if row is None:
             print(f"\n[{n}/{len(entries)}] {label}: NOT FOUND")
             skipped += 1
@@ -1223,20 +1338,24 @@ def main() -> int:
                 )
 
         run_ids.add(run_id)
-        if not enqueue_one(run_id, row, int(cfg_row["maxAttempts"]),
-                           retry=args.retry):
+        enqueued = enqueue_one(run_id, row, int(cfg_row["maxAttempts"]),
+                               retry=args.retry)
+        if enqueued == "open":
             print(f"\n[{n}/{len(entries)}] {row['sku']}: SKIPPED — it already has "
                   f"an open row"
                   f"{'' if args.retry else ' (pass --retry to re-verify it)'}")
             skipped += 1
             continue
-
+        # 'already_queued' falls through to everything below: a row queued by an
+        # earlier invocation and never drained is exactly the work this run was
+        # asked to do, so it is submitted like any other rather than skipped.
         events.emit(tenant_id, "queue",
                     f"{row['sku']} queued by run_from_sheet.py",
                     run_id=run_id, product_id=str(row["id"]))
 
         print(f"\n[{n}/{len(entries)}] {row['tenant']} · {row['sku']} · "
-              f"{(row['title'] or '')[:56]}")
+              f"{(row['title'] or '')[:56]}"
+              f"{'  (already queued — picking it up)' if enqueued == 'already_queued' else ''}")
         if created:
             print(f"    opened the Whole-queue run for {row['tenant']}: {run_id}")
 
@@ -1266,7 +1385,9 @@ def main() -> int:
                 print("  no lease on these rows: do not run a Celery worker "
                       "for this tenant until this finishes\n")
                 pool = Parallel(snap, args.workers, stages,
-                                args.reject_missing_attrs, args.apply)
+                                args.reject_missing_attrs, args.apply,
+                                skip_matte=args.no_matte,
+                                price_rounding_only=args.price_rounding_only)
             if pool.abort:
                 # A worker saw a run-level stop. The row this iteration just
                 # enqueued would otherwise sit QUEUED with nothing to claim it.
@@ -1356,7 +1477,10 @@ def main() -> int:
         claimed = claim.claim_next(
             tenant_id, int(cfg_row["leaseSeconds"]),
             include_failed=bool(cfg_row["includeFailedGeneration"]),
-            stages=stages,
+            # The claim re-checks the stage, so it has to agree with the
+            # eligibility predicate above — admitting a product and then being
+            # unable to claim it would report "another worker took it".
+            stages=eligible_stages,
         )
         if not claimed or str(claimed["productId"]) != str(row["id"]):
             # Another worker took it, or took something else first. Both mean
@@ -1384,7 +1508,9 @@ def main() -> int:
         # it, approving one product by hand would require arming the background
         # agent for the whole tenant first — more dangerous than the thing the
         # guard protects against.
-        abort = runner.verify_one(claimed, rs, ignore_stop=True, allow_stage=stages)
+        abort = runner.verify_one(claimed, rs, ignore_stop=True, allow_stage=stages,
+                                  skip_matte=args.no_matte,
+                                  price_rounding_only=args.price_rounding_only)
 
         after = db.fetch_one(
             'SELECT status, outcome, reason, approved FROM "AutoApprovalRunProduct"'

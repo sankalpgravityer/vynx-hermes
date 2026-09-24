@@ -19,7 +19,7 @@ from typing import Any
 from psycopg.types.json import Jsonb
 
 from app import product_audit
-from app.config import settings
+from app.config import policy_overlay, settings
 from app.llm import health
 from app.services.auto_approval import claim, config as cfgmod, db, events
 from app.services.auto_approval.outcome import Verdict, classify
@@ -375,6 +375,8 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                ignore_stop: bool = False,
                allow_stage: list[str] | None = None,
                expect_status: str = "IN_PROGRESS",
+               skip_matte: bool = False,
+               price_rounding_only: bool = False,
                silent: bool = False) -> str | None:
     """One claimed product, start to finish. Never raises.
 
@@ -399,6 +401,19 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     verdict is written — IN_PROGRESS for the claim-based path, QUEUED for
     --workers, which cannot use IN_PROGRESS because only one row per tenant may
     hold it. See _finish.
+
+    `price_rounding_only` narrows the price step to the .99 ending and drops
+    the grade-window check. Like the flags below it, a decision about one batch
+    rather than a rule for the catalogue, so it is a parameter and not a config
+    field: the unattended agent still checks the window.
+
+    `skip_matte` drops the background-removal and re-cut steps for THIS
+    invocation. Like `allow_stage` and `ignore_stop`, it is a judgement about a
+    batch someone is watching and not a rule for the catalogue, so it is a
+    parameter rather than a config field: the unattended agent still mattes.
+    The cost it saves is real — 45s plus 168s per image on the CPU segmenter —
+    and the price is that a CUTOUT_DEFECT cannot be repaired on this pass, only
+    reported. `repair()` has always taken the flag; nothing passed it.
     """
     repair = _load_repair()
 
@@ -442,7 +457,12 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
         f" · {'writes on' if rs.apply else 'writes off (shadow)'}"
         f" · evidence {'on' if rs.use_llm else 'off'}"
         f" · min confidence {rs.min_extraction_confidence}"
-        f"{' · renders skipped' if rs.skip_render else ''}",
+        f"{' · renders skipped' if rs.skip_render else ''}"
+        f"{'' if rs.matte else ' · matte off'}"
+        f"{'' if rs.gate else ' · image gate off'}"
+        f"{'' if rs.price_mode == 'full' else f' · price {rs.price_mode}'}"
+        f"{'' if rs.publish_on_approve else ' · Shopify push off'}"
+        f"{' · sync repairs to Shopify' if rs.sync_changes else ''}",
         run_id=row["runId"],
         run_product_id=row["id"],
         product_id=product_id,
@@ -502,27 +522,43 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
         # than leave the row unfinished — a held product is recoverable, a
         # stranded one is not.
 
+    # The caller's batch flag narrows the price step further; it never widens
+    # what the Brain switched off.
+    price_mode = rs.price_mode
+    if price_rounding_only and price_mode in ("full", "window_only"):
+        price_mode = "rounding_only" if price_mode == "full" else "off"
+
     try:
-        result = repair(
-            db.dsn(),
-            product_id,
-            apply=rs.apply,
-            vnyx_api=_vnyx_api_dir(),
-            infer=rs.infer_attributes,
-            min_confidence=rs.min_extraction_confidence,
-            skip_render=rs.skip_render,
-            approve=approve,
-            skip_bin=rs.skip_bin_placement,
-            # Frozen in the run's configSnapshot, so a mid-run Brain edit cannot
-            # change how the products still queued are judged.
-            severity_overrides=rs.severity_overrides,
-            allow_stage=allow_stage,
-            # Several products narrate at once under --workers, and interleaved
-            # line-by-line output reads as one product doing the wrong steps in
-            # the wrong order. The caller prints a block per product instead.
-            silent=silent,
-            quiet=True,
-        )
+        # THE TENANT'S BRAIN, for this product only: every policy() read inside
+        # repair() — the gate's block_on, the photo audit's actions, the copy
+        # triggers — sees the checks compiled into the run's snapshot.
+        with policy_overlay(rs.policy_overlay):
+            result = repair(
+                db.dsn(),
+                product_id,
+                apply=rs.apply,
+                vnyx_api=_vnyx_api_dir(),
+                infer=rs.infer_attributes,
+                min_confidence=rs.min_extraction_confidence,
+                skip_render=rs.skip_render,
+                skip_matte=skip_matte or not rs.matte,
+                skip_gate=not rs.gate,
+                price_mode=price_mode,
+                publish=rs.publish_on_approve,
+                sync_changes=rs.sync_changes,
+                approve=approve,
+                skip_bin=rs.skip_bin_placement,
+                # Frozen in the run's configSnapshot, so a mid-run Brain edit
+                # cannot change how the products still queued are judged.
+                severity_overrides=rs.severity_overrides,
+                allow_stage=allow_stage,
+                # Several products narrate at once under --workers, and
+                # interleaved line-by-line output reads as one product doing
+                # the wrong steps in the wrong order. The caller prints a block
+                # per product instead.
+                silent=silent,
+                quiet=True,
+            )
     except product_audit.ProductNotFound:
         _finish(
             row,

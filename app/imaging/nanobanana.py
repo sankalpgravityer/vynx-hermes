@@ -655,11 +655,25 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
                 "frame; keep a recognisable portion of the garment on the upper body "
                 "visible for context."
             )
+        # 21 Sep 2026, MID-000421: the re-rendered close-up came back as a BACK
+        # view — the back of the shirt and the back of the model's head. This
+        # branch was the ONLY one that never said which way the model faces:
+        # `is_back_view` says "facing directly AWAY", the `else` says "faces the
+        # camera", and the close-up said nothing. The call carries the FRONT and
+        # BACK cut-outs both, so with no instruction the side is the generator's
+        # coin toss. Every close-up this system defines — neckline and chest,
+        # waistband and fly, the shoes, the accessory — is a FRONT detail.
+        facing = (
+            " The model FACES THE CAMERA and the garment is seen from the FRONT: "
+            "this is a front detail. Do NOT render a back view — the model's back, "
+            "the rear of the garment or the back of the head must not be what this "
+            "picture shows."
+        )
         prompt += (
             f". CRITICAL: Keep the EXACT SAME garment, fabric, colour and details as "
             f"shown in the reference images (the front reference establishes the "
-            f"model and how the garment sits).{close_up_framing}"
-            if has_front_reference else f".{close_up_framing}"
+            f"model and how the garment sits).{facing}{close_up_framing}"
+            if has_front_reference else f".{facing}{close_up_framing}"
         )
     elif is_back_view:
         # Passing the front image as an "EXACT SAME model" reference tends to make

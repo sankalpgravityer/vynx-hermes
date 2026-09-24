@@ -132,6 +132,28 @@ def test_close_up_is_not_a_macro():
     assert "NOT an extreme macro" in prompt
 
 
+def test_close_up_says_the_model_faces_the_camera():
+    """MID-000421 (21 Sep 2026): a re-rendered close-up came back showing the
+    model's BACK. The close-up branch was the only one that never stated an
+    orientation, and the call carries the FRONT and BACK cut-outs both — so the
+    side was the generator's to choose."""
+    for reference in (True, False):
+        prompt = build_prompt("closeup", ctx(), reference)
+        assert "FACES THE CAMERA" in prompt
+        assert "Do NOT render a back view" in prompt
+
+
+@pytest.mark.parametrize("view", VIEW_ORDER)
+def test_every_view_states_which_way_the_model_faces(view):
+    """The regression guard, not the fix: whatever a view is for, the prompt has
+    to say whether the camera sees the front of the garment or the back of it.
+    A view that says neither renders a coin toss."""
+    prompt = build_prompt(view, ctx(), True)
+    faces_front = "faces the camera" in prompt.lower()
+    faces_away = "facing directly away from the camera" in prompt.lower()
+    assert faces_front ^ faces_away, f"{view}: front={faces_front} away={faces_away}"
+
+
 def test_model_is_always_fully_dressed():
     """Without this the model is rendered in the featured garment alone — a top
     with bare legs."""

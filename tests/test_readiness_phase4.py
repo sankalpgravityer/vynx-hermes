@@ -65,7 +65,20 @@ def test_a_waist_is_a_band_only_on_bottoms_with_a_gender():
 # decide(): the build against the size
 # --------------------------------------------------------------------------- #
 
-def _decide(raw_over: dict, *, build: str | None, size: Any = None, gender="men", pol=POL):
+# THE SHIPPED `block_on` NO LONGER CARRIES `body_size_mismatch` (19 Sep 2026):
+# it re-rendered the whole set on one band of judgement and was 24.8% of a
+# measured run. The question is still ASKED and still recorded in `soft`.
+#
+# So the mechanism tests below run against a policy that still funds it —
+# otherwise they would be testing the price rather than the behaviour — and
+# `test_the_shipped_gate_does_not_regenerate_on_the_build` pins what ships.
+POL_BUILD_BLOCKS = copy.deepcopy(POL)
+POL_BUILD_BLOCKS["quality_gate"]["block_on"] = [
+    *POL["quality_gate"]["block_on"], "body_size_mismatch"]
+
+
+def _decide(raw_over: dict, *, build: str | None, size: Any = None, gender="men",
+            pol=POL_BUILD_BLOCKS):
     return qg.decide({**GOOD, **raw_over}, product_gender=gender, accessory=False, pol=pol,
                      product_build=build, product_size=size)
 
@@ -116,6 +129,36 @@ def test_the_build_check_has_two_switches():
         b for b in soft_only["quality_gate"]["block_on"] if b != "body_size_mismatch"]
     v = _decide({"model_build": "slim"}, build="plus", size="XL", pol=soft_only)
     assert v.action == "ok" and any("one band off" in s for s in v.soft)
+
+
+def test_the_shipped_gate_does_not_regenerate_on_the_build():
+    """WHAT SHIPS (19 Sep 2026). The build question is still asked and still
+    recorded; it just stops costing a whole re-rendered set.
+
+    Measured over 18 products: the gate is 6s each (2.3% of the run) and the
+    re-render it asks for is 156s (24.8%), the largest line — and a build read
+    off a render is one band of judgement, where a gender or a garment family
+    is a fact about the picture."""
+    v = _decide({"model_build": "slim"}, build="plus", size="XL", pol=POL)
+    assert v.action == "ok" and v.code is None and not v.blocks
+    # Asked, answered, and on the row — just not blocking.
+    assert v.build_seen == "slim" and v.build_expected == "plus"
+    assert any("band off" in s for s in v.soft)
+
+
+def test_the_shipped_gate_still_refuses_the_two_that_matter():
+    """`gender_mismatch` and `category_mismatch` are untouched — a woman
+    modelling a men's shirt, and a tank top filed as a dress, are still worth a
+    regeneration and a hold respectively."""
+    wrong_model = _decide({"gender": "Women"}, build=None, gender="men", pol=POL)
+    assert wrong_model.action == "regen" and wrong_model.code == "MODEL_GENDER_MISMATCH"
+
+    # The gender is judged BEFORE the category, so it has to agree here or it
+    # would be the one answering — GOOD reads "Men".
+    wrong_shelf = qg.decide({**GOOD, "garment": "tank top"}, product_gender="men",
+                            accessory=False, pol=POL, category="Dresses",
+                            subcategory="Casual Dress")
+    assert wrong_shelf.code == "CATEGORY_IMAGE_MISMATCH"
 
 
 def test_a_model_cut_at_the_knees_on_a_full_body_view_is_re_rendered():
@@ -200,7 +243,8 @@ MEDIA = [{"url": "https://x/front.png", "view": "AI_FRONT", "mediaType": "IMAGE"
 
 
 def _judge(raw_over: dict, **kw):
-    return qg.judge(MEDIA, gender=kw.pop("gender", "men"), pol=POL,
+    return qg.judge(MEDIA, gender=kw.pop("gender", "men"),
+                    pol=kw.pop("pol", POL_BUILD_BLOCKS),
                     evidence=FakeEvidence({**GOOD, **raw_over}), **kw)
 
 
@@ -322,7 +366,7 @@ def wired(monkeypatch):
 
     approve_outcome: dict[str, Any] = {"outcome": "would_approve", "problems": []}
 
-    def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet, allow_stage=None):
+    def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet, allow_stage=None, publish=True):
         calls["approve"].append({"apply": apply})
         return dict(approve_outcome)
 

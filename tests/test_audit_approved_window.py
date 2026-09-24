@@ -237,12 +237,12 @@ def test_workbook_is_written_with_three_sheets(tmp_path):
     assert issues.cell(row=2, column=1).value == "high"
 
 
-def _fake_gather(seen):
+def _fake_gather(seen, rows=()):
     def fake_gather(dsn, start, end, tenant, limit, quiet=False, judge_images=False, workers=1,
-                    product_ids=None, rejudge=False):
+                    product_ids=None, rejudge=False, stage=None):
         seen.update(start=start, end=end, tenant=tenant, judge_images=judge_images, workers=workers,
-                    product_ids=product_ids, rejudge=rejudge)
-        return []
+                    product_ids=product_ids, rejudge=rejudge, stage=stage)
+        return list(rows)
     return fake_gather
 
 
@@ -272,6 +272,113 @@ def test_product_mode_takes_ids_and_rejudge_implies_judging(monkeypatch, tmp_pat
     assert seen["start"] is None and seen["end"] is None
     assert seen["judge_images"] is True and seen["rejudge"] is True
     assert (tmp_path / "p.xlsx").exists()
+
+
+def test_failed_pictures_names_only_a_verdict_that_refused(monkeypatch):
+    """The filter behind --pictures-failed-only.
+
+    A missing render and an unmatted view are pictures that were never made, not
+    pictures a check refused; a soft flag is a pass with a note. Only a verdict —
+    or an outage that stood in for one — puts a product on the repair list.
+    """
+    refused = [{"code": "GATE_WOULD_REFUSE", "severity": "high", "detail": ""},
+               {"code": "RULE:PRICE.003", "severity": "high", "detail": ""}]
+    assert aw.failed_pictures(refused) == ["GATE_WOULD_REFUSE"]
+    held = [{"code": "PHOTO_AUDIT_HELD_BUT_APPROVED", "severity": "high", "detail": ""}]
+    assert aw.failed_pictures(held) == ["PHOTO_AUDIT_HELD_BUT_APPROVED"]
+    for code in ("RENDER_DEFECT", "CUTOUT_DEFECT", "PICTURES_COULD_NOT_BE_JUDGED"):
+        assert aw.failed_pictures([{"code": code, "severity": "high", "detail": ""}]) == [code]
+    passing = [{"code": c, "severity": "low", "detail": ""} for c in
+               ("PHOTO_AUDIT_SOFT_FLAGS", "RENDERS_INCOMPLETE", "UNMATTED_VIEW",
+                "NO_GATE_RECORD", "NO_PHOTO_AUDIT", "MANUAL_APPROVAL")]
+    assert aw.failed_pictures(passing) == []
+    assert aw.failed_pictures([]) == []
+
+
+def _row(sku, issues, worst="high"):
+    return {"pid": f"p-{sku}", "sku": sku, "title": "Jeans", "tenant": "Klekt",
+            "approved_at": datetime(2026, 9, 15, 14, 22), "approved_by": "agent",
+            "stage_now": "APPROVED", "verification": "VERIFIED", "verification_outcome": None,
+            "agent": None, "gate": None, "photos": None, "judged": {}, "renders": 5,
+            "care_labels": 1, "listings": [], "shopify_id": None, "publication_verify": None,
+            "blocking": [], "advisory": 0, "issues": issues, "worst": worst, "edit_url": ""}
+
+
+def test_stage_mode_examines_the_tab_and_keeps_only_the_products_that_failed(monkeypatch, tmp_path):
+    """`--stage APPROVED --pictures-failed-only`: the Approved tab as it stands,
+    narrowed to the products a picture check refused. The two that passed are
+    still examined — the Summary has to say they were, or 2 rows could be read
+    as a tab of 2."""
+    from openpyxl import load_workbook
+
+    seen = {}
+    rows = [_row("KLE-1", [{"code": "GATE_WOULD_REFUSE", "severity": "high", "detail": "judged now — MODEL"}]),
+            _row("KLE-2", [{"code": "PHOTO_AUDIT_SOFT_FLAGS", "severity": "low", "detail": "x"}], worst="low"),
+            _row("KLE-3", [{"code": "RENDER_DEFECT", "severity": "high", "detail": "judged now — legs"}]),
+            _row("KLE-4", [], worst="none")]
+    monkeypatch.setattr(aw, "gather", _fake_gather(seen, rows))
+    out = tmp_path / "klekt.xlsx"
+    assert aw.main(["--db", "postgresql://x", "--stage", "approved", "--tenant", "Klekt",
+                    "--judge-images", "--pictures-failed-only", "--out", str(out), "--quiet"]) == 0
+    assert seen["stage"] == "APPROVED" and seen["start"] is None and seen["end"] is None
+    assert seen["tenant"] == "Klekt" and seen["judge_images"] is True
+
+    wb = load_workbook(out)
+    skus = [c.value for c in wb["Products"]["D"][1:]]
+    assert sorted(skus) == ["KLE-1", "KLE-3"]
+    summary = {wb["Summary"].cell(row=n, column=1).value: wb["Summary"].cell(row=n, column=2).value
+               for n in range(3, 20)}
+    assert summary["Products"] == 2 and summary["Examined"] == 4
+    assert summary["Passed the pictures — not listed here"] == 2
+    assert "APPROVED" in summary["Scope"] and "image gate" in summary["Scope"]
+
+
+def test_the_passing_half_is_the_same_tab_the_other_way_round(monkeypatch, tmp_path):
+    """--pictures-passed-only keeps exactly what --pictures-failed-only drops, so
+    the two sheets add up to the tab and neither can quietly lose a product."""
+    from openpyxl import load_workbook
+
+    rows = [_row("KLE-1", [{"code": "GATE_WOULD_REFUSE", "severity": "high", "detail": "d"}]),
+            _row("KLE-2", [{"code": "PHOTO_AUDIT_SOFT_FLAGS", "severity": "low", "detail": "x"}], worst="low"),
+            _row("KLE-3", [{"code": "CUTOUT_DEFECT", "severity": "medium", "detail": "d"}], worst="medium"),
+            _row("KLE-4", [], worst="none")]
+    monkeypatch.setattr(aw, "gather", _fake_gather({}, rows))
+    out = tmp_path / "passes.xlsx"
+    assert aw.main(["--db", "postgresql://x", "--stage", "APPROVED", "--tenant", "Klekt",
+                    "--pictures-passed-only", "--out", str(out), "--quiet"]) == 0
+
+    wb = load_workbook(out)
+    assert sorted(c.value for c in wb["Products"]["D"][1:]) == ["KLE-2", "KLE-4"]
+    summary = {wb["Summary"].cell(row=n, column=1).value: wb["Summary"].cell(row=n, column=2).value
+               for n in range(3, 20)}
+    assert summary["Products"] == 2 and summary["Examined"] == 4
+    # The dropped line names the right half — the failing one, not the passing one.
+    assert summary["Did not pass the pictures — not listed here"] == 2
+    assert "passed the image gate" in summary["Scope"]
+
+
+def test_the_two_halves_cannot_be_asked_for_at_once(monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(aw, "gather", _fake_gather({}))
+    with pytest.raises(SystemExit) as exc:
+        aw.main(["--db", "postgresql://x", "--stage", "APPROVED",
+                 "--pictures-failed-only", "--pictures-passed-only"])
+    assert "two halves" in str(exc.value)
+
+
+def test_stage_is_checked_and_rejudging_a_whole_tab_needs_one_tenant(monkeypatch, tmp_path):
+    import pytest
+
+    monkeypatch.setattr(aw, "gather", _fake_gather({}))
+    with pytest.raises(SystemExit) as exc:
+        aw.main(["--db", "postgresql://x", "--stage", "APROVED"])
+    assert "APPROVED" in str(exc.value)
+    with pytest.raises(SystemExit) as exc:
+        aw.main(["--db", "postgresql://x", "--stage", "APPROVED", "--rejudge"])
+    assert "--tenant" in str(exc.value)
+    assert aw.main(["--db", "postgresql://x", "--stage", "APPROVED", "--tenant", "Klekt",
+                    "--rejudge", "--out", str(tmp_path / "r.xlsx"), "--quiet"]) == 0
 
 
 def test_rejudge_needs_product_and_product_needs_uuids(monkeypatch, tmp_path):

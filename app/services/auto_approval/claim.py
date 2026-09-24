@@ -58,7 +58,13 @@ WITH claimed AS (
     -- repair images a job in flight is about to replace.
     AND pr."generationStatus" = ANY(%(gen)s::"ProductGenerationStatus"[])
     AND pr."isRegenerating" = false
-    AND pr."reviewStatus" = ANY(ARRAY['PENDING','PENDING_DECISON']::"ProductReviewStatus"[])
+    -- PARAMETERISED FOR THE SAME REASON `stages` IS, and derived from it (21
+    -- Sep 2026). This clause was hardcoded, so widening the stage alone
+    -- admitted an APPROVED product at enqueue and then refused it here — and
+    -- `claim_next` returns a bare None, which the caller can only report as
+    -- "another worker holds this tenant". The product was enqueued, released
+    -- and skipped on every attempt, with nothing naming the real clause.
+    AND pr."reviewStatus" = ANY(%(review)s::"ProductReviewStatus"[])
   -- Manual work first (an operator is waiting on that one), then the oldest
   -- arrival, so garments come out in the order they came in.
   ORDER BY p.priority DESC, p."createdAt" ASC
@@ -81,6 +87,21 @@ UPDATE "AutoApprovalRunProduct" q
  WHERE q.id = c.id
 RETURNING q.*;
 """
+
+
+def review_statuses(stages: list[str] | None) -> list[str]:
+    """The `reviewStatus` values that go with these stages.
+
+    ONE FACT IN TWO COLUMNS. `ProductStage.APPROVED` is defined in the schema as
+    `reviewStatus=ACCEPTED`, so a caller that widens the stage has already
+    decided this — deriving it here rather than taking a second argument is what
+    stops the two drifting apart, which is exactly how an APPROVED product came
+    to be admitted at enqueue and refused at claim.
+    """
+    out = ["PENDING", "PENDING_DECISON"]
+    if stages and "APPROVED" in stages:
+        out.append("ACCEPTED")
+    return out
 
 
 def claim_next(
@@ -125,6 +146,7 @@ def claim_next(
                             else ["COMPLETE"]
                         ),
                         "stages": stages or ["REVIEW"],
+                        "review": review_statuses(stages),
                     },
                 )
             except pg_errors.UniqueViolation:
@@ -263,12 +285,29 @@ def cancel_stale_queued() -> int:
                  "completedAt" = now(),
                  "leaseExpiresAt" = NULL,
                  "updatedAt"   = now()
-            FROM "Product" pr
+            FROM "Product" pr, "AutoApprovalRun" r
            WHERE pr.id = q."productId"
+             AND r.id  = q."runId"
              AND q.status = 'QUEUED'::"VerificationStatus"
-             AND (pr."currentStage" <> 'REVIEW'::"ProductStage"
-                  OR pr."isDeleted" = true
-                  OR pr."isArchived" = true)
+             -- A MANUAL run's stage is the OPERATOR'S CHOICE (22 Sep 2026).
+             --
+             -- `run_from_sheet.py --include-approved` queues products that are
+             -- already APPROVED on purpose: the backlog it repairs lives in the
+             -- Approved tab. This clause read "not in Review" and cancelled
+             -- them as stale, so a Klekt batch lost 54 of 350 rows to
+             -- LEFT_REVIEW — a sentence that was not true of any of them — with
+             -- the remaining 78 queued behind it waiting for the same.
+             --
+             -- The unattended paths are untouched: for ON_ARRIVAL and SCHEDULED
+             -- the queue IS the Review tab, a product that leaves it has left
+             -- the run's scope, and an uncancellable row is queue depth nobody
+             -- can trust. For a manual batch only the unambiguous cases apply.
+             AND (CASE WHEN r.source::text LIKE 'MANUAL%%'
+                       THEN (pr."isDeleted" = true OR pr."isArchived" = true)
+                       ELSE (pr."currentStage" <> 'REVIEW'::"ProductStage"
+                             OR pr."isDeleted" = true
+                             OR pr."isArchived" = true)
+                  END)
           RETURNING q."productId", q."runId"
         ), bumped AS (
           UPDATE "AutoApprovalRun" r

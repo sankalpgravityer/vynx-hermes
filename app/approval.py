@@ -871,8 +871,9 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
 
 
 def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
-                  plan: list[dict[str, Any]]) -> None:
-    """Fill an absent EU size from the product's own sizing chart.
+                  plan: list[dict[str, Any]], pol: dict[str, Any]) -> None:
+    """Fill an absent EU size from the product's own sizing chart, or correct a
+    wrong one against it.
 
     A LOOKUP, not a conversion. `ProductSize.euSizes` is index-aligned with
     `sizes` — VNYX documents the alignment on the column — so this reads the
@@ -894,7 +895,46 @@ def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
         f.rule_id == "DATA.010" and "eu_size" in (f.fields or [])
         for f in findings
     )
-    if not absent or not p.catalog:
+    # A WRONG EU SIZE IS ALSO REPAIRABLE (22 Sep 2026), and until now was not:
+    # this planner ran only for an ABSENT one, so SIZE.002 was detected on every
+    # pass, reported, and never written. KLE-000025 sat at EU 42 against a chart
+    # that pairs its W32 with EU 40, run after run.
+    #
+    # Only on the TENANT CHART's word. SIZE.002 has a second basis — a generic
+    # waist->EU table in policy.yaml, used when no catalog is loaded — and the
+    # rule's own comment calls that "a guess at the tenant's chart". A guess may
+    # report; it may not write.
+    wrong = next(
+        (f for f in findings
+         if f.rule_id == "SIZE.002"
+         and (f.detail or {}).get("basis") == "tenant_chart"
+         and (f.detail or {}).get("expected_eu")),
+        None,
+    )
+    if not (absent or wrong) or not p.catalog:
+        return
+
+    # The planners run twice — `_apply_plan` folds the first pass into the
+    # snapshot and re-plans the residual — so an action already planned for this
+    # field must not be planned again. The absent branch below is self-limiting
+    # (DATA.010 stops firing once the value is there); a correction is not,
+    # because the snapshot still holds the old value until the write lands.
+    if any(a.get("field") == "eu_size" for a in plan):
+        return
+
+    if wrong is not None and not absent:
+        detail = wrong.detail or {}
+        plan.append({
+            "kind": "set_property", "field": "eu_size",
+            "value": str(detail["expected_eu"]),
+            "reason": "SIZE.002",
+            # The chart the RULE used, which is not always the attached one
+            # (sizing.chart_preference). Naming the other would send whoever
+            # reads this log to a table that says something else.
+            "detail": (f"the '{detail.get('chart_used') or p.sizing_guide}' chart "
+                       f"pairs this size with EU {detail['expected_eu']}, "
+                       f"not {detail.get('eu_size')}"),
+        })
         return
 
     # `_apply_plan` has already folded any planned size into the snapshot for
@@ -906,15 +946,20 @@ def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
          and a["kind"] in ("set_property", "set_column")),
         None,
     )
+    # Through the same resolver the rule uses, preference and all: filling an
+    # absent EU size from one chart while SIZE.002 validates it against another
+    # would write a value and report it wrong in the same pass.
+    from app.rules.consistency import eu_from_charts
+
     for candidate in (planned_size, p.size, p.international_size):
         if not candidate:
             continue
-        eu = p.catalog.eu_for_size(p.sizing_guide, candidate)
+        eu, chart = eu_from_charts(p.catalog, p.sizing_guide, [candidate], pol)
         if eu:
             plan.append({
                 "kind": "set_property", "field": "eu_size", "value": eu,
                 "reason": "DATA.010",
-                "detail": (f"the '{p.sizing_guide}' chart pairs "
+                "detail": (f"the '{chart}' chart pairs "
                            f"{candidate!r} with EU {eu}"),
             })
             return
@@ -1437,7 +1482,7 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
         _plan_fields(p, pol, findings, llm, plan)
         # LAST of the field planners: its input is the size, which every planner
         # above may have just changed.
-        _plan_eu_size(p, findings, plan)
+        _plan_eu_size(p, findings, plan, pol)
 
         # SETTLE THE PAIRED FIELDS.
         #

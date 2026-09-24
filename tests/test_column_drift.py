@@ -819,7 +819,7 @@ def eu_snap(**over):
 
 def _eu_plan(p):
     plan: list[dict] = []
-    approval._plan_eu_size(p, approval._all_findings(p, policy()), plan)
+    approval._plan_eu_size(p, approval._all_findings(p, policy()), plan, policy())
     return plan
 
 
@@ -866,6 +866,6 @@ def test_it_pairs_with_the_size_this_run_is_about_to_write():
     p = eu_snap(size="S")
     plan = [{"kind": "set_property", "field": "international_size",
              "value": "L", "reason": "CARE_LABEL"}]
-    approval._plan_eu_size(p, approval._all_findings(p, policy()), plan)
+    approval._plan_eu_size(p, approval._all_findings(p, policy()), plan, policy())
     eu = [a for a in plan if a["field"] == "eu_size"]
     assert eu and eu[0]["value"] == "50", "should pair with the PLANNED L, not the stored S"

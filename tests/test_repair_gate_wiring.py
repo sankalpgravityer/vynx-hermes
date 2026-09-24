@@ -75,7 +75,7 @@ def wired(monkeypatch):
 
     approve_outcome: dict[str, Any] = {"outcome": "would_approve", "problems": []}
 
-    def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet, allow_stage=None):
+    def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet, allow_stage=None, publish=True):
         calls["approve"].append({"apply": apply})
         return dict(approve_outcome)
 

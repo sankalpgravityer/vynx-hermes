@@ -296,6 +296,37 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
     return out
 
 
+def eu_from_charts(catalog: Any, guide: str | None, candidates: list[Any],
+                   pol: dict[str, Any]) -> tuple[str | None, str | None]:
+    """The EU size, and the NAME of the chart that supplied it.
+
+    Consults `sizing.chart_preference[guide]` before the attached guide, so a
+    tenant with two charts for the same garment can say which one answers — see
+    the policy entry for why Klekt needs it and what it costs. With no entry
+    the attached guide is the only chart tried, which is the behaviour every
+    other tenant has always had.
+
+    Returns the chart's NAME as well as the value because the finding quotes it:
+    "does not match the 'Men Bottoms' chart" would be a lie when the expectation
+    came from 'Men Bottoms (auto)', and the next person to check it by hand
+    would find the chart says something else.
+    """
+    if not catalog or not guide:
+        return None, guide
+    prefer = ((pol.get("sizing") or {}).get("chart_preference") or {}).get(guide) or []
+    seen: set[str] = set()
+    for chart in [*prefer, guide]:
+        for candidate in candidates:
+            key = str(candidate).strip().lower() if candidate else ""
+            if not key or (chart, key) in seen:
+                continue
+            seen.add((chart, key))
+            eu = catalog.eu_for_size(chart, candidate)
+            if eu:
+                return eu, chart
+    return None, guide
+
+
 def check_sizing(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
     out: list[Finding] = []
     sz = pol["sizing"]
@@ -330,13 +361,26 @@ def check_sizing(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
     # says 40 and 48. Validating a correct women's product against the policy
     # table fires SIZE.002 every time, off by up to 8 EU sizes.
     guide_expected = None
+    guide_used = p.sizing_guide
     if p.catalog:
-        # Try the raw size first, then the waist restated as "W32" — stored
-        # attributes use both spellings for the same value.
-        for candidate in (p.size, p.waist, f"W{waist}" if waist else None):
-            guide_expected = p.catalog.eu_for_size(p.sizing_guide, candidate)
-            if guide_expected:
-                break
+        # THE SAME SIZE IS SPELLED SEVERAL WAYS, and the chart holds exactly one
+        # of them. This tenant's Men Bottoms chart is keyed W21-W40, while
+        # KLE-000025 stores its size as a bare "32" and its `waist` as the fit
+        # word "Mid" — so the three candidates this used to try were '32'
+        # (no match), 'Mid' (no match) and f"W{waist}" (unbuildable, because
+        # `waist` is not a number). The lookup returned None, the policy-table
+        # fallback below needs a numeric waist and got none, and a bottom with
+        # EU 42 against a chart that pairs W32 with EU 40 was reported clean.
+        #
+        # So the NUMBER is restated in both spellings wherever it is found, and
+        # the international size joins the list: on a bottom it holds the waist
+        # ("W28", "32") as often as `size` does.
+        candidates: list[Any] = [p.size, p.waist, p.international_size]
+        for n in (size, waist, intl):
+            if n is not None:
+                candidates += [f"W{n}", str(n)]
+        guide_expected, guide_used = eu_from_charts(
+            p.catalog, p.sizing_guide, candidates, pol)
 
     if guide_expected is not None and eu is not None:
         expected_int = _int(guide_expected)
@@ -344,10 +388,14 @@ def check_sizing(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
             out.append(Finding(
                 rule_id="SIZE.002", severity=Severity.HIGH,
                 fields=["eu_size", "size"],
-                message=f"EU size {eu} does not match the '{p.sizing_guide}' chart, "
-                        f"which pairs this size with EU {expected_int}.",
+                message=(f"EU size {eu} does not match the '{guide_used}' chart, "
+                         f"which pairs this size with EU {expected_int}."
+                         + ("" if guide_used == p.sizing_guide else
+                            f" (preferred over the attached '{p.sizing_guide}' "
+                            f"by sizing.chart_preference)")),
                 detail={"eu_size": eu, "expected_eu": expected_int,
-                        "sizing_guide": p.sizing_guide, "basis": "tenant_chart"},
+                        "sizing_guide": p.sizing_guide,
+                        "chart_used": guide_used, "basis": "tenant_chart"},
             ))
     # Fallback: no catalog (raw webhook payload / fixture). The generic waist→EU
     # table is a guess at the tenant's chart, so it is used only when there is

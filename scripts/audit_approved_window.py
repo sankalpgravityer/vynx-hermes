@@ -8,6 +8,17 @@ Database only — nothing is written, no Shopify call, no model call.
     python scripts/audit_approved_window.py --db "..." --product <uuid> --judge-images
     python scripts/audit_approved_window.py --db "..." --product <uuid> --rejudge
     python scripts/audit_approved_window.py --db "..." --product <uuid>,<uuid>
+    python scripts/audit_approved_window.py --db "..." --stage APPROVED --tenant Klekt \
+        --judge-images --pictures-failed-only
+
+THE APPROVED TAB, NOW. `--stage APPROVED` takes every product sitting in that
+stage today rather than everything that entered it between two dates — the tab
+as the screen shows it, whatever the product was approved. `--pictures-failed-only`
+then keeps only the products that did **not** pass the image gate or the photo
+audit, so the sheet is the repair list rather than the census; a product whose
+pictures could not be judged is kept too, under its own code, because "the call
+did not run" must never read as "passed". `--pictures-passed-only` is the other
+half — the two add up to the tab, and either sheet names how many the other holds.
 
 ONE PRODUCT, OR A FEW. `--product` examines the named products whatever stage
 they are in — a product still in Review is checked for everything the window
@@ -88,6 +99,11 @@ _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 AI_VIEWS = ("AI_FRONT", "AI_BACK", "AI_FRONT_34", "AI_BACK_34", "AI_CLOSEUP")
 GARMENT_VIEWS = ("FRONT", "BACK")
 RANK = {"high": 0, "medium": 1, "low": 2}
+# `ProductStage` in the Prisma schema. Whitelisted rather than passed through:
+# the stage reaches SQL as a value, and a typo should say so rather than return
+# an empty tab.
+STAGES = ("LABEL", "DECISION", "PHOTOBOOTH", "MISSING_LABEL", "REVIEW", "APPROVED",
+          "REJECTED", "DELETED", "ARCHIVED", "IMPORTED")
 
 # --------------------------------------------------------------------------- #
 # SQL
@@ -139,6 +155,29 @@ SELECT p.id::text, m."enteredAt", m."performedById"::text, m."fromStage"::text,
          LIMIT 1) m ON true
  WHERE p.id = ANY(%(ids)s::uuid[])
    AND p."isDeleted" = false
+ ORDER BY p.sku
+"""
+
+# `--stage`: the tab as it stands today. Not a window — a product approved in
+# March is in the Approved tab this morning exactly as one approved last night
+# is, and the question "what is in there that would not pass today" is asked of
+# both. The most recent move to APPROVED still rides along where there was one,
+# so "approved by whom" is answered for the rows that have an answer.
+STAGE_SQL = """
+SELECT p.id::text, m."enteredAt", m."performedById"::text, m."fromStage"::text,
+       p."currentStage"::text, p."shopifyProductId", p."verificationStatus"::text,
+       p."verificationOutcome", t.name
+  FROM "Product" p
+  JOIN "Tenant" t ON t.id = p."tenantId"
+  LEFT JOIN LATERAL (
+        SELECT x."enteredAt", x."performedById", x."fromStage"
+          FROM "ProductStageMovement" x
+         WHERE x."productId" = p.id AND x."toStage" = 'APPROVED'
+         ORDER BY x."enteredAt" DESC
+         LIMIT 1) m ON true
+ WHERE p."isDeleted" = false
+   AND p."currentStage"::text = %(stage)s
+   AND (%(tenant)s::text IS NULL OR t.name ILIKE %(tenant)s)
  ORDER BY p.sku
 """
 
@@ -377,6 +416,28 @@ def worst(issues: list[dict[str, str]]) -> str:
     return min((i["severity"] for i in issues), key=lambda s: RANK[s], default="none")
 
 
+# The codes that mean "this product did not pass the pictures". Deliberately not
+# every picture-ish finding: RENDERS_INCOMPLETE and UNMATTED_VIEW say a picture
+# is *missing*, which no judgement refused, and PHOTO_AUDIT_SOFT_FLAGS is a pass
+# with a note. NO_GATE_RECORD / NO_PHOTO_AUDIT are absences too — with
+# `--judge-images` they become a real verdict, and without it they would flood a
+# "what failed" sheet with products nobody ever checked.
+PICTURE_FAILURE_CODES = frozenset({
+    "GATE_REFUSED", "GATE_REFUSED_BUT_APPROVED", "GATE_WOULD_REFUSE",
+    "PHOTO_AUDIT_HELD", "PHOTO_AUDIT_HELD_BUT_APPROVED", "PHOTO_AUDIT_WOULD_HOLD",
+    "RENDER_DEFECT", "CUTOUT_DEFECT",
+    # Not a failure — an unchecked product. Kept so that a run where the vision
+    # provider was down comes back as a sheet full of UNCHECKED rows rather than
+    # as an empty one, which would read as "everything passed".
+    "PICTURES_COULD_NOT_BE_JUDGED",
+})
+
+
+def failed_pictures(issues: list[dict[str, str]]) -> list[str]:
+    """The codes on which this product did not pass the gate or the photo audit."""
+    return sorted({i["code"] for i in issues if i["code"] in PICTURE_FAILURE_CODES})
+
+
 # --------------------------------------------------------------------------- #
 # Gathering
 # --------------------------------------------------------------------------- #
@@ -426,7 +487,12 @@ def judge_now(record: dict[str, Any], media: list[dict[str, Any]], agent: dict[s
         out["photos"] = photo_audit.judge(
             media, grade_severity=record.get("gradeSeverity"),
             grade_label=record.get("gradeLabel") or record.get("grade"), pol=pol,
-            product_gender=root_gender).as_dict()
+            product_gender=root_gender,
+            # Framing is judged per view, and which views must show the whole
+            # figure depends on what the garment is — a bottom needs its hem in
+            # frame, footwear and accessories are exempt. Omitting these is the
+            # same silent under-reading as omitting `size` was (see above).
+            category=record.get("category"), subcategory=record.get("subCategory")).as_dict()
     return out
 
 
@@ -465,9 +531,10 @@ def verdict_line(v: dict[str, Any] | None) -> str:
 def gather(dsn: str, start: datetime | None, end: datetime | None, tenant: str | None,
            limit: int | None, quiet: bool = False,
            judge_images: bool = False, workers: int = 1,
-           product_ids: list[str] | None = None, rejudge: bool = False) -> list[dict[str, Any]]:
-    """Every approved product in the window — or the named products, whatever
-    their stage — with everything assess() needs.
+           product_ids: list[str] | None = None, rejudge: bool = False,
+           stage: str | None = None) -> list[dict[str, Any]]:
+    """Every approved product in the window — the named products, whatever their
+    stage — or everything sitting in `stage` today, with everything assess() needs.
 
     `workers` parallelises only the `--judge-images` vision calls, per batch:
     they are network-bound (image download plus one model call each, 10–30 s),
@@ -490,6 +557,13 @@ def gather(dsn: str, start: datetime | None, end: datetime | None, tenant: str |
             if not quiet:
                 print(f"{len(approved)} of {len(product_ids)} product(s) found"
                       + (f" — not found or deleted: {', '.join(sorted(missing))}" if missing else ""))
+        elif stage:
+            approved = _fetch_dicts(cur, STAGE_SQL, {"stage": stage, "tenant": tenant}, columns)
+            if limit:
+                approved = approved[:limit]
+            if not quiet:
+                print(f"{len(approved)} product(s) in {stage} right now"
+                      + (f" for {tenant}" if tenant else ""))
         else:
             assert start is not None and end is not None
             approved = _fetch_dicts(cur, APPROVED_SQL,
@@ -639,7 +713,9 @@ METHOD_DB_ONLY = "database only — no Shopify call, no model call, nothing writ
 
 
 def write_workbook(rows: list[dict[str, Any]], out: Path, *, dsn: str, start: datetime | None,
-                   end: datetime | None, tenant: str | None, method: str = METHOD_DB_ONLY) -> Path:
+                   end: datetime | None, tenant: str | None, method: str = METHOD_DB_ONLY,
+                   scope: str | None = None, dropped: int = 0,
+                   dropped_label: str = "Passed the pictures — not listed here") -> Path:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -663,11 +739,21 @@ def write_workbook(rows: list[dict[str, Any]], out: Path, *, dsn: str, start: da
     affected = Counter(i["code"] for r in rows for i in {x["code"]: x for x in r["issues"]}.values())
     ws.cell(row=1, column=1, value="Approved products re-examined against the new checks").font = Font(bold=True, size=14)
     meta = [
-        ("Window", (f"{start:%Y-%m-%d} to {(end - timedelta(days=1)):%Y-%m-%d} (inclusive, by the time the product entered APPROVED)"
-                    if start and end else f"{len(rows)} product(s) named on the command line, any stage")),
+        ("Scope" if scope else "Window",
+         scope or (f"{start:%Y-%m-%d} to {(end - timedelta(days=1)):%Y-%m-%d} (inclusive, by the time the product entered APPROVED)"
+                   if start and end else f"{len(rows)} product(s) named on the command line, any stage")),
         ("Tenant", tenant or "all"),
         ("Database", _redact(dsn)),
         ("Products", len(rows)),
+    ]
+    if dropped:
+        # The census this sheet was cut from, said plainly: a reader who sees
+        # 40 rows must be able to tell 40-of-40 from 40-of-600.
+        meta += [
+            ("Examined", len(rows) + dropped),
+            (dropped_label or "Not listed here", dropped),
+        ]
+    meta += [
         ("With at least one issue", sum(1 for r in rows if r["issues"])),
         ("Worst = high", sum(1 for r in rows if r["worst"] == "high")),
         ("Worst = medium", sum(1 for r in rows if r["worst"] == "medium")),
@@ -813,6 +899,20 @@ def main(argv: list[str] | None = None) -> int:
                     help=("examine these products instead of a window, whatever stage they "
                           "are in. The approval-only checks are asked only of products that "
                           "were approved; everything else is checked regardless."))
+    ap.add_argument("--stage", metavar="STAGE",
+                    help=("examine every product sitting in this stage right now (APPROVED = the "
+                          "Approved tab as the screen shows it), instead of a date window. "
+                          "Combine with --tenant."))
+    ap.add_argument("--pictures-failed-only", action="store_true",
+                    help=("keep only the products that did not pass the image gate or the photo "
+                          "audit (refused, held, a defective render or cut-out) — plus any whose "
+                          "pictures could not be judged. Everything else is examined and dropped; "
+                          "the Summary says how many."))
+    ap.add_argument("--pictures-passed-only", action="store_true",
+                    help=("the other half of the same tab: keep only the products the image gate "
+                          "and the photo audit both passed. Their other findings — rules, soft "
+                          "flags, a missing care label — still ride in the sheet; this filter is "
+                          "about the pictures alone."))
     ap.add_argument("--tenant", help="one tenant by name (case-insensitive); default every tenant")
     ap.add_argument("--limit", type=int, help="examine only the first N products (oldest first)")
     ap.add_argument("--out", help="xlsx path. Default reports/generated/approved-<from>-<to>.xlsx")
@@ -838,6 +938,12 @@ def main(argv: list[str] | None = None) -> int:
     if not dsn:
         sys.exit("No --db, and no DATABASE_URL.")
     product_ids = [s.strip() for s in (args.products or "").split(",") if s.strip()]
+    stage = (args.stage or "").upper().strip() or None
+    if stage and stage not in STAGES:
+        sys.exit(f"--stage takes one of: {', '.join(STAGES)}")
+    if args.pictures_failed_only and args.pictures_passed_only:
+        sys.exit("--pictures-failed-only and --pictures-passed-only are the two halves of the "
+                 "same tab; pass one, or neither for the whole of it.")
     if product_ids:
         bad = [p for p in product_ids if not _UUID_RE.match(p)]
         if bad:
@@ -845,11 +951,21 @@ def main(argv: list[str] | None = None) -> int:
         start = end = None
         if (args.start or args.end) and not args.quiet:
             print("--product given: --from/--to ignored, examining the named product(s) whatever the date")
+    elif stage:
+        start = end = None
+        # A stage run is bounded by the tab, not by a day count, so --rejudge is
+        # allowed here — but only for one tenant at a time. Re-judging every
+        # approved product of every tenant is a day of vision calls nobody asked
+        # for, which is the spend the --product guard exists to prevent.
+        if args.rejudge and not args.tenant:
+            sys.exit("--rejudge with --stage re-judges a whole tab; name one --tenant.")
+        if (args.start or args.end) and not args.quiet:
+            print(f"--stage given: --from/--to ignored, examining everything in {stage} today")
     else:
         if args.rejudge:
-            sys.exit("--rejudge re-judges named products only; pass --product <uuid[,uuid]>.")
+            sys.exit("--rejudge re-judges named products only; pass --product <uuid[,uuid]> or --stage.")
         if not (args.start and args.end):
-            sys.exit("Pass --from and --to (YYYY-MM-DD), or --product <uuid[,uuid]>.")
+            sys.exit("Pass --from and --to (YYYY-MM-DD), --product <uuid[,uuid]>, or --stage APPROVED.")
         start, end = _day(args.start), _day(args.end) + timedelta(days=1)
         if end <= start:
             sys.exit("--to must not be before --from.")
@@ -857,12 +973,34 @@ def main(argv: list[str] | None = None) -> int:
 
     rows = gather(dsn, start, end, args.tenant, args.limit, quiet=args.quiet,
                   judge_images=judge_images, workers=max(1, args.workers),
-                  product_ids=product_ids or None, rejudge=args.rejudge)
+                  product_ids=product_ids or None, rejudge=args.rejudge, stage=stage)
+
+    # The filter runs after the examination, never before it: every product in
+    # the tab is judged, and only the reporting is narrowed. The two halves add
+    # up to the tab, so either sheet can be read against the other.
+    dropped, dropped_label = 0, ""
+    if args.pictures_failed_only or args.pictures_passed_only:
+        failed = args.pictures_failed_only
+        kept = [r for r in rows if bool(failed_pictures(r["issues"])) is failed]
+        dropped = len(rows) - len(kept)
+        rows = kept
+        dropped_label = ("Passed the pictures — not listed here" if failed
+                         else "Did not pass the pictures — not listed here")
+        if not args.quiet:
+            print(f"{len(rows)} product(s) {'did not pass' if failed else 'passed'} the pictures; "
+                  f"{dropped} {'passed' if failed else 'did not'} and are not listed")
+
     if args.out:
         out = Path(args.out)
     elif product_ids:
         stem = rows[0]["sku"] if len(rows) == 1 and rows[0].get("sku") else f"{len(product_ids)}-products"
         out = product_audit.REPORT_DIR / f"product-{stem}.xlsx"
+    elif stage:
+        out = product_audit.REPORT_DIR / (
+            f"{stage.lower()}-now" + (f"-{args.tenant}" if args.tenant else "")
+            + ("-picture-failures" if args.pictures_failed_only else "")
+            + ("-picture-passes" if args.pictures_passed_only else "")
+            + f"-{date.today():%Y-%m-%d}.xlsx")
     else:
         out = product_audit.REPORT_DIR / (
             f"approved-{args.start}-{args.end}" + (f"-{args.tenant}" if args.tenant else "") + ".xlsx")
@@ -872,7 +1010,15 @@ def main(argv: list[str] | None = None) -> int:
         method = "database, plus the image gate and the photo audit run now where the agent never judged (--judge-images)"
     else:
         method = METHOD_DB_ONLY
-    write_workbook(rows, out, dsn=dsn, start=start, end=end, tenant=args.tenant, method=method)
+    scope = None
+    if stage:
+        scope = f"every product in {stage} on {date.today():%Y-%m-%d}"
+        if args.pictures_failed_only:
+            scope += " that did not pass the image gate or the photo audit"
+        elif args.pictures_passed_only:
+            scope += " that passed the image gate and the photo audit"
+    write_workbook(rows, out, dsn=dsn, start=start, end=end, tenant=args.tenant, method=method,
+                   scope=scope, dropped=dropped, dropped_label=dropped_label)
 
     # A handful of products is read on the terminal, not in a spreadsheet.
     if product_ids and len(rows) <= 5:

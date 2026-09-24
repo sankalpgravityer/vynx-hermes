@@ -17,7 +17,7 @@ from fastapi import (
 )
 from pydantic import BaseModel, Field
 
-from app.config import policy, reload_policy, settings
+from app.config import policy, policy_overlay, reload_policy, settings
 from app.imaging import background, legibility, nanobanana, openai_image
 from app.models import (
     BackgroundCheck, BackgroundVerdict, Finding, ImageryGenerateResponse,
@@ -606,6 +606,13 @@ class ApprovalGateRequest(BaseModel):
     # and the gate derives the gender from the master category, which is the same
     # answer analyze.worker's inline narrowing reaches.
     split_on_both_genders: bool = False
+    # THE TENANT'S BRAIN (vnyx-api services/auto-approval/checks.ts), so the
+    # reconcile step plans against the same rule set the agent judges with. A
+    # check switched off arrives as `RULE: off` here and neither blocks nor
+    # plans its repair. Both default to nothing: a caller that sends neither
+    # gets policy.yaml, exactly as before.
+    severity_overrides: dict[str, str] | None = None
+    policy_overlay: dict[str, Any] | None = None
 
 
 @app.post("/v1/approval-gate")
@@ -623,13 +630,15 @@ def approval_gate(req: ApprovalGateRequest) -> dict[str, Any]:
     raw = {**req.product, "media": req.media or req.product.get("media") or []}
     tenant_id = str(raw.get("tenantId") or raw.get("tenant_id") or "")
 
-    return approval.run_gate(
-        raw,
-        catalog=req.catalog.get(tenant_id) or req.catalog or None,
-        imagery_settings=req.settings,
-        llm=make_llm() if req.use_llm else None,
-        split_on_both_genders=req.split_on_both_genders,
-    )
+    with policy_overlay(req.policy_overlay):
+        return approval.run_gate(
+            raw,
+            catalog=req.catalog.get(tenant_id) or req.catalog or None,
+            imagery_settings=req.settings,
+            llm=make_llm() if req.use_llm else None,
+            split_on_both_genders=req.split_on_both_genders,
+            severity_overrides=req.severity_overrides,
+        )
 
 
 # --------------------------------------------------------------------------- #

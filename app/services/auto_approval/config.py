@@ -7,7 +7,7 @@ stale. That split is what makes a mid-run Brain edit harmless without a lock.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.services.auto_approval import db
@@ -28,6 +28,18 @@ class RunSettings:
     lease_seconds: int
     rule_groups: list[str]
     severity_overrides: dict[str, str]
+    # THE BRAIN CHECKS, compiled by vnyx-api (services/auto-approval/checks.ts)
+    # and frozen in the snapshot. `policy_overlay` is applied around repair()
+    # through app.config.policy_overlay; the rest are repair() flags. Every
+    # default is what the worker did before the checks existed, so a snapshot
+    # with no `compiled` block (an older API, or a run started before the
+    # deploy) runs exactly as it always did.
+    policy_overlay: dict[str, Any] = field(default_factory=dict)
+    matte: bool = True
+    gate: bool = True
+    price_mode: str = "full"          # full | window_only | rounding_only | off
+    publish_on_approve: bool = True
+    sync_changes: bool = False
 
     @property
     def apply(self) -> bool:
@@ -74,6 +86,13 @@ def settings_from_snapshot(snapshot: Any, fallback_max_attempts: int = 3) -> Run
     snap = _as_dict(snapshot)
     brain = _as_dict(snap.get("brain"))
     execution = _as_dict(snap.get("execution"))
+    compiled = _as_dict(brain.get("compiled"))
+    chain = _as_dict(compiled.get("chain"))
+    price_mode = str(chain.get("priceMode") or "full")
+    if price_mode not in _PRICE_MODES:
+        # A mode this worker does not know is a newer API talking to an older
+        # worker. The full step is what ran before the modes existed.
+        price_mode = "full"
 
     return RunSettings(
         mode=str(snap.get("mode") or "SHADOW"),
@@ -88,7 +107,16 @@ def settings_from_snapshot(snapshot: Any, fallback_max_attempts: int = 3) -> Run
         lease_seconds=int(execution.get("leaseSeconds") or 1800),
         rule_groups=list(brain.get("ruleGroups") or []),
         severity_overrides=_as_dict(brain.get("severityOverrides")),
+        policy_overlay=_as_dict(compiled.get("policy")),
+        matte=bool(chain.get("matte", True)),
+        gate=bool(chain.get("gate", True)),
+        price_mode=price_mode,
+        publish_on_approve=bool(chain.get("publishOnApprove", True)),
+        sync_changes=bool(chain.get("syncChanges", False)),
     )
+
+
+_PRICE_MODES = frozenset({"full", "window_only", "rounding_only", "off"})
 
 
 def enabled_configs() -> list[dict[str, Any]]:

@@ -1077,7 +1077,7 @@ def wired(monkeypatch):
 
     approve_outcome: dict[str, Any] = {"outcome": "would_approve", "problems": []}
 
-    def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet, allow_stage=None):
+    def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet, allow_stage=None, publish=True):
         calls["approve"].append({"apply": apply})
         return dict(approve_outcome)
 
@@ -1115,10 +1115,10 @@ def wired(monkeypatch):
     return {"calls": calls, "states": states, "verdicts": verdicts, "approve": approve_outcome}
 
 
-def _repair(apply: bool = False, approve: bool = False) -> dict[str, Any]:
+def _repair(apply: bool = False, approve: bool = False, **kw: Any) -> dict[str, Any]:
     return rp.repair(DSN, PID, apply=apply, vnyx_api=Path("."), infer=False,
                      min_confidence=70, skip_render=True, approve=approve,
-                     skip_bin=True, quiet=True, silent=True)
+                     skip_bin=True, quiet=True, silent=True, **kw)
 
 
 def matte_step(r: dict[str, Any]) -> dict[str, Any]:
@@ -1168,6 +1168,63 @@ def test_an_old_server_still_gets_the_whole_product(wired, monkeypatch):
     _repair(apply=True)
     args = wired["calls"]["matte_args"][0]
     assert "--replace" in args and "--keep-better" in args and "--views" not in args
+
+
+def test_no_matte_asks_the_segmenter_for_nothing(wired):
+    """--no-matte. THE SEGMENTER IS NOT CALLED, which is the point: MID-000775
+    was re-cut on 19 Sep with the mannequin's waist and the whole podium left
+    in, and `--keep-better` cannot stop that — it refuses a candidate with LESS
+    garment, and a podium is more."""
+    wired["verdicts"][:] = [BAD, OK]          # a cut-out the chain would re-cut
+    r = _repair(apply=True, skip_matte=True)
+    assert wired["calls"]["matte_args"] == [], "no segmenter call at all"
+    assert matte_step(r)["ran"] is False
+    assert matte_step(r)["why"] == "--no-matte"
+
+
+def test_no_matte_covers_the_re_cut_too(wired):
+    """Skipping only the matte step would leave `rematte` calling the same
+    segmenter, and the flag would not mean what it says."""
+    wired["verdicts"][:] = [BAD, OK]
+    r = _repair(apply=True, skip_matte=True)
+    rem = next(s for s in r["steps"] if s["step"] == "rematte")
+    assert rem["ran"] is False and rem["why"] == "--no-matte"
+    assert wired["calls"]["matte_args"] == []
+
+
+def test_no_gate_skips_the_look_at_the_render(wired):
+    """--no-gate. Cheap in itself (6s, 2.3% measured) — what it saves is the
+    re-render it asks for (156s, 24.8%)."""
+    r = _repair(apply=True, skip_gate=True)
+    g = next(s for s in r["steps"] if s["step"] == "gate")
+    assert g["ran"] is False and g["why"] == "--no-gate"
+    assert wired["calls"]["judge"] >= 0        # the CUT-OUT judge still runs
+
+
+def test_the_flags_are_independent(wired):
+    """Each turns off its own step and nothing else — a run with one of them is
+    not quietly a run with both."""
+    def why(result, name):
+        # `why` is only present on a SKIPPED step; a step that ran has none.
+        return next(s for s in result["steps"] if s["step"] == name).get("why")
+
+    wired["verdicts"][:] = [OK, OK]
+    only_gate = _repair(apply=True, skip_gate=True)
+    assert why(only_gate, "gate") == "--no-gate"
+    assert why(only_gate, "matte") != "--no-matte"
+
+    only_matte = _repair(apply=True, skip_matte=True)
+    assert why(only_matte, "matte") == "--no-matte"
+    assert why(only_matte, "gate") != "--no-gate"
+
+
+def test_both_flags_default_off(wired):
+    """The flags are opt-in: an ordinary run is unchanged."""
+    wired["verdicts"][:] = [OK, OK]
+    r = _repair(apply=True)
+    for name in ("gate", "matte"):
+        why = next(s for s in r["steps"] if s["step"] == name).get("why")
+        assert why not in ("--no-gate", "--no-matte"), name
 
 
 def test_a_server_without_keep_better_is_refused(wired, monkeypatch):
