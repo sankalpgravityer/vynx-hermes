@@ -381,6 +381,15 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
         options["infer"] = True
     if "--skip-bin" in args:
         options["skipBin"] = True
+    # THE BRAIN'S SHOPIFY AND PRICE SWITCHES. approve_check refuses to send
+    # --no-publish to a server that cannot take it (see there); the price
+    # modes follow remote_supports the same way.
+    if "--no-publish" in args:
+        options["noPublish"] = True
+    if "--rounding-only" in args:
+        options["roundingOnly"] = True
+    if "--skip-rounding" in args:
+        options["skipRounding"] = True
     if "--authorize" in args:
         options["authorize"] = True
     if "--provider" in args:
@@ -933,10 +942,26 @@ def run_fixtures(paths: list[Path], *, out: str | None = None) -> int:
     return 1 if failed else 0
 
 
+def shopify_product_id(dsn: str, product_id: str) -> str | None:
+    """The product's Shopify id, or None when it has never been published.
+
+    Read fresh, READ ONLY, at the moment the sync decision is made — the only
+    question it answers is "would a re-push update a listing or CREATE one",
+    and a stale answer is the one that publishes a product nobody approved.
+    """
+    with product_audit.connect(dsn, read_only=True) as conn:
+        row = conn.execute(
+            'SELECT "shopifyProductId" FROM "Product" WHERE id = %s::uuid',
+            (product_id,),
+        ).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
 def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
                   apply: bool, skip_bin: bool,
                   quiet: bool,
-                  allow_stage: list[str] | None = None) -> dict[str, Any]:
+                  allow_stage: list[str] | None = None,
+                  publish: bool = True) -> dict[str, Any]:
     """Run approve-products.ts and read back its structured verdict.
 
     Shelled out rather than reimplemented for the reason in the module
@@ -949,8 +974,17 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
     answer costs nothing and is safe to run on every product.
     """
     args = ["--db", dsn, "--product", product_id]
+    if apply and not publish and not remote_supports("noPublish"):
+        # THE TENANT SAID NOT TO PUBLISH, and this vnyx-api cannot approve
+        # without publishing. Withholding the move is the only safe reading:
+        # an approval with no undo on a storefront the tenant asked to keep
+        # out of is worse than a ready product left in Review. The pre-flight
+        # still runs, so the product reads `would_approve`.
+        apply = False
     if apply:
         args.append("--apply")
+    if not publish:
+        args.append("--no-publish")
     if skip_bin:
         args.append("--skip-bin")
     if allow_stage:
@@ -975,10 +1009,31 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
 def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            infer: bool, min_confidence: int, skip_render: bool,
            approve: bool, skip_bin: bool,
+           skip_gate: bool = False, skip_matte: bool = False,
+           # PRICE, .99 ONLY. The grade window is not consulted: a price outside
+           # it stays where it is and only its cents move. The operator asked for
+           # this for a backlog whose windows are not the question — see
+           # fix-selling-price.ts --rounding-only.
+           price_rounding_only: bool = False,
            quiet: bool, progress: str = "",
            severity_overrides: dict[str, str] | None = None,
            allow_stage: list[str] | None = None,
            silent: bool = False,
+           # THE BRAIN'S CHAIN SWITCHES (vnyx-api services/auto-approval/
+           # checks.ts, frozen in the run's snapshot). Every default is the
+           # chain as it ran before they existed.
+           #
+           #   price_mode    full | window_only | rounding_only | off — the
+           #                 grade-window clamp and the .99 ending, separately.
+           #                 None derives it from price_rounding_only, which
+           #                 is still what the CLI flag sets.
+           #   publish       False approves WITHOUT the Shopify push
+           #                 (approve-products.ts --no-publish).
+           #   sync_changes  re-push a product that is ALREADY on Shopify
+           #                 after a run that changed it. Never creates one.
+           price_mode: str | None = None,
+           publish: bool = True,
+           sync_changes: bool = False,
            ) -> dict[str, Any]:
     # SILENT SHADOWS THE BUILTIN, deliberately and only inside this function.
     #
@@ -994,6 +1049,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     started = time.perf_counter()
     state = needs(dsn, product_id)
+    # The sync step's "did this run write anything" baseline.
+    started_updated_at = state["loaded"]["record"].get("updatedAt")
     steps: list[dict[str, Any]] = []
 
     # Steps whose VISION READ failed at the provider — an API error, a timeout,
@@ -1332,7 +1389,25 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     cutouts_on = _cutouts_mod.enabled(policy())
     matte_why = ""
-    if state["unmatted"]:
+    if skip_matte:
+        # --no-matte. THE SEGMENTER IS NOT ASKED AT ALL, and that is a decision
+        # about what this chain may write, not only about its speed.
+        #
+        # MID-000775 is the case for it: on 19 Sep 2026 this step replaced a
+        # sound cut-out with one that kept the mannequin's waist AND the whole
+        # podium. `--keep-better` could not stop it — that guard refuses a
+        # candidate with LESS garment, and a podium is MORE. cloth-seg is a
+        # clothing parser and the podium sits directly beneath the clothing, so
+        # it is kept by construction; with the paid strategies off (see
+        # `imagery.cutout.strategies`) nothing in the chain can take it out.
+        #
+        # Costs matte (45s a product, 16.2%) and rematte (168s, 10.0%).
+        # Leaves IMG.010 unrepairable: a photograph with no cut-out keeps its
+        # background and goes on blocking, which is the honest trade — a
+        # background left in is visible, a mannequin welded into the catalogue
+        # is worse and irreversible.
+        matte_why = "--no-matte"
+    elif state["unmatted"]:
         matte_why = ""
     elif cutouts_on and state.get("cutout_views"):
         # Every view has a cut-out; whether each is RIGHT is the step's job now.
@@ -1621,9 +1696,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # is a no-op when the price is already inside the window, it costs no model
     # call, and having it decide is what keeps Hermes from holding a second
     # opinion about what a correct price is.
+    mode = price_mode or ("rounding_only" if price_rounding_only else "full")
+    mode_flag = {"rounding_only": ["--rounding-only"],
+                 "window_only": ["--skip-rounding"]}.get(mode, [])
+
     def _price() -> str:
         ok, _, payload = run_step(vnyx_api, "fix-selling-price.ts",
-                                  [*common, *(["--apply"] if apply else [])],
+                                  [*common, *(["--apply"] if apply else []), *mode_flag],
                                   timeout_s=120, quiet=quiet,
                                   results_name="price.json")
         if not ok:
@@ -1631,11 +1710,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
         rows = (payload or {}).get("results") or []
         row = rows[0] if rows else None
+        settled = ("price already ends .99" if mode == "rounding_only"
+                   else "price already inside the window")
         if not row:
-            return "price already inside the window"
+            return settled
         before, after = row.get("before"), row.get("after")
         if after is None or before == after:
-            return "price already inside the window"
+            return settled
         verb = "would set" if not apply else "set"
         return f'{verb} {before} {ARROW} {after} ({row.get("reason") or "clamped"})'
 
@@ -1647,6 +1728,15 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                  "not written" if is_consignment(
                      str(state["loaded"]["record"].get("tenantId") or ""), policy())
                  else "")
+    if not price_why and mode == "off":
+        price_why = "the Brain has both the grade window and the .99 rounding off"
+    elif not price_why and mode_flag and not remote_supports(
+            "roundingOnly" if mode == "rounding_only" else "skipRounding"):
+        # Sending a mode this vnyx-api cannot take is a 400 mid-chain; running
+        # the full step instead would write the change the tenant switched off.
+        price_why = (f"this vnyx-api cannot run the price step in {mode} mode — "
+                     f"left unchanged rather than applying the part the Brain "
+                     f"switched off")
     step("price", price_why, _price)
 
     # ---- 4. render --------------------------------------------------------
@@ -1770,8 +1860,25 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             raise StepFailed("vision unavailable — " + "; ".join(gate_verdict.reasons))
         return gate_verdict.summary()
 
-    gate_why = ("" if (policy().get("quality_gate") or {}).get("enabled", True)
-                else "disabled in policy (quality_gate.enabled)")
+    # --no-gate IS A TIME SETTING, AND ITS COST IS NOT THE SIX SECONDS IT TAKES.
+    #
+    # Measured over 18 products: the gate itself is 6s a product, 2.3% of the
+    # wall clock. What it is worth skipping for is what it ASKS FOR — a refusal
+    # re-renders, and `regen` is 156s a product and 24.8% of the run, the single
+    # largest line. Eight of those eighteen regenerated.
+    #
+    # WHAT IS LOST, said plainly, because it is the whole check on the picture a
+    # shopper sees: no MODEL_GENDER_MISMATCH, no BODY_SIZE_MISMATCH, no
+    # CATEGORY_IMAGE_MISMATCH, no cropped model, no empty frame. `_approve`
+    # reads `gate_verdict`; with none it has nothing to enforce, so a product
+    # whose render shows the wrong model will pass the picture half of the
+    # pre-flight. Everything that reads COLUMNS is unaffected.
+    if skip_gate:
+        gate_why = "--no-gate"
+    elif not (policy().get("quality_gate") or {}).get("enabled", True):
+        gate_why = "disabled in policy (quality_gate.enabled)"
+    else:
+        gate_why = ""
     step("gate", gate_why, _gate)
 
     # ---- 4c. photos -------------------------------------------------------
@@ -1807,6 +1914,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             grade_label=record.get("gradeLabel") or record.get("grade"),
             pol=policy(),
             product_gender=readiness.root_gender(record.get("masterCategory"), policy()),
+            category=record.get("category"), subcategory=record.get("subCategory"),
         )
 
     def _photos() -> str:
@@ -1970,7 +2078,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     from app.imaging import photo_audit as _pa
 
-    if photo_verdict is None or not _pa.rematte_views(photo_verdict, policy()):
+    if skip_matte:
+        # --no-matte means the segmenter is not asked, and this is the other
+        # place that asks it. Skipping only the matte step would leave the
+        # re-cut running and the flag would not mean what it says.
+        rematte_why = "--no-matte"
+    elif photo_verdict is None or not _pa.rematte_views(photo_verdict, policy()):
         rematte_why = "the photo audit found every cut-out whole"
     elif matte_state["replaced"]:
         rematte_why = ("the matte step re-cut this product this run already — the same "
@@ -2321,7 +2434,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         verdict = approve_check(vnyx_api, dsn, product_id,
                                 apply=apply and approve and not blocked,
                                 skip_bin=skip_bin,
-                                quiet=quiet, allow_stage=allow_stage)
+                                quiet=quiet, allow_stage=allow_stage,
+                                publish=publish)
         if blocked:
             gate_problems = [f"{label}: {r}" for label, v in refusing for r in v.reasons]
             # A real refusal names its code; only when EVERY refusing verdict is
@@ -2344,8 +2458,14 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         outcome = verdict.get("outcome", "?")
         problems = verdict.get("problems") or []
         if outcome == "approved":
+            pushed = ("Shopify upsert enqueued" if verdict.get("published", True)
+                      else "NOT published — the Brain has the Shopify push off")
             return (f'APPROVED — {verdict.get("stageBefore")} '
-                    f'{ARROW} {verdict.get("stageAfter")}, Shopify upsert enqueued')
+                    f'{ARROW} {verdict.get("stageAfter")}, {pushed}')
+        if (outcome == "would_approve" and apply and approve and not publish
+                and not remote_supports("noPublish")):
+            return ("ready — NOT moved: the Brain has the Shopify push off and this "
+                    "vnyx-api cannot approve without publishing (no noPublish)")
         if outcome == "would_approve":
             return "ready — pass --approve to move it"
         if outcome == "gate_blocked":
@@ -2357,6 +2477,49 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         return f'{outcome}: {"; ".join(problems)}' if problems else outcome
 
     step("approve", "", _approve)
+
+    # ---- 5b. sync ---------------------------------------------------------
+    #
+    # A REPAIR TO A PRODUCT THAT IS ALREADY LIVE, pushed to the storefront (the
+    # Brain's `syncChangesToShopify`). The chain's writes go through
+    # updateProduct's service path, which — unlike the edit screen's route —
+    # enqueues no channel sync, so a corrected title or price on a product
+    # already on Shopify stayed a database fact until someone pressed Sync now.
+    #
+    # Only for a product that ALREADY has a Shopify id: resync-listings.ts
+    # force-enqueues, and on a product with no listing that would CREATE one —
+    # publishing a product nobody approved. Skipped after an approval, which has
+    # just pushed it, and when nothing in the run wrote anything.
+    sync_report: dict[str, Any] = {"ran": False, "why": None}
+
+    def _sync() -> str:
+        ok, _, _ = run_step(vnyx_api, "resync-listings.ts",
+                            ["--product", product_id, *live],
+                            timeout_s=120, quiet=quiet)
+        if not ok:
+            raise StepFailed("resync-listings.ts returned non-zero")
+        sync_report["ran"] = bool(apply)
+        return ("re-pushed to Shopify — the storefront gets this run's repairs"
+                if apply else "would re-push to Shopify")
+
+    # "Did this run change the product" from the ROW, not the step notes: every
+    # write lands through updateProduct or the media cache rebuild, and both
+    # move Product.updatedAt, whereas a step that ran can have written nothing
+    # (reconcile runs on every product).
+    wrote = bool(apply) and sync_changes and (
+        needs(dsn, product_id)["loaded"]["record"].get("updatedAt") != started_updated_at)
+    if not sync_changes:
+        sync_why = "off in the Brain (syncChangesToShopify)"
+    elif verdict.get("outcome") == "approved":
+        sync_why = "just approved — the approval pushed it"
+    elif not wrote:
+        sync_why = "nothing was repaired this run"
+    elif not shopify_product_id(dsn, product_id):
+        sync_why = "not on Shopify — a re-sync would create the listing"
+    else:
+        sync_why = ""
+    sync_report["why"] = sync_why or None
+    step("sync", sync_why, _sync)
 
     # ---- 6. the verdict that counts ---------------------------------------
     #
@@ -2459,6 +2622,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # copy regeneration with its triggers.
         "order": order_report,
         "copy": copy_report,
+        # The Brain's re-push of an already-live product after its repairs.
+        "sync": sync_report,
         # A defect no re-run can clear, with the reason a person would read; the
         # runner turns it into a rejection under `readiness.unfixable`.
         "unfixable": unfixable,
@@ -2852,6 +3017,32 @@ def main() -> int:
     ap.add_argument("--no-render", action="store_true",
                     help="skip the paid image generation step.")
     ap.add_argument(
+        "--no-gate", action="store_true",
+        help=("skip the image gate. Measured over 18 products it costs 6s "
+              "itself (2.3%%) but ASKS FOR the re-render, which is 156s and "
+              "24.8%% — that is what this saves. Gives up "
+              "MODEL_GENDER_MISMATCH, BODY_SIZE_MISMATCH, "
+              "CATEGORY_IMAGE_MISMATCH, cropped model and empty frame: no "
+              "check on the picture a shopper sees. Column checks are "
+              "unaffected."))
+    ap.add_argument(
+        "--price-rounding-only", action="store_true",
+        help=("the price step checks ONLY that the shelf price ends in .99, and "
+              "fixes it when it does not. The grade window is not consulted, so "
+              "a price outside it is left where it is and only its cents move. "
+              "Reaches products the window check skips too — no retail anchor, "
+              "no grade factor — which still have a price that should end .99."))
+    ap.add_argument(
+        "--no-matte", action="store_true",
+        help=("skip background removal AND the re-cut (45s + 168s a product, "
+              "26%% together). Nothing is asked of the segmenter, so no "
+              "cut-out is written or replaced. Use when the segmenter is "
+              "making things worse: MID-000775 was re-cut with the "
+              "mannequin's waist and the whole podium left in, which "
+              "--keep-better cannot stop because that guard refuses a "
+              "candidate with LESS garment and a podium is more. Leaves "
+              "IMG.010 unrepairable."))
+    ap.add_argument(
         "--approve", action="store_true",
         help=("move the product REVIEW -> APPROVED when it passes the "
               "pre-flight. PUBLISHES A LIVE SHOPIFY LISTING and cannot be "
@@ -2997,6 +3188,8 @@ def main() -> int:
                        infer=args.infer, min_confidence=args.min_confidence,
                        skip_render=args.no_render, approve=args.approve,
                        skip_bin=args.skip_bin, quiet=args.quiet,
+                       skip_gate=args.no_gate, skip_matte=args.no_matte,
+                       price_rounding_only=args.price_rounding_only,
                        progress=counter(n))
         except product_audit.ProductNotFound:
             print(f'{paint(counter(n), BOLD)}  {paint("no product " + pid, RED)}')

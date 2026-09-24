@@ -338,6 +338,7 @@ def inspect(dsn: str, product_id: str, *, measure: bool = False, judge: bool = F
             grade_severity=record.get("gradeSeverity"),
             grade_label=record.get("gradeLabel") or record.get("grade"), pol=pol,
             product_gender=readiness.root_gender(record.get("masterCategory"), pol),
+            category=record.get("category"), subcategory=record.get("subCategory"),
         ).as_dict()
 
     # THE PICTURE VERDICTS ARE ISSUES TOO — with their fix, ahead of the rules.

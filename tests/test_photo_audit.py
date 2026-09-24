@@ -73,9 +73,10 @@ def test_gallery_off_sends_only_the_photographs():
 
 # ------------------------------------------------------------------ decide
 
-def _decide(raw, grade="none", pol=POL, media=MEDIA):
+def _decide(raw, grade="none", pol=POL, media=MEDIA, category=None, subcategory=None):
     images, _ = pa.select_images(media, pol)
-    return pa.decide(raw, images=images, grade_severity=grade, grade_label="A", pol=pol)
+    return pa.decide(raw, images=images, grade_severity=grade, grade_label="A", pol=pol,
+                     category=category, subcategory=subcategory)
 
 
 def test_photos_two_steps_worse_than_the_grade_hold_with_the_defects():
@@ -344,6 +345,215 @@ def test_a_cached_answer_with_neither_new_field_still_decides():
     assert v.soft == ["CUTOUT DEFECT — FRONT cut-out: hanger visible"]
     assert v.reasons == ["RENDER DEFECT — AI_CLOSEUP render: a different model than the other renders"]
     assert v.bad_cutouts == ["FRONT"] and v.bad_views == ["AI_CLOSEUP"]
+
+
+# 21 Sep 2026. Two defects the audit passed on the Midtex dossier because it
+# had never been asked about them: the studio behind the model (MID-000475
+# AI_FRONT_34 — a backdrop rig, ceiling beams, a clamp and shelving, `ok: true`)
+# and a body that comes apart inside the frame (MID-000382 AI_BACK — the lower
+# leg dissolves into the backdrop while the shoe stays). Both are measured on a
+# scale, like the leftovers, so the threshold is a value and not an adjective.
+
+def _raw_scene(scene=None, body=None, on=(5,), ok=True):
+    """`scene` / `body_flaw` set on the images in `on` (1-based), which are
+    renders in MEDIA_FIVE unless a photograph index is passed deliberately."""
+    raw = _raw7()
+    for e in raw["images"]:
+        e["scene"] = "plain"
+        e["body_flaw"] = "none"
+        if e["index"] in on:
+            e["ok"] = ok
+            if scene:
+                e["scene"] = scene
+            if body:
+                e["body_flaw"] = body
+    return raw
+
+
+def test_mid_000475_a_studio_behind_the_model_is_a_render_defect_of_that_view():
+    v = _decide(_raw_scene(scene="cluttered"), media=MEDIA_FIVE)          # 5 = AI_FRONT_34
+    assert v.action == "regen" and v.code == "RENDER_DEFECT"
+    assert v.reasons == ["RENDER DEFECT — AI_FRONT_34 render: background is not clean"]
+    assert v.bad_views == ["AI_FRONT_34"] and pa.regen_views(v, POL) == ["AI_FRONT_34"]
+
+
+def test_mid_000382_a_leg_that_dissolves_inside_the_frame_is_a_render_defect():
+    v = _decide(_raw_scene(body="clear", on=(4,)), media=MEDIA_FIVE)      # 4 = AI_BACK
+    assert v.action == "regen" and v.code == "RENDER_DEFECT"
+    assert v.reasons == ["RENDER DEFECT — AI_BACK render: the body is not whole"]
+    assert v.bad_views == ["AI_BACK"]
+
+
+def test_the_scale_is_the_threshold_and_only_its_top_is_a_defect():
+    """Every render has a soft shadow and a soft edge somewhere. `minor` and
+    `slight` are those, and nothing follows from them — the discipline the
+    leftovers got after MID-000591, applied before the same mistake is made."""
+    assert _decide(_raw_scene(scene="minor"), media=MEDIA_FIVE).action == "ok"
+    assert _decide(_raw_scene(body="slight"), media=MEDIA_FIVE).action == "ok"
+    both = _decide(_raw_scene(scene="minor", body="slight"), media=MEDIA_FIVE)
+    assert both.action == "ok" and both.bad_views == [] and both.soft == []
+
+
+def test_neither_question_is_asked_of_a_garment_photograph():
+    """Images 1–2 of MEDIA_FIVE are cut-outs. A cut-out sits on a white field
+    with no person in it; a model answering `cluttered` or `clear` there is
+    answering the wrong question, and the cut-out has `leftovers` for the
+    things that really are behind it."""
+    v = _decide(_raw_scene(scene="cluttered", body="clear", on=(1, 2)), media=MEDIA_FIVE)
+    assert v.action == "ok" and v.bad_views == [] and v.bad_cutouts == []
+
+
+def test_the_model_s_own_words_are_not_repeated_by_the_measurement():
+    """The model that answers `cluttered` usually also writes the issue line.
+    One row, one sentence — not 'studio equipment visible; background is not
+    clean'."""
+    raw = _raw_scene(scene="cluttered", ok=False)
+    raw["images"][4]["issue"] = "studio equipment visible behind model"
+    v = _decide(raw, media=MEDIA_FIVE)
+    assert v.reasons == ["RENDER DEFECT — AI_FRONT_34 render: studio equipment visible behind model"]
+    # A complaint about something else keeps both halves, in one row.
+    raw = _raw_scene(body="clear", ok=False)
+    raw["images"][4]["issue"] = "garment colour wrong"
+    v = _decide(raw, media=MEDIA_FIVE)
+    assert v.reasons == ["RENDER DEFECT — AI_FRONT_34 render: garment colour wrong; the body is not whole"]
+
+
+# FRAMING, per view (21 Sep 2026). The user's standard, which is also what
+# nanobanana.py already asks the renderer for: AI_FRONT and AI_BACK show the
+# whole figure; the three-quarter views are knee-up, so a cut THROUGH the lower
+# leg is the defect (MID-000425's AI_FRONT_34 ends mid-shin, no feet); the
+# close-up is a detail. A bottom needs its hem, footwear and accessories are
+# framed around the product and exempt.
+
+# MEDIA_FIVE in order: FRONT, BACK (photographs), then AI_FRONT, AI_BACK,
+# AI_FRONT_34, AI_BACK_34, AI_CLOSEUP. Everything not under test is framed the
+# way its view wants, so a failure names the image the test is about.
+_FRAMED_RIGHT = {1: "detail", 2: "detail", 3: "feet", 4: "feet",
+                 5: "thigh", 6: "thigh", 7: "waist_up"}
+
+
+def _raw_framing(where, on=(5,)):
+    raw = _raw7()
+    for e in raw["images"]:
+        e["framing"] = where if e["index"] in on else _FRAMED_RIGHT[e["index"]]
+    return raw
+
+
+def test_a_three_quarter_view_cut_through_the_lower_leg_is_a_render_defect():
+    v = _decide(_raw_framing("lower_leg"), media=MEDIA_FIVE)              # 5 = AI_FRONT_34
+    assert v.action == "regen" and v.code == "RENDER_DEFECT"
+    assert v.reasons == ["RENDER DEFECT — AI_FRONT_34 render: ends at lower leg — "
+                         "the legs are cut through the middle — crop at the knee or show the feet"]
+    assert v.bad_views == ["AI_FRONT_34"]
+    # Knee-up and thigh-up are what that view is FOR, and full body is not a
+    # thing missing from it.
+    for ok_where in ("knee", "thigh", "waist_up", "feet"):
+        assert _decide(_raw_framing(ok_where), media=MEDIA_FIVE).action == "ok"
+
+
+def test_the_front_and_back_must_show_the_whole_figure():
+    for where in ("lower_leg", "knee", "thigh", "waist_up"):
+        v = _decide(_raw_framing(where, on=(4,)), media=MEDIA_FIVE)        # 4 = AI_BACK
+        assert v.action == "regen" and v.bad_views == ["AI_BACK"]
+        assert "head to feet" in v.reasons[0] and f"ends at {where.replace('_', ' ')}" in v.reasons[0]
+    assert _decide(_raw_framing("feet", on=(4,)), media=MEDIA_FIVE).action == "ok"
+
+
+def test_the_close_up_is_never_judged_on_framing():
+    for where in ("lower_leg", "detail", "waist_up"):
+        assert _decide(_raw_framing(where, on=(7,)), media=MEDIA_FIVE).action == "ok"   # 7 = AI_CLOSEUP
+
+
+def test_a_bottom_needs_its_hem_in_frame_on_the_three_quarter_views_too():
+    """Jeans cropped at the thigh are a picture of half the product.
+
+    Which names mean "bottom" is the tenant's, read from `sizing.sides` — the
+    same table SIZE.014 and the gate's build check read. Without one nothing is
+    a bottom and the view table alone applies, which is the honest answer for a
+    caller that passed no category at all."""
+    sided = {**POL, "sizing": {"sides": {"bottom": ["trouser", "jean", "short"],
+                                         "upper": ["shirt", "tee", "polo"]}}}
+    v = _decide(_raw_framing("thigh"), media=MEDIA_FIVE, pol=sided, category="Jeans & Trousers")
+    assert v.action == "regen" and "head to feet" in v.reasons[0]
+    # The same answer on an upper is the view working as designed.
+    assert _decide(_raw_framing("thigh"), media=MEDIA_FIVE, pol=sided,
+                   category="T-Shirts & Polos").action == "ok"
+    # And with no sides table, a bottom cannot be recognised: no defect invented.
+    assert _decide(_raw_framing("thigh"), media=MEDIA_FIVE, category="Jeans & Trousers").action == "ok"
+
+
+def test_footwear_and_accessories_are_framed_around_the_product_and_exempt():
+    for cat, sub in (("Shoes", "Sneakers"), ("Accessories", "Cap")):
+        v = _decide(_raw_framing("lower_leg", on=(4, 5)), media=MEDIA_FIVE,
+                    category=cat, subcategory=sub)
+        assert v.action == "ok" and v.bad_views == []
+
+
+def test_framing_can_be_recorded_without_re_rendering_anything():
+    soft = {**POL, "photo_audit": {"gallery": {"framing": "soft"}}}
+    v = _decide(_raw_framing("lower_leg"), media=MEDIA_FIVE, pol=soft)
+    assert v.action == "ok" and v.bad_views == []
+    assert v.soft == ["FRAMING — AI_FRONT_34 render ends at lower leg; the legs are cut "
+                      "through the middle — crop at the knee or show the feet"]
+    off = {**POL, "photo_audit": {"gallery": {"framing": "off"}}}
+    v = _decide(_raw_framing("lower_leg"), media=MEDIA_FIVE, pol=off)
+    assert v.action == "ok" and v.soft == []
+
+
+# THE CLOSE-UP'S SIDE IS THE GARMENT'S BUSINESS (21 Sep 2026). KLE-000030, a
+# pair of trousers, was refused for "AI_CLOSEUP render: shows back view instead
+# of front" — but the seat and rear pockets ARE the detail shot for a bottom,
+# and the renderer has a `closeup_back` for it. The demand belongs to uppers.
+
+SIDED = {**POL, "sizing": {"sides": {"bottom": ["trouser", "jean", "short"],
+                                     "upper": ["shirt", "tee", "polo", "jacket"]}}}
+
+
+def _closeup_expect(category, pol=SIDED):
+    images, _ = pa.select_images(MEDIA_FIVE, pol,
+                                 pa.garment_side(category, None, pol))
+    return next(im["expect"] for im in images if im["view"] == "AI_CLOSEUP")
+
+
+def test_an_upper_close_up_must_show_the_front():
+    expect = _closeup_expect("T-Shirts & Polos")
+    assert "FRONT of this garment" in expect
+    assert "BACK does not belong in this slot" in expect
+
+
+def test_a_bottom_close_up_may_show_either_side():
+    expect = _closeup_expect("Jeans & Trousers")
+    assert "EITHER side is correct" in expect
+    assert "BACK does not belong" not in expect
+    # The waistband and the seat are both named, so the model is told what the
+    # shot IS rather than only what it is not.
+    assert "seat" in expect and "waistband" in expect
+
+
+def test_an_unknown_category_is_not_treated_as_an_upper():
+    """None is not 'upper'. A check that invented a defect for every product
+    whose category this tenant names differently is the bug, not the fix."""
+    assert "EITHER side is correct" in _closeup_expect(None)
+    assert "EITHER side is correct" in _closeup_expect("Something Unmapped")
+    # And with no sides table at all, nothing can be classified.
+    assert "EITHER side is correct" in _closeup_expect("T-Shirts & Polos", pol=POL)
+
+
+def test_the_other_views_keep_their_side_whatever_the_garment():
+    """Only the close-up is ambiguous. A back view filed as AI_FRONT is wrong
+    for trousers exactly as it is for a shirt."""
+    for category in ("Jeans & Trousers", "T-Shirts & Polos"):
+        images, _ = pa.select_images(MEDIA_FIVE, SIDED,
+                                     pa.garment_side(category, None, SIDED))
+        by_view = {im["view"]: im["expect"] for im in images}
+        assert "facing the camera" in by_view["AI_FRONT"]
+        assert "turned away" in by_view["AI_BACK"]
+
+
+def test_an_answer_cached_before_the_scene_questions_is_judged_as_it_was():
+    raw = _raw7()
+    assert all("scene" not in e and "body_flaw" not in e for e in raw["images"])
+    assert _decide(raw, media=MEDIA_FIVE).action == "ok"
 
 
 def test_mid_000253_the_smeared_knees_on_a_view_the_gate_never_sees_re_render_that_view_alone():

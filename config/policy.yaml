@@ -334,6 +334,32 @@ mannequin_map:
 sizing:
   eu_tolerance: 1
 
+  # WHICH CHART ANSWERS FIRST, when a tenant has more than one for the same
+  # garment. Added 22 September 2026 at the operator's instruction.
+  #
+  # Klekt has two men's bottoms charts and they disagree by ~6 EU sizes:
+  #
+  #   Men Bottoms          W28->36  W32->40  W36->46   (roughly waist + 9)
+  #   Men Bottoms (auto)   W28->44  W32->48  W36->52   (exactly waist + 16)
+  #
+  # `(auto)` is the correct one — waist + 16 is the European men's convention,
+  # and it is what the operator writes by hand on the edit screen. The attached
+  # chart is the other one, so every bottom was being validated, and would have
+  # been repaired, against numbers nobody wants.
+  #
+  # KNOWN CONSEQUENCE, accepted deliberately. `(auto)` covers W28-W40 only, so
+  # the 22 Klekt bottoms at W21-W27 fall through to the attached chart and land
+  # on the OTHER convention: W27 reads EU 36 and W28 reads EU 44, an eight-size
+  # step for one inch of waist. Fixing the attached chart's values instead would
+  # remove both the preference and the cliff; this entry buys the correct
+  # numbers for the 273 products in range today without touching tenant data.
+  #
+  # Keyed by the ATTACHED guide's name, listing the charts to consult before it.
+  # Absent key = no preference, which is every other tenant: the product's own
+  # guide answers, as it always has.
+  chart_preference:
+    Men Bottoms: ["Men Bottoms (auto)"]
+
   # Which half of the body a category and a guide name refer to.
   #
   # SIZE.014 compares the two: a Women > T-Shirts & Polos product sitting on
@@ -536,6 +562,25 @@ imagery:
   # that already exists (`readiness.cutouts`). Items 6, 7 and 8 of
   # docs/PICTURE-CHECK-FIXES.md.
   cutout:
+    # WHICH SEGMENTERS RUN WHEN NOBODY NAMES ONE — a cost setting (19 Sep 2026).
+    #
+    # The four are not equally priced. `cloth-seg` is a local ONNX graph and
+    # costs nothing per image; `gemini-mask`, `openai-mask` and `gemini-paint`
+    # are paid API calls, each tried TWICE, so a photograph cloth-seg cannot cut
+    # walked SIX paid calls before the chain gave up. MID-000132 did exactly
+    # that across four views — twenty-four paid calls — and produced no cut-out.
+    #
+    # It never showed up on a bill before because it never ran: the re-matte was
+    # refused outright for want of `--keep-better` in vnyx-api, so nothing
+    # reached the chain. Implementing that guard is what switched it on.
+    #
+    # WHAT THIS COSTS, HONESTLY. A cut-out with a stand or a podium left in is
+    # now left as it is — cloth-seg is the segmenter that left it in, so asking
+    # it again returns the same picture. Those stay flagged and unrepaired.
+    #
+    # Add "gemini-mask" (and "openai-mask") back to spend again. The allow-list
+    # a caller passes explicitly still wins over this.
+    strategies: ["cloth-seg"]
     # The long edge every pixel comparison below is made on. 448 to match
     # `readiness.cutouts.garment_check.work_width`: the two ask the same
     # question of the same garment and a different grid would give them
@@ -587,8 +632,19 @@ imagery:
     # re-matte asks these and INTERSECTS the answer with cloth-seg, which
     # leaves the garment parser deciding what is cloth.
     #
-    # Empty this list to send every re-matte back through the default chain.
-    leftover_strategies: ["gemini-mask", "openai-mask"]
+    # EMPTY, AND EMPTY MEANS DO NOT RE-CUT (19 Sep 2026).
+    #
+    # Both names that belong here are paid calls, and `strategies` above
+    # explains why those are now opt-in. With none configured, a cut-out with a
+    # stand or a hanger left in is LEFT AS IT IS: sending it back through the
+    # default chain would ask cloth-seg to remove the podium cloth-seg left in,
+    # which returns the same picture and spends ~20s a view proving it — how
+    # MID-000521 carried the same stand through every repair run.
+    #
+    # That is a real loss, taken deliberately: those cut-outs stay flagged and
+    # unrepaired rather than costing six paid calls each to maybe improve. Put
+    # "gemini-mask" back to spend again.
+    leftover_strategies: []
     intersect_cloth: true
 
     # --- item 8: a replacement is never worse than what it replaces ----------
@@ -802,8 +858,30 @@ quality_gate:
   # band below the model, or a model a fraction of the frame's height — is
   # re-rendered on its own (IMAGE_COMPOSITION). A pixel test over every view,
   # not only the lead; see `composition` below and app/imaging/composition.py.
+  #
+  # `body_size_mismatch` IS OUT (19 Sep 2026) — and it is still measured.
+  #
+  # It was the most expensive rule here by a distance. The gate itself costs 6s
+  # a product, 2.3% of a run measured over 18 products; what it ASKS FOR is the
+  # re-render, and a build mismatch re-renders THE WHOLE SET because the model
+  # carries every view. `regen` was 156s a product and 24.8% of that run, the
+  # single largest line, and eight of the eighteen went through it.
+  #
+  # And it is the weakest of the three. A build read off a render is one band of
+  # judgement — "slim" against an XL garment — where a gender or a garment
+  # family is a fact about the picture. Removing it from this list does not turn
+  # the question off: `decide` still asks it and still records
+  # "build one band off — model slim, garment size XL (plus)" in `soft`, so it
+  # is on the row and in the report. It simply stops costing a paid re-render.
+  #
+  # `gender_mismatch` and `category_mismatch` stay, which is the point: the two
+  # that catch a woman modelling a men's shirt, or a tank top filed as a dress,
+  # are the ones worth a regeneration.
+  #
+  # Put the name back to spend on it again. Heavier alternative:
+  # `readiness.body_size.enabled: false` stops the measurement as well.
   block_on: ["no_model", "bad_face", "broken_body", "gender_mismatch",
-             "category_mismatch", "body_size_mismatch", "cropped_model",
+             "category_mismatch", "cropped_model",
              "bad_composition"]
   composition:
     enabled: true
@@ -908,6 +986,44 @@ photo_audit:
     # AI_BACK_34) and BOA-006153 (AI_CLOSEUP) were false positives on renders
     # with no face in them; MID-000569's close-up had one and is still caught.
     render_defects: regen
+    # 21 Sep 2026 — WHAT IS BEHIND THE MODEL, AND WHETHER THE BODY IS WHOLE.
+    # Two questions the audit had never asked, so a render made in front of the
+    # studio's own backdrop rig, ceiling beams and shelving answered ok = true
+    # (MID-000475 AI_FRONT_34, and 9 of 10 products in the first sample had at
+    # least one). Both are MEASURED like the leftovers, because "is the
+    # background clean" with no scale flags every soft shadow:
+    #
+    #   scene       plain | minor | cluttered   — only `cluttered` is a defect
+    #   body_flaw   none  | slight | clear      — only `clear` is a defect
+    #
+    # No switch of their own: both are RENDER_DEFECTs and follow
+    # `render_defects` above. A cached answer written before this has neither
+    # field and is judged exactly as it was.
+    #
+    # FRAMING — where the picture may cut the model, per view. The gate owns
+    # this rule for the single lead render it judges (quality_gate's
+    # `full_body_views`); these are the same words applied to all five, which
+    # is what caught MID-000425's AI_FRONT_34 ending mid-shin with no feet.
+    #   defect  a render framed wrongly is re-rendered (follows render_defects)
+    #   soft    recorded on the product and nothing else — the count before the bill
+    #   off     not asked
+    #
+    # SOFT, 21 Sep 2026, and deliberately. Asked which of these to act on, the
+    # user drew the line where the shopper sees it: a dirty background is the
+    # severe fault and gets re-rendered; where the frame cuts the model is not
+    # worth a paid render. MID-000425 is the case — its AI_CLOSEUP stands in
+    # front of a rail of other garments (severe, re-rendered on the `scene`
+    # answer) while its AI_FRONT_34 merely ends at the ankles (recorded here,
+    # nothing follows). A soft note is also kept out of the picture-failure
+    # sheets by `audit_approved_window.PICTURE_FAILURE_CODES`, so a framing
+    # answer cannot pad the repair list.
+    framing: soft
+    full_body_views: ["AI_FRONT", "AI_BACK"]
+    # Knee-up by design (nanobanana.py asks for exactly that), so only a cut
+    # THROUGH the lower leg is wrong here. A bottom is the exception and needs
+    # its hem: every body view of one must show the feet. Footwear and
+    # accessories are exempt whatever the view, as in the gate.
+    half_body_views: ["AI_FRONT_34", "AI_BACK_34"]
     # rematte | hold | soft — what a defective CUT-OUT becomes: a collar or
     # sleeve the mask cut away, a stand or hand left in (MID-000569: the
     # sweater's neckband missing from both FRONT cut-outs). `rematte` re-cuts

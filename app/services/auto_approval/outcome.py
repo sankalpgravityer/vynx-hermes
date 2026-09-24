@@ -164,10 +164,29 @@ def classify(result: dict[str, Any]) -> Verdict:
     # only because re-approving records no movement, so onApprovedArrival never
     # fires — the product is done. (repair_product.py:695 makes the same call.)
     stage_only = [b for b in blockers if b.startswith("stage is ")]
+    # ALREADY APPROVED IS A PREMISE, NOT A BLOCKER (23 Sep 2026).
+    #
+    # This required the stage line to be the ONLY blocker, which held while the
+    # queue was the Review tab: a product there is approved or it is not. It
+    # stopped holding when `run_from_sheet --include-approved` began repairing
+    # the APPROVED backlog, where every product carries that line by definition.
+    # One with a second problem — 18 of the Klekt batch had a category the image
+    # gate contradicts — fell past this branch into LEFT_REVIEW below and was
+    # recorded CANCELLED, "the product left the Review stage during
+    # verification", which is not what happened: it was approved before the run
+    # began. The real finding went with it.
+    #
+    # So the line is set aside and the rest is judged on its own: nothing left
+    # means ALREADY_APPROVED as before, and anything left reaches the ordinary
+    # held branches carrying the problem a person actually needs to see.
+    approved_stage = [b for b in stage_only if "APPROVED" in b]
+    if outcome == "skipped_preflight" and approved_stage:
+        blockers = [b for b in blockers if b not in approved_stage]
+        stage_only = [b for b in stage_only if b not in approved_stage]
     if (
         outcome == "skipped_preflight"
-        and len(blockers) == len(stage_only) == 1
-        and "APPROVED" in stage_only[0]
+        and approved_stage
+        and not blockers
     ):
         return Verdict(
             status="VERIFIED",
