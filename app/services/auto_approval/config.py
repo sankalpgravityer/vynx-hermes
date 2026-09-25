@@ -188,10 +188,10 @@ def has_open_manual_run(tenant_id: str) -> bool:
         SELECT 1 AS x FROM "AutoApprovalRun"
          WHERE "tenantId" = %(t)s::uuid
            AND status = 'RUNNING'::"AutoApprovalRunStatus"
-           AND source IN ('MANUAL_SINGLE'::"AutoApprovalRunSource",
-                          'MANUAL_DATE_RANGE'::"AutoApprovalRunSource",
-                          'MANUAL_FULL_REVIEW'::"AutoApprovalRunSource",
-                          'MANUAL_RETRY'::"AutoApprovalRunSource")
+           -- Every manual source by prefix, so a scope added later (MANUAL_TAB,
+           -- MANUAL_ID_LIST on 24 Sep 2026) is drained outside the window too
+           -- without another edit here.
+           AND source::text LIKE 'MANUAL%%'
          LIMIT 1
         """,
         {"t": tenant_id},
