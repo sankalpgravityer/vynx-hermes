@@ -377,7 +377,8 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                expect_status: str = "IN_PROGRESS",
                skip_matte: bool = False,
                price_rounding_only: bool = False,
-               silent: bool = False) -> str | None:
+               silent: bool = False,
+               section: str = "REVIEW") -> str | None:
     """One claimed product, start to finish. Never raises.
 
     RETURNS None, or one sentence saying why the RUN must stop — the canary
@@ -414,7 +415,16 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     The cost it saves is real — 45s plus 168s per image on the CPU segmenter —
     and the price is that a CUTOUT_DEFECT cannot be repaired on this pass, only
     reported. `repair()` has always taken the flag; nothing passed it.
+
+    `section` is the products-list section the run pulls from. REVIEW for
+    every caller but a run the Overview scoped to Approved or Rejected. Those
+    products already carry a verdict, so THE AUTOMATIC REJECTIONS BELOW ARE
+    REVIEW-ONLY: "no care label → reject" on an Approved product would take a
+    live listing down, and on a Rejected one it is meaningless. The chain
+    still verifies and repairs; the approve step still refuses to move them
+    (only REVIEW is ever handed to it as a stage to move from).
     """
+    settled = section != "REVIEW"
     repair = _load_repair()
 
     tenant_id = str(row["tenantId"])
@@ -505,7 +515,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     #
     # Only when the repairs are allowed to write. A shadow pass must not archive
     # a product; it records what it would have done and stops there.
-    if rs.apply and not _has_care_label(product_id):
+    if rs.apply and not settled and not _has_care_label(product_id):
         events.emit(tenant_id, "warn",
                     f"{row['productSku']} — {_NO_LABEL}, rejecting",
                     run_id=row["runId"], run_product_id=row["id"],
@@ -700,8 +710,8 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     # product — the exact incident the outage guard exists for. A product on
     # `vision_unavailable` has not had its chance; it is held above, not
     # rejected here.
-    if (rs.apply and verdict.status == "HELD_FOR_HUMAN" and not unavailable
-            and (missing := _missing_attrs(product_id))):
+    if (rs.apply and not settled and verdict.status == "HELD_FOR_HUMAN"
+            and not unavailable and (missing := _missing_attrs(product_id))):
         why = f"{' and '.join(missing)} missing — not readable from the care label"
         events.emit(tenant_id, "warn", f"{row['productSku']} — {why}, rejecting",
                     run_id=row["runId"], run_product_id=row["id"],
@@ -722,7 +732,8 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     # from, or a print every image model declines — and the product is held.
     # Same guards as the brand/size rule above (see unfixable_rejection), same
     # reject step, same terminal verdict shape, and the code the chain chose.
-    rejection = unfixable_rejection(result, verdict, unavailable, apply=rs.apply)
+    rejection = (None if settled else
+                 unfixable_rejection(result, verdict, unavailable, apply=rs.apply))
     if rejection is not None:
         code, why = rejection
         events.emit(tenant_id, "warn", f"{row['productSku']} — {why}, rejecting",
@@ -763,6 +774,18 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
         expect_status=expect_status,
     )
     return abort
+
+
+# The sections a manual run may pull from — vnyx-api's RUN_SECTIONS. Anything
+# else in a stored requestParams is read as REVIEW rather than trusted.
+_RUN_SECTIONS = ("REVIEW", "APPROVED", "REJECTED")
+
+
+def run_section(request_params: Any) -> str:
+    """The section a run pulls from: REVIEW, APPROVED or REJECTED."""
+    params = cfgmod._as_dict(request_params)
+    section = str(params.get("section") or "REVIEW").upper()
+    return section if section in _RUN_SECTIONS else "REVIEW"
 
 
 def stop_reason(abort: str | None = None) -> str | None:
@@ -845,14 +868,19 @@ def pump(tenant_id: str) -> dict[str, Any]:
             break
 
         run = db.fetch_one(
-            'SELECT "configSnapshot" FROM "AutoApprovalRun" WHERE id = %(r)s::uuid',
+            'SELECT "configSnapshot", "requestParams" FROM "AutoApprovalRun"'
+            ' WHERE id = %(r)s::uuid',
             {"r": row["runId"]},
         )
         rs = cfgmod.settings_from_snapshot(
             run and run["configSnapshot"], int(cfg_row["maxAttempts"])
         )
 
-        abort = verify_one(row, rs)
+        # A run over the Approved or Rejected section (the Overview's "Source
+        # section") re-checks products that already carry a verdict. They are
+        # never approved — the approve step is still only ever told REVIEW —
+        # and the Review-only automatic rejections do not apply to them.
+        abort = verify_one(row, rs, section=run_section(run and run["requestParams"]))
         processed += 1
 
         claim.close_finished_runs()

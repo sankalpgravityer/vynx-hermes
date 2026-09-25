@@ -378,3 +378,77 @@ def test_the_gate_endpoint_drops_a_rule_the_brain_switched_off():
     # No repair planned for a check the tenant does not run.
     assert not any(a.get("field") == "category" and a.get("reason") == "TAX.002"
                    for a in off.get("repair_plan") or [])
+
+
+# --------------------------------------------------------------------------- #
+# Run scope: the tabs a manual run pulls from
+# --------------------------------------------------------------------------- #
+
+def test_run_section_reads_the_runs_section_and_nothing_else():
+    from app.services.auto_approval.runner import run_section
+
+    assert run_section(None) == "REVIEW"
+    assert run_section({"scope": "full_review"}) == "REVIEW"
+    assert run_section({"section": "approved"}) == "APPROVED"
+    assert run_section('{"section": "REJECTED"}') == "REJECTED"
+    # Anything else is read as the default, never trusted.
+    assert run_section({"section": "LABEL"}) == "REVIEW"
+
+
+def test_a_rejected_product_checked_on_purpose_is_not_left_review():
+    from app.services.auto_approval.outcome import classify
+
+    base = {"approval": {"outcome": "skipped_preflight",
+                         "blockers": ["stage is REJECTED, not REVIEW"]},
+            "remaining": [], "verified": True}
+    v = classify({**base, "stage_before": "REJECTED"})
+    assert (v.status, v.outcome, v.approved) == ("VERIFIED", "REJECTED_PASSES_CHECKS", False)
+    # Rejected MID-run of a Review run: still the guard that stops an approval.
+    assert classify({**base, "stage_before": "REVIEW"}).outcome == "LEFT_REVIEW"
+    # A real finding on a rejected product still holds, carrying the finding.
+    held = classify({**base, "stage_before": "REJECTED",
+                     "approval": {"outcome": "skipped_preflight",
+                                  "blockers": ["stage is REJECTED, not REVIEW", "no size"]}})
+    assert held.status == "HELD_FOR_HUMAN" and "size" in held.reason.lower()
+
+
+def test_a_settled_section_never_triggers_the_automatic_rejections(monkeypatch):
+    """An Approved product with no care label must NOT be archived — that
+    rule is for Review, and on the Approved section it would take a live
+    listing down."""
+    from app.services.auto_approval import runner
+
+    archived: list[str] = []
+    monkeypatch.setattr(runner, "_has_care_label", lambda pid: False)
+    monkeypatch.setattr(runner, "_archive", lambda row, why: archived.append(why) or True)
+    monkeypatch.setattr(runner, "_load_repair", lambda: (_ for _ in ()).throw(RuntimeError("stop")))
+    monkeypatch.setattr(runner.db, "connection", lambda **kw: _NullConn())
+    monkeypatch.setattr(runner.db, "assert_tenant", lambda *a, **k: True)
+    monkeypatch.setattr(runner.events, "emit", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_finish", lambda *a, **k: None)
+    rs = settings_from_snapshot({"mode": "SHADOW", "shadowWritesRepairs": True})
+    row = {"id": "r", "runId": "u", "tenantId": "t", "productId": "p",
+           "productSku": "S", "productTitle": "", "attempts": 0, "maxAttempts": 3}
+    try:
+        runner.verify_one(row, rs, ignore_stop=True, section="APPROVED")
+    except RuntimeError:
+        pass
+    assert archived == []
+
+
+class _NullConn:
+    def cursor(self, *a, **k): return self
+    def execute(self, *a, **k): return None
+    def fetchone(self): return None
+    def commit(self): return None
+    def rollback(self): return None
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def test_the_claim_honours_a_runs_own_stages():
+    from app.services.auto_approval import claim
+
+    sql = claim._CLAIM_SQL
+    assert 'JOIN "AutoApprovalRun" r ON r.id = p."runId"' in sql
+    assert "requestParams\"->'stages'" in sql

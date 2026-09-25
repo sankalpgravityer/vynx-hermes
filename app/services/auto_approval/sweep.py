@@ -460,6 +460,11 @@ def sweep() -> dict[str, Any]:
     configs = cfgmod.enabled_configs()
     dispatched: list[str] = []
 
+    # BEFORE the dispatch decisions below, so a run the premature close had
+    # ended gets its pump on THIS tick: has_open_manual_run() only sees RUNNING
+    # runs, and a queued product under a COMPLETED run is otherwise stranded.
+    reopened = claim.reopen_orphaned_runs()
+
     for cfg_row in configs:
         tenant_id = str(cfg_row["tenantId"])
 
@@ -577,6 +582,7 @@ def sweep() -> dict[str, Any]:
         "reaped": reaped,
         "staleCancelled": stale,
         "runsClosed": closed,
+        "runsReopened": reopened,
         "arrivalRunsRolled": rolled,
         "eventsPruned": pruned,
         "preflightOk": pf["ok"],

@@ -39,6 +39,7 @@ WITH claimed AS (
   SELECT p.id
   FROM "AutoApprovalRunProduct" p
   JOIN "Product" pr ON pr.id = p."productId"
+  JOIN "AutoApprovalRun" r ON r.id = p."runId"
   WHERE p."tenantId"    = %(tenant_id)s::uuid
     AND p.status        = 'QUEUED'::"VerificationStatus"
     AND p."availableAt" <= now()
@@ -47,10 +48,31 @@ WITH claimed AS (
     -- this clause makes sure one cannot be claimed in the meantime even if the
     -- sweep has not run yet.
     --
-    -- Parameterised, defaulting to REVIEW alone, so the unattended loop is
-    -- unchanged. scripts/run_from_sheet.py --include-label is the only caller
-    -- that widens it.
-    AND pr."currentStage" = ANY(%(stages)s::"ProductStage"[])
+    -- TWO WAYS IN, and the review-state clause belongs to the first only.
+    --
+    -- (a) The caller's stages — REVIEW alone by default, so the unattended loop
+    --     is unchanged; scripts/run_from_sheet.py --include-label/--include-
+    --     approved widens it for the whole claim. `reviewStatus` is tested
+    --     here, PARAMETERISED and derived from the stages (21 Sep 2026): it was
+    --     hardcoded, so widening the stage alone admitted an APPROVED product
+    --     at enqueue and refused it here, and `claim_next` returns a bare None
+    --     the caller can only report as "another worker holds this tenant".
+    --
+    -- (b) The RUN's own section (24 Sep 2026). The Overview's run scope can
+    --     pull from Approved or Rejected, and stores that in
+    --     requestParams.stages. A row queued by such a run is claimable in that
+    --     stage, while the same stage stays closed to every other run. No
+    --     reviewStatus test here: the section IS the verdict (APPROVED ↔
+    --     ACCEPTED is one fact in two columns), and a rejected product's
+    --     review state is REJECTED by definition.
+    AND (
+          (pr."currentStage" = ANY(%(stages)s::"ProductStage"[])
+           AND pr."reviewStatus" = ANY(%(review)s::"ProductReviewStatus"[]))
+       OR pr."currentStage"::text IN (
+            SELECT jsonb_array_elements_text(
+                     CASE WHEN jsonb_typeof(r."requestParams"->'stages') = 'array'
+                          THEN r."requestParams"->'stages' ELSE '[]'::jsonb END))
+    )
     AND pr."isDeleted"  = false
     AND pr."isArchived" = false
     -- The pipeline must STILL be finished with it. A product can start
@@ -58,13 +80,6 @@ WITH claimed AS (
     -- repair images a job in flight is about to replace.
     AND pr."generationStatus" = ANY(%(gen)s::"ProductGenerationStatus"[])
     AND pr."isRegenerating" = false
-    -- PARAMETERISED FOR THE SAME REASON `stages` IS, and derived from it (21
-    -- Sep 2026). This clause was hardcoded, so widening the stage alone
-    -- admitted an APPROVED product at enqueue and then refused it here — and
-    -- `claim_next` returns a bare None, which the caller can only report as
-    -- "another worker holds this tenant". The product was enqueued, released
-    -- and skipped on every attempt, with nothing naming the real clause.
-    AND pr."reviewStatus" = ANY(%(review)s::"ProductReviewStatus"[])
   -- Manual work first (an operator is waiting on that one), then the oldest
   -- arrival, so garments come out in the order they came in.
   ORDER BY p.priority DESC, p."createdAt" ASC
@@ -344,7 +359,47 @@ def close_finished_runs() -> int:
                "completionReason" = COALESCE(r."completionReason", 'all products processed')
          WHERE r.status = 'RUNNING'::"AutoApprovalRunStatus"
            AND r.source <> 'ON_ARRIVAL'::"AutoApprovalRunSource"
+           -- A GRACE PERIOD FOR A RUN BEING FILLED (24 Sep 2026). vnyx-api
+           -- creates the run and THEN inserts its products, in a separate
+           -- transaction. A tick landing between the two saw a run with no
+           -- queue rows and closed it — BOA-005794's single run was closed 1 ms
+           -- after it was created, its product left QUEUED under a COMPLETED
+           -- run, and no pump was ever dispatched for it (has_open_manual_run
+           -- looks for a RUNNING run). An empty run that is genuinely finished
+           -- closes on the next tick instead.
+           AND r."startedAt" < (now() AT TIME ZONE 'UTC') - interval '2 minutes'
            AND NOT EXISTS (
+             SELECT 1 FROM "AutoApprovalRunProduct" q
+              WHERE q."runId" = r.id
+                AND q.status IN ('QUEUED'::"VerificationStatus",
+                                 'IN_PROGRESS'::"VerificationStatus")
+           )
+        """
+    )
+
+
+def reopen_orphaned_runs() -> int:
+    """Put a run back to RUNNING when it was closed with work still queued.
+
+    The repair for the race close_finished_runs now guards against, for runs
+    that were caught by it before the guard existed. A closed run with QUEUED
+    rows is never drained: the sweep dispatches a pump for a manual run only
+    while one is RUNNING, and these rows cannot be claimed by anything else.
+
+    Only runs the automatic close ended ('all products processed' — which was
+    untrue). A run someone STOPPED, or one the window closed, released its rows
+    back to NOT_STARTED already; it never has QUEUED rows, and is left alone
+    by the reason test anyway.
+    """
+    return db.execute(
+        """
+        UPDATE "AutoApprovalRun" r
+           SET status             = 'RUNNING'::"AutoApprovalRunStatus",
+               "completedAt"      = NULL,
+               "completionReason" = NULL
+         WHERE r.status = 'COMPLETED'::"AutoApprovalRunStatus"
+           AND r."completionReason" = 'all products processed'
+           AND EXISTS (
              SELECT 1 FROM "AutoApprovalRunProduct" q
               WHERE q."runId" = r.id
                 AND q.status IN ('QUEUED'::"VerificationStatus",

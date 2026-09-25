@@ -196,6 +196,33 @@ def classify(result: dict[str, Any]) -> Verdict:
             retryable=False,
         )
 
+    # ---- already rejected, and checked on purpose -------------------------
+    #
+    # A run over the Rejected SECTION (the Overview's run scope, 24 Sep 2026)
+    # checks products whose rejection is the premise, exactly as the Approved
+    # backlog's approval is. The stage line is set aside the same way — but ONLY
+    # when the product was already REJECTED when the chain began. A product a
+    # person rejects MID-verification of a Review run must still read
+    # LEFT_REVIEW below: that is the guard against approving it afterwards.
+    #
+    # Never approved either way — approve-products.ts refuses REJECTED as a
+    # stage to move from. One that passes everything is reported as ready to
+    # restore; moving it back is a person's decision.
+    rejected_stage = [b for b in stage_only if "REJECTED" in b]
+    if (outcome == "skipped_preflight" and rejected_stage
+            and str(result.get("stage_before") or "").upper() == "REJECTED"):
+        blockers = [b for b in blockers if b not in rejected_stage]
+        stage_only = [b for b in stage_only if b not in rejected_stage]
+        if not blockers:
+            return Verdict(
+                status="VERIFIED",
+                outcome="REJECTED_PASSES_CHECKS",
+                reason=("Still rejected, and passes every check. Restoring it "
+                        "to Review is a person's decision — nothing moved."),
+                approved=False,
+                retryable=False,
+            )
+
     # ---- the product left Review while we worked on it ---------------------
     #
     # The preflight's own stage check catches this, which is the strongest
