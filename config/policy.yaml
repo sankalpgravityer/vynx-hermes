@@ -1120,9 +1120,16 @@ readiness:
   # step's `views` option, and judges the result once more. See
   # app/imaging/quality_gate.py (size_band, regen_views).
   #
-  # One paid regeneration per product per run. A second refusal holds; credits
-  # are spent once, never in a loop.
+  # ON/OFF, not a count: the Brain sends 1 when "Re-render what a check
+  # refuses" is on and 0 when it is off (vnyx-api checks.ts), overriding this.
   max_regenerations_per_run: 1
+  # HOW MANY ROUNDS "ON" BUYS (29 Sep 2026). A round re-renders every view the
+  # gate or the photo audit refused, then both look again; the next round
+  # re-plans from those verdicts. It stops as soon as nothing is refused. Each
+  # round is a PAID render plus a second photo audit. BOA-006400 is why: round 1
+  # fixed AI_FRONT_34, the second look refused AI_CLOSEUP, and one round was all
+  # there was. 1 = the old single retry.
+  regen_rounds: 3
   # Decision 4: Kids products are rendered with a child model, never held for
   # being Kids. `hold` leaves their renders to a person.
   kids_renders: generate

@@ -73,8 +73,11 @@ _DEFAULTS: dict[str, Any] = {
     "usage_tiebreak_ratio": 2,
 
     # --- phase 4: the renders (docs/READINESS-PLAN.md §4 step 5) ---------------
-    # One paid regeneration per product per run. A second refusal holds.
+    # ON/OFF: the Brain sends 1 (on) or 0 (off). See `regen_rounds`.
     "max_regenerations_per_run": 1,
+    # How many rounds "on" buys (29 Sep 2026): re-render what was refused, look
+    # again, repeat while something is still refused. Each round is paid.
+    "regen_rounds": 3,
     # Decision 4: Kids products are rendered (with a child model, as the prompt
     # builder already does for the Kids rig), never held for being Kids.
     # `hold` leaves their renders to a person.
