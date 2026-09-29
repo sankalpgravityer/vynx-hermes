@@ -683,9 +683,14 @@ def test_mid_000521_a_stand_left_in_is_re_cut_by_a_different_segmenter(
 
 
 def test_a_stand_is_left_alone_when_nothing_can_remove_it(wired, monkeypatch):
-    """WHAT SHIPS. No paid strategy is funded, so the stand stays and the step
-    says why — rather than re-cutting with cloth-seg, which is the segmenter
-    that left the stand in and would hand back the same picture."""
+    """With only the STOCK parser in the chain and no paid strategy funded, the
+    stand stays and the step says why — rather than re-cutting with cloth-seg,
+    which is the segmenter that left the stand in and would hand back the same
+    picture. (What ships since 29 Sep 2026 is the next test.)"""
+    from app.imaging import cutout as _cutout
+
+    stock = {**_cutout.config(None), "strategies": ["cloth-seg"], "leftover_strategies": []}
+    monkeypatch.setattr(_cutout, "config", lambda pol=None: stock)
     _photo_sequence(monkeypatch, STAND_LEFT, PHOTO_OK)
     bg = _record_bg_removal(monkeypatch, wired)
     r = _repair(apply=True, approve=True)
@@ -694,6 +699,21 @@ def test_a_stand_is_left_alone_when_nothing_can_remove_it(wired, monkeypatch):
     assert "left the existing cut-outs alone" in note
     assert "leftover_strategies" in note
     assert r["rematte"]["skipped"] == "no leftover strategy configured"
+
+
+def test_what_ships_a_stand_is_re_cut_with_the_fine_tuned_chain(wired, monkeypatch):
+    """WHAT SHIPS (29 Sep 2026). The default chain starts with the fine-tuned
+    parser, trained on these stands, so the leftover is re-cut with the DEFAULT
+    chain: no `--bg-strategies` (vnyx-api only accepts its own closed list of
+    names), and the usual `--replace --keep-better` guard."""
+    _photo_sequence(monkeypatch, STAND_LEFT, PHOTO_OK)
+    bg = _record_bg_removal(monkeypatch, wired)
+    r = _repair(apply=True, approve=True)
+    assert len(bg) == 1
+    assert "--bg-strategies" not in bg[0]
+    assert "--keep-better" in bg[0] and "--replace" in bg[0]
+    assert r["rematte"]["strategies"] is None
+    assert r["rematte"].get("skipped") in (None, "")
 
 
 def test_a_collar_the_mask_ate_keeps_the_default_chain(wired, monkeypatch):
