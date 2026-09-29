@@ -129,6 +129,22 @@ DEFAULTS: dict[str, Any] = {
     # matting model removed the podium and kept the hanger. The intersection is
     # the only combination that removes both.
     "intersect_cloth": True,
+    # --- the two fine-tuned parsers together (29 Sep 2026) ------------------
+    #
+    # When BOTH `cloth-seg-ft` and `cloth-seg-ft-backup` are refused by the
+    # leftover check but agree on the garment at least this well (IoU of the
+    # two alphas), the primary's cut-out is accepted: the check misreads white
+    # and pale-patterned garments as white backdrop, and two parsers trained
+    # apart landing on the same outline is the better evidence. 0 disables it.
+    # Measured on the fix queue: 522 of 525 usable photos accepted this way had
+    # been judged good by a person. See `agreed_cut` in remove_background.
+    "agreement_min_iou": 0.98,
+    # THE CHAIN FOR POST /v1/imagery/cutout — the URL-in, PNG-out endpoint. Its
+    # own list, so turning it on changes nothing for vnyx-api's calls to
+    # /v1/imagery/remove-background, which follow `strategies` above.
+    # gemini-mask is PAID and tried twice; it runs only when both fine-tuned
+    # parsers are refused and do not agree.
+    "url_strategies": ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"],
     # --- item 8: a replacement is never worse than what it replaces --------
     #
     # How much less garment the new cut-out may have than the one it would
@@ -454,12 +470,146 @@ def _is_cutout(data: bytes) -> tuple[bool, str]:
 # garment specifically, which is why the mannequin, the stand, the podium, the
 # metal disc and the red button all disappear where the other two kept them.
 _CLOTH_MODEL = os.getenv("HERMES_CLOTH_SEG_MODEL", "u2net_cloth_seg")
-_cloth_session: Any = None
+# THE FINE-TUNED GARMENT PARSER (strategy `cloth-seg-ft`), 28 Sep 2026.
+#
+# u2net_cloth_seg fine-tuned on vnyx's own decision and photobooth raws: 6,275
+# finished masks, 821 of them corrected by hand. On the frozen test split of
+# 1,257 photos (524 products never seen in training) a blind A/B review of every
+# photo where the two models disagreed chose it 249 times against 58, and it
+# kept a solid piece of set (podium, floor, a second garment) on 46 photos where
+# the stock model kept one on 152. It is not perfect — the 58 are real — which
+# is why the chain keeps the stock model BEHIND it: a `cloth-seg-ft` cut-out that
+# Hermes refuses falls through to `cloth-seg`, exactly as before.
+#
+# A PATH, not a rembg model name: the file is ours, versioned by name
+# (cloth_seg_ft_v1.onnx), and never downloaded. Unset, the strategy reports
+# itself unconfigured and the chain moves on, so deploying this code changes
+# nothing until policy lists `cloth-seg-ft` AND the file is in place.
+_CLOTH_FT_PATH = os.getenv("HERMES_CLOTH_SEG_FT_PATH", "")
+# THE PREVIOUS FINE-TUNE, KEPT AS A BACKUP (strategy `cloth-seg-ft-backup`), 29 Sep 2026.
+#
+# Round 2 (cloth_seg_ft_v2.onnx) is the primary: in a blind A/B on the frozen
+# test split it won 66 photos to 39 against round 1, and 50 to 25 on decision.
+# Round 1 (cloth_seg_ft_v1.onnx) runs when round 2's cut-out is refused, and the
+# two together decide the case the leftover check gets wrong most — see
+# `agreement_min_iou`.
+_CLOTH_FT_BACKUP_PATH = os.getenv("HERMES_CLOTH_SEG_FT_BACKUP_PATH", "")
+_cloth_sessions: dict[str, Any] = {}
 _cloth_unavailable: str | None = None
 
 
-def _cloth_seg(data: bytes) -> tuple[bytes | None, str | None]:
+def _cloth_session_for(model: str) -> Any:
+    """A cached rembg cloth session for a model NAME or an .onnx PATH."""
+    if model not in _cloth_sessions:
+        started = time.perf_counter()
+        if model.lower().endswith(".onnx"):
+            # rembg loads the graph from whatever `download_models` returns;
+            # pointing it at our file keeps every other step — preprocessing,
+            # argmax, the resize back to full size — rembg's own.
+            from rembg.sessions.u2net_cloth_seg import Unet2ClothSession
+
+            class _FromFile(Unet2ClothSession):
+                @classmethod
+                def download_models(cls, *args, **kwargs):
+                    return model
+
+            _cloth_sessions[model] = _FromFile("u2net_cloth_seg", None)
+        else:
+            from rembg import new_session
+
+            _cloth_sessions[model] = new_session(model)
+        log.info("cloth-seg model %s loaded in %.1fs", model, time.perf_counter() - started)
+    return _cloth_sessions[model]
+
+
+def _cloth_seg_ft(data: bytes) -> tuple[bytes | None, str | None]:
+    """The fine-tuned garment parser, when one is configured. Never raises."""
+    if not _CLOTH_FT_PATH:
+        return None, "the fine-tuned cloth-seg is not configured (HERMES_CLOTH_SEG_FT_PATH is unset)"
+    if not os.path.isfile(_CLOTH_FT_PATH):
+        return None, f"the fine-tuned cloth-seg model file is missing: {_CLOTH_FT_PATH}"
+    return _cloth_seg(data, _CLOTH_FT_PATH)
+
+
+def _cloth_seg_ft_backup(data: bytes) -> tuple[bytes | None, str | None]:
+    """The previous fine-tune, when one is configured. Never raises."""
+    if not _CLOTH_FT_BACKUP_PATH:
+        return None, ("the backup fine-tuned cloth-seg is not configured "
+                      "(HERMES_CLOTH_SEG_FT_BACKUP_PATH is unset)")
+    if not os.path.isfile(_CLOTH_FT_BACKUP_PATH):
+        return None, f"the backup fine-tuned cloth-seg model file is missing: {_CLOTH_FT_BACKUP_PATH}"
+    return _cloth_seg(data, _CLOTH_FT_BACKUP_PATH)
+
+
+def _alpha_agreement(a_png: bytes, b_png: bytes) -> float | None:
+    """IoU of two cut-outs' garment (alpha >= 128). None when they cannot be compared."""
+    from PIL import Image
+    import numpy as np
+
+    try:
+        a = np.asarray(Image.open(io.BytesIO(a_png)).convert("RGBA").getchannel("A")) >= 128
+        b = np.asarray(Image.open(io.BytesIO(b_png)).convert("RGBA").getchannel("A")) >= 128
+    except Exception:  # noqa: BLE001
+        return None
+    if a.shape != b.shape:
+        return None
+    union = float((a | b).sum())
+    return float((a & b).sum()) / union if union else None
+
+
+def _upright(data: bytes) -> tuple[bytes, int]:
+    """The photograph as it is meant to be seen. Returns (bytes, EXIF orientation).
+
+    THE DECISION PANEL STORES EVERY ORIGINAL SIDEWAYS. The camera writes a
+    4000x3000 frame and an EXIF Orientation of 6 ("rotate 90° to view"): 4,981
+    of the 5,017 decision raws measured on prod, 26 Sep 2026, and 4 more at 8.
+    Photobooth raws carry no tag.
+
+    rembg's `remove()` APPLIES that tag before segmenting, so cloth-seg hands
+    back masks for the UPRIGHT 3000x4000 picture, while `_cloth_seg` read the
+    source's size from the untransposed pixels and cropped its three panels at
+    4000x3000. Every decision cut-out came out as an upright mask laid over a
+    sideways photograph: backdrop kept, garment cut away. The same photograph
+    turned upright first cuts cleanly.
+
+    So the source is turned upright ONCE, here, before any strategy or check
+    sees it: cloth-seg, the mask strategies, `_kept_backdrop` and `garment_kept`
+    all read the same pixels, and the cut-out comes back upright — which is how
+    a browser shows the original, and what `cutouts.garment_hole` already
+    assumes when it transposes the raw before comparing.
+
+    Re-encoded as JPEG quality 95 without chroma subsampling rather than PNG: a
+    12-megapixel PNG is 15-25 MB, past what the paid mask strategies accept
+    inline, and the difference is invisible. Bytes without a rotating tag are
+    returned untouched.
+    """
+    from PIL import Image, ImageOps
+
+    try:
+        img = Image.open(io.BytesIO(data))
+        orientation = int(img.getexif().get(0x0112) or 1)
+    except Exception:  # noqa: BLE001 — undecodable: the strategies report it
+        return data, 1
+    if orientation not in range(2, 9):
+        return data, orientation
+    try:
+        img = ImageOps.exif_transpose(img)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=95, subsampling=0,
+                 icc_profile=img.info.get("icc_profile"))
+        return buf.getvalue(), orientation
+    except Exception as exc:  # noqa: BLE001
+        log.info("could not turn the source upright (%s); using it as stored", exc)
+        return data, orientation
+
+
+def _cloth_seg(data: bytes, model: str | None = None) -> tuple[bytes | None, str | None]:
     """Segment the garment locally. Returns (png, error). Never raises.
+
+    `model` is a rembg model name or an .onnx path; the stock `_CLOTH_MODEL`
+    when omitted.
 
     THE SESSION IS CACHED because building it loads a 168 MB ONNX graph and
     takes ~25 seconds; per-image that would dwarf the ~4s inference and make the
@@ -471,34 +621,30 @@ def _cloth_seg(data: bytes) -> tuple[bytes | None, str | None]:
     and taking the strongest alpha at each pixel is right for all three without
     having to know which kind of garment this is beforehand.
     """
-    global _cloth_session, _cloth_unavailable
+    global _cloth_unavailable
     if _cloth_unavailable:
         return None, _cloth_unavailable
 
     from PIL import Image
     import numpy as np
 
-    if _cloth_session is None:
-        try:
-            from rembg import new_session
-            started = time.perf_counter()
-            _cloth_session = new_session(_CLOTH_MODEL)
-            log.info("cloth-seg model %s loaded in %.1fs",
-                     _CLOTH_MODEL, time.perf_counter() - started)
-        except ImportError:
-            _cloth_unavailable = "rembg is not installed"
-            return None, _cloth_unavailable
-        except Exception as exc:  # noqa: BLE001 — a missing model file, no disk, no network
-            # NOT cached as unavailable: `No space left on device` while
-            # fetching the weights is exactly what happened here once, and it is
-            # a condition that gets fixed. Caching it would keep the segmenter
-            # switched off for the life of the process afterwards.
-            return None, f"could not load {_CLOTH_MODEL}: {str(exc)[:140]}"
+    model = model or _CLOTH_MODEL
+    try:
+        session = _cloth_session_for(model)
+    except ImportError:
+        _cloth_unavailable = "rembg is not installed"
+        return None, _cloth_unavailable
+    except Exception as exc:  # noqa: BLE001 — a missing model file, no disk, no network
+        # NOT cached as unavailable: `No space left on device` while
+        # fetching the weights is exactly what happened here once, and it is
+        # a condition that gets fixed. Caching it would keep the segmenter
+        # switched off for the life of the process afterwards.
+        return None, f"could not load {model}: {str(exc)[:140]}"
 
     try:
         from rembg import remove
         src = Image.open(io.BytesIO(data)).convert("RGBA")
-        stacked = Image.open(io.BytesIO(remove(data, session=_cloth_session)))
+        stacked = Image.open(io.BytesIO(remove(data, session=session)))
         stacked = stacked.convert("RGBA")
     except Exception as exc:  # noqa: BLE001
         return None, f"{exc.__class__.__name__}: {str(exc)[:140]}"
@@ -1418,7 +1564,12 @@ def _intersect_alpha(mask_png: bytes, cloth_png: bytes) -> tuple[bytes | None, s
 # because a caller may now ask for a SUBSET of them by name (`strategies` /
 # `skip`) and the endpoint has to be able to say which names exist without
 # reaching into the chain below.
-STRATEGY_NAMES = ("cloth-seg", "gemini-mask", "openai-mask", "gemini-paint")
+STRATEGY_NAMES = ("cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg", "gemini-mask", "openai-mask",
+                  "gemini-paint")
+# What a cut-out accepted because the two fine-tuned parsers AGREED is reported
+# as (see `agreement_min_iou`): still the primary's pixels, named apart so the
+# log and the caller can tell it from one the leftover check passed.
+AGREED = "cloth-seg-ft+agreed"
 
 # The provider a refusal carries when the candidate was good enough to keep but
 # not good enough to REPLACE what is already on file (item 8). It is not "none"
@@ -1508,6 +1659,16 @@ def remove_background(
     attempts: list[str] = []
     cfg = config()
 
+    # UPRIGHT BEFORE ANYTHING LOOKS AT IT — see `_upright`. The decision panel's
+    # originals are stored sideways with an EXIF rotation, and a mask made for
+    # the upright picture laid over the sideways pixels is what every decision
+    # cut-out used to be.
+    data, orientation = _upright(data)
+    if orientation != 1:
+        log.info("bg-removal: source carries EXIF orientation %d; segmenting it upright", orientation)
+    if previous is not None:
+        previous, _ = _upright(previous)
+
     # MASK FIRST, PAINT LAST.
     #
     # The two mask strategies ask the model only where the garment is; the
@@ -1522,6 +1683,13 @@ def remove_background(
     # and left a mannequin stand in the next. A second ask is far cheaper than
     # a product held for a human.
     chain = (
+        # THE FINE-TUNED PARSER, BEFORE THE STOCK ONE — when policy lists it
+        # (see `_CLOTH_FT_PATH`). Same kind, same checks, same cost; a cut-out
+        # of its that Hermes refuses falls through to the stock `cloth-seg`,
+        # which is what makes it safe to put first. Off unless named.
+        ("cloth-seg-ft", "direct", lambda: _cloth_seg_ft(data)),
+        # …and the previous fine-tune behind it (`_CLOTH_FT_BACKUP_PATH`).
+        ("cloth-seg-ft-backup", "direct", lambda: _cloth_seg_ft_backup(data)),
         # LOCAL AND FIRST. The only one of the four that measured 0% backdrop on
         # a real studio original, and it returns the FULL source resolution
         # rather than the model's render size.
@@ -1564,11 +1732,56 @@ def remove_background(
     intersect = bool(cfg.get("intersect_cloth", True)) and \
         "cloth-seg" not in {s[0] for s in chain} and "cloth-seg" not in banned
     cloth: dict[str, Any] = {}
+    # What the fine-tuned parsers produced this call, and which of those the
+    # leftover check refused (see `agreement_min_iou`).
+    ft_parsed: dict[str, bytes] = {}
+    ft_refused: dict[str, bytes] = {}
+    FT = ("cloth-seg-ft", "cloth-seg-ft-backup")
 
     def cloth_cut() -> tuple[bytes | None, str | None]:
+        # THE GARMENT PARSER TO INTERSECT WITH IS THE BEST ONE CONFIGURED. The
+        # fine-tuned parser, when one is — reusing the cut-out it already made
+        # this call, refused or not, since "what is cloth" is exactly what it
+        # was trained on — and the stock one otherwise.
         if "png" not in cloth:
-            cloth["png"], cloth["err"] = _cloth_seg(data)
+            if "cloth-seg-ft" in ft_parsed:
+                cloth["png"], cloth["err"] = ft_parsed["cloth-seg-ft"], None
+            elif _CLOTH_FT_PATH and os.path.isfile(_CLOTH_FT_PATH):
+                cloth["png"], cloth["err"] = _cloth_seg_ft(data)
+            else:
+                cloth["png"], cloth["err"] = _cloth_seg(data)
         return cloth["png"], cloth["err"]
+
+    def agreed_cut() -> tuple[bytes | None, str | None]:
+        """Both fine-tuned parsers' cut-outs were refused as leftovers. If they
+        AGREE on the garment, the refusal is taken to be the check's mistake.
+
+        Measured 29 Sep 2026. On 62 Midtex products never seen in training,
+        the leftover check refused 12 photos from both models; a person judged
+        11 of those cut-outs clean (white shirts, pale knit patterns read as
+        backdrop), and the twelfth had no garment at all. The eleven agree at
+        IoU 0.988-0.999. On the fix queue, where the check refused BOTH models'
+        cut-outs, agreement >= 0.98 picked 525 usable photos of which a person
+        had judged 522 good (99.4%); it also passed 18 photos a person had
+        rejected as unusable (no garment, a person, the floor), which is a
+        different failure and belongs before background removal.
+        """
+        need = float(cfg.get("agreement_min_iou") or 0.0)
+        if need <= 0 or not all(n in ft_refused for n in FT):
+            return None, None
+        agree = _alpha_agreement(ft_refused["cloth-seg-ft"], ft_refused["cloth-seg-ft-backup"])
+        if agree is None or agree < need:
+            log.info("bg-removal: the two fine-tuned cut-outs disagree (IoU %s < %.2f); not overriding",
+                     "n/a" if agree is None else f"{agree:.3f}", need)
+            return None, None
+        out = ft_refused["cloth-seg-ft"]
+        if previous is not None:
+            better, keep_why = garment_kept(previous, out, cfg)
+            if not better:
+                kept_existing.append(AGREED)
+                attempts.append(f"{AGREED}: {keep_why}")
+                return None, None
+        return out, f"the two fine-tuned parsers agree at IoU {agree:.3f}"
 
     # Whether any candidate was turned away for losing garment against
     # `previous`. It changes what the failure MEANS: nothing is wrong with the
@@ -1591,6 +1804,8 @@ def remove_background(
             if kind == "direct":
                 # Already an RGBA cut-out of the original pixels.
                 step_err = None
+                if name in FT:
+                    ft_parsed[name] = out
             elif kind == "mask":
                 # The model returned a silhouette; the photograph is ours.
                 out, step_err = _apply_mask(data, out)
@@ -1648,6 +1863,8 @@ def remove_background(
                 log.info("bg-removal %s kept part of the set in %.1fs: %s",
                          label, took, backdrop_why)
                 attempts.append(f"{label}: {backdrop_why}")
+                if name in FT:
+                    ft_refused[name] = out
                 continue
 
             # LAST, AND A PRECONDITION (item 8). Everything above asks whether
@@ -1667,6 +1884,14 @@ def remove_background(
             log.info("bg-removal %s produced a cut-out in %.1fs (%d KB, %s)",
                      label, took, len(out) // 1024, why)
             return out, None, name
+
+        # BOTH FINE-TUNED PARSERS HAVE HAD THEIR TURN: before any paid strategy
+        # runs, see whether their refusals were the leftover check's mistake.
+        if name == "cloth-seg-ft-backup":
+            out, why = agreed_cut()
+            if out is not None:
+                log.info("bg-removal %s: accepted despite the leftover check (%s)", AGREED, why)
+                return out, None, AGREED
 
     if kept_existing:
         # NOT A FAILURE, AND IT MUST NOT BE FILED AS ONE. Every candidate that

@@ -849,6 +849,130 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
     )
 
 
+class CutoutUrlRequest(BaseModel):
+    """An image to cut out: a URL (or base64 bytes). The answer is the PNG itself."""
+
+    image_url: str | None = None
+    image_base64: str | None = None
+    timeout_s: float = 180.0
+
+
+def _cutout_png(raw: bytes, timeout_s: float):
+    """Cut `raw` with the URL endpoint's chain; the PNG at the photo's resolution."""
+    import io as _io
+    import os as _os
+    import time as _time
+
+    from fastapi.responses import JSONResponse, Response
+    from PIL import Image
+
+    from app.imaging import cutout
+
+    started = _time.perf_counter()
+    cfg = cutout.config()
+    strategies = [str(s) for s in (cfg.get("url_strategies") or [])] or None
+    # NOT A SILENT BILL. Without the fine-tuned model files this chain would
+    # skip straight to the paid mask strategy for every photo; say so instead.
+    if strategies and "cloth-seg-ft" in strategies and not (
+            cutout._CLOTH_FT_PATH and _os.path.isfile(cutout._CLOTH_FT_PATH)):
+        return JSONResponse(status_code=503, content={
+            "ok": False, "error": "the fine-tuned model is not configured on this server "
+                                  "(HERMES_CLOTH_SEG_FT_PATH): see docs/DEPLOY-BACKGROUND-REMOVAL.md §11"})
+    try:
+        upright, _orientation = cutout._upright(raw)
+        size = Image.open(_io.BytesIO(upright)).size
+    except Exception:  # noqa: BLE001
+        raise HTTPException(400, "the image could not be decoded")
+
+    out, err, provider = cutout.remove_background(raw, timeout_s=timeout_s, strategies=strategies)
+    ms = int((_time.perf_counter() - started) * 1000)
+    if out is None:
+        return JSONResponse(status_code=422, content={
+            "ok": False, "error": err, "provider": provider, "duration_ms": ms})
+
+    # THE SAME RESOLUTION AS THE PHOTOGRAPH. Every local strategy already keeps
+    # it; a paid PAINT strategy may render at its own size, so the result is
+    # brought back to the source's (RGB and alpha resized apart, so the corners
+    # stay (255,255,255,0) rather than premultiplied black).
+    img = Image.open(_io.BytesIO(out)).convert("RGBA")
+    if img.size != size:
+        rgb = img.convert("RGB").resize(size, Image.Resampling.LANCZOS)
+        alpha = img.getchannel("A").resize(size, Image.Resampling.LANCZOS)
+        img = Image.merge("RGBA", (*rgb.split(), alpha))
+        buf = _io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        out = buf.getvalue()
+    return Response(content=out, media_type="image/png", headers={
+        "X-Cutout-Provider": provider,
+        "X-Cutout-Width": str(img.width), "X-Cutout-Height": str(img.height),
+        "X-Duration-Ms": str(ms),
+    })
+
+
+def _check_cutout_key(key: str | None) -> None:
+    """Optional shared secret: set HERMES_CUTOUT_API_KEY and send it as X-Api-Key."""
+    import os as _os
+
+    want = _os.getenv("HERMES_CUTOUT_API_KEY", "")
+    if want and not (key and hmac.compare_digest(want, key)):
+        raise HTTPException(401, "missing or wrong X-Api-Key")
+
+
+def _fetch_image(url: str) -> bytes:
+    try:
+        from app.net import make_client
+
+        with make_client(30.0) as client:
+            resp = client.get(url)
+            resp.raise_for_status()
+            return resp.content
+    except Exception as exc:
+        raise HTTPException(400, f"could not fetch image_url: {exc}")
+
+
+@app.post("/v1/imagery/cutout")
+def imagery_cutout(req: CutoutUrlRequest, x_api_key: str | None = Header(default=None)):
+    """Image URL in, transparent PNG out, at the photograph's own resolution.
+
+    THE CHAIN is `imagery.cutout.url_strategies`: the fine-tuned parser (v2),
+    then the previous fine-tune (v1), then — only when both are refused AND do
+    not agree on the garment (`agreement_min_iou`) — Gemini's mask, which is a
+    paid call. Every candidate passes Hermes's own checks before it is returned.
+
+    200  image/png (RGBA; transparent background). Headers: X-Cutout-Provider
+         (which strategy made it: cloth-seg-ft, cloth-seg-ft-backup,
+         cloth-seg-ft+agreed, gemini-mask), X-Cutout-Width/Height, X-Duration-Ms.
+    422  JSON {ok: false, error, provider}: nothing produced an acceptable cut-out.
+    400  the URL could not be fetched, or the bytes are not an image.
+    503  the fine-tuned model is not configured on this server.
+
+    RESOLUTION: the photograph's, turned upright from its EXIF orientation the
+    way a browser shows it (a decision original stored 4000x3000 with
+    orientation 6 comes back 3000x4000).
+    """
+    _check_cutout_key(x_api_key)
+    import base64 as _b64
+
+    if req.image_base64:
+        try:
+            raw = _b64.b64decode(req.image_base64, validate=True)
+        except Exception:
+            raise HTTPException(400, "image_base64 is not valid base64")
+    elif req.image_url:
+        raw = _fetch_image(req.image_url)
+    else:
+        raise HTTPException(400, "pass image_url or image_base64")
+    return _cutout_png(raw, req.timeout_s)
+
+
+@app.get("/v1/imagery/cutout")
+def imagery_cutout_get(image_url: str, timeout_s: float = 180.0,
+                       x_api_key: str | None = Header(default=None)):
+    """The same, as a GET: /v1/imagery/cutout?image_url=<url-encoded URL>."""
+    _check_cutout_key(x_api_key)
+    return _cutout_png(_fetch_image(image_url), timeout_s)
+
+
 @app.post("/v1/imagery/verify", response_model=ImageryVerdict)
 def imagery_verify(req: ImageryVerifyRequest) -> ImageryVerdict:
     """Are this product's pictures finished? Writes nothing, ever.

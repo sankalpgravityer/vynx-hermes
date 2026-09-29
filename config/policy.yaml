@@ -580,7 +580,28 @@ imagery:
     #
     # Add "gemini-mask" (and "openai-mask") back to spend again. The allow-list
     # a caller passes explicitly still wins over this.
+    #
+    # THE FINE-TUNED PARSER (28 Sep 2026): list "cloth-seg-ft" here, ahead of
+    # nothing — the chain's order is fixed and puts it first — to cut with
+    # the model fine-tuned on vnyx's own raws, falling back to the stock
+    # "cloth-seg" whenever Hermes refuses its cut-out:
+    #
+    #     strategies: ["cloth-seg-ft", "cloth-seg"]
+    #
+    # It needs HERMES_CLOTH_SEG_FT_PATH pointing at the .onnx file; without it
+    # the strategy says so in the log and the stock model runs as before.
+    # Evidence and the switch-on steps: docs/DEPLOY-BACKGROUND-REMOVAL.md §10.
     strategies: ["cloth-seg"]
+    # When both fine-tuned parsers ("cloth-seg-ft" = v2, "cloth-seg-ft-backup"
+    # = v1) are refused by the leftover check but their garments agree at
+    # least this well, the v2 cut-out is accepted: the check misreads white and
+    # pale-patterned garments as backdrop. 0 disables. §11 of the deploy doc.
+    agreement_min_iou: 0.98
+    # The chain POST /v1/imagery/cutout (image URL in, PNG out) uses. Separate
+    # from `strategies`, so it changes nothing for vnyx-api's calls. gemini-mask
+    # is PAID (tried twice) and only runs when v2 and v1 are both refused and
+    # disagree.
+    url_strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
     # The long edge every pixel comparison below is made on. 448 to match
     # `readiness.cutouts.garment_check.work_width`: the two ask the same
     # question of the same garment and a different grid would give them
