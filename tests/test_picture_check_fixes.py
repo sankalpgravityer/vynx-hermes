@@ -731,6 +731,53 @@ def test_a_zoomed_incumbent_does_not_beat_a_correctly_framed_replacement():
     assert "KEPT" not in why
 
 
+def _mild_zoom(data: bytes, factor: float = 1.2, back=(235, 235, 235)) -> bytes:
+    """The cut-out zoomed IN by `factor` about the garment, same size and ratio.
+
+    BOA-006356's cut-out on file: about 1.22x, inside the old 1.25 "same
+    framing" band, so it was compared pixel for pixel and won."""
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    px = im.load()
+    xs = [x for x in range(im.width) for y in range(0, im.height, 4) if px[x, y] != back]
+    ys = [y for y in range(im.height) for x in range(0, im.width, 4) if px[x, y] != back]
+    cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+    cw, ch = im.width / factor, im.height / factor
+    x0 = min(max(0.0, cx - cw / 2), im.width - cw)
+    y0 = min(max(0.0, cy - ch / 2), im.height - ch)
+    box = (int(x0), int(y0), int(x0 + cw), int(y0 + ch))
+    assert box[0] <= min(xs) and box[2] >= max(xs) and box[1] <= min(ys) and box[3] >= max(ys), \
+        "the garment must stay inside the zoomed frame"
+    return encode(im.crop(box).resize((im.width, im.height), Image.Resampling.LANCZOS))
+
+
+def test_boa_006356_a_mild_zoom_on_file_does_not_beat_a_cut_from_the_raw():
+    """A 1.2x zoom used to sit inside the "same framing" band and win on pixel
+    count; a clean cut-out straight from the raw photograph now replaces it."""
+    correct = composited()
+    ok, why = cutout.garment_kept(_mild_zoom(correct, 1.2), correct)
+    assert ok is True, why
+    assert "same garment at" in why and "KEPT" not in why
+
+
+def test_a_mild_zoom_does_not_let_a_real_loss_through():
+    ok, why = cutout.garment_kept(_mild_zoom(composited(), 1.2), transparent("back"))
+    assert ok is False and "KEPT" in why, why
+
+
+def test_when_both_fine_tuned_cut_outs_lose_only_to_the_one_on_file_gemini_is_not_asked(
+        providers, monkeypatch):
+    """BOA-006356: after v2 and v1 each lost to the incumbent on completeness,
+    Gemini was asked twice, returned photographs, and the call ran past the
+    proxy timeout. The incumbent stands, and nothing is paid for."""
+    good = cutout_png("none")
+    _two_parsers(monkeypatch, providers["calls"], good, good)
+    monkeypatch.setattr(cutout, "garment_kept", lambda prev, out, cfg=None: (False, "33% less garment"))
+    out, err, provider = cutout.remove_background(
+        lit_sweep(), timeout_s=1, strategies=CHAIN, previous=cutout_png("none"))
+    assert out is None and provider == cutout.KEPT_EXISTING
+    assert "gemini-mask" not in providers["calls"]
+
+
 def test_a_rescale_that_also_ate_the_shirt_back_is_still_refused():
     """THE CONTROL. The scale escape must not become a way in for damage: a
     piece missing from the garment is missing from its OUTLINE too, so the
