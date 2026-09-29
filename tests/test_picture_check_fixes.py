@@ -457,6 +457,160 @@ def test_an_unknown_strategy_name_is_said_rather_than_ignored(providers):
 
 
 # --------------------------------------------------------------------------- #
+# The decision panel's sideways originals
+# --------------------------------------------------------------------------- #
+
+def sideways_jpeg(orientation: int = 6) -> bytes:
+    """A 400x300 frame tagged "rotate to view", as the decision camera writes it."""
+    img = Image.new("RGB", (400, 300), (200, 200, 200))
+    img.paste((20, 40, 160), (0, 0, 60, 300))   # a stripe on the frame's left edge
+    exif = img.getexif()
+    exif[0x0112] = orientation
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", exif=exif, quality=95)
+    return buf.getvalue()
+
+
+def test_upright_applies_the_exif_rotation():
+    out, orientation = cutout._upright(sideways_jpeg(6))
+    img = Image.open(io.BytesIO(out))
+    assert orientation == 6
+    assert img.size == (300, 400), "orientation 6 is a portrait photograph"
+    assert int(img.getexif().get(0x0112) or 1) == 1, "the tag must not be applied twice"
+    # rotate 90° clockwise: the stripe on the frame's left edge is now along the top
+    top, bottom = img.getpixel((150, 10)), img.getpixel((150, 390))
+    assert top[2] > 120 and bottom[2] < 220 and top != bottom
+
+
+def test_upright_leaves_an_untagged_photograph_byte_for_byte():
+    data = lit_sweep()
+    out, orientation = cutout._upright(data)
+    assert out is data and orientation == 1
+
+
+def test_every_strategy_is_handed_the_upright_photograph(monkeypatch):
+    """4,981 of 5,017 decision raws are stored sideways with EXIF orientation 6.
+    rembg segments them upright; the cut-out must be built on the same pixels,
+    or the mask lands on a sideways photograph."""
+    seen: list[tuple[int, int]] = []
+
+    def fake_cloth(data):
+        seen.append(Image.open(io.BytesIO(data)).size)
+        return None, "stubbed"
+
+    monkeypatch.setattr(cutout, "_cloth_seg", fake_cloth)
+    cutout.remove_background(sideways_jpeg(6), timeout_s=1)
+    assert seen == [(300, 400)]
+
+
+# --------------------------------------------------------------------------- #
+# The fine-tuned garment parser, `cloth-seg-ft`
+# --------------------------------------------------------------------------- #
+
+def test_the_fine_tuned_parser_is_off_unless_policy_names_it(providers, monkeypatch):
+    """Deploying the code changes nothing: the shipped default is still the stock model alone."""
+    monkeypatch.setattr(cutout, "_cloth_seg_ft",
+                        lambda data: pytest.fail("cloth-seg-ft ran without being named"))
+    providers["answers"]["cloth-seg"] = (None, "declined")
+    cutout.remove_background(lit_sweep(), timeout_s=1)
+    assert providers["calls"] == ["cloth-seg"]
+
+
+def test_the_fine_tuned_parser_goes_first_and_its_cut_out_is_used(providers, monkeypatch):
+    calls = providers["calls"]
+
+    def fake_ft(data):
+        calls.append("cloth-seg-ft")
+        return cutout_png("none"), None           # a clean cut-out
+    monkeypatch.setattr(cutout, "_cloth_seg_ft", fake_ft)
+    out, err, provider = cutout.remove_background(
+        lit_sweep(), timeout_s=1, strategies=["cloth-seg-ft", "cloth-seg"])
+    assert provider == "cloth-seg-ft" and out is not None, err
+    assert calls == ["cloth-seg-ft"], "the stock model is not asked when the fine-tuned one passes"
+
+
+def test_a_refused_fine_tuned_cut_out_falls_back_to_the_stock_model(providers, monkeypatch):
+    """The safety net: a cut-out Hermes refuses (here, the podium left in) is not
+    the end — the stock parser gets its turn, exactly as before."""
+    calls = providers["calls"]
+
+    def fake_ft(data):
+        calls.append("cloth-seg-ft")
+        return cutout_png("one"), None            # keeps the podium
+    monkeypatch.setattr(cutout, "_cloth_seg_ft", fake_ft)
+    providers["answers"]["cloth-seg"] = (cutout_png("none"), None)
+    out, err, provider = cutout.remove_background(
+        lit_sweep(), timeout_s=1, strategies=["cloth-seg-ft", "cloth-seg"])
+    assert provider == "cloth-seg" and out is not None, err
+    assert calls == ["cloth-seg-ft", "cloth-seg"]
+
+
+def test_an_unconfigured_fine_tuned_parser_says_so_and_steps_aside(providers, monkeypatch):
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", "")
+    providers["answers"]["cloth-seg"] = (cutout_png("none"), None)
+    out, err, provider = cutout.remove_background(
+        lit_sweep(), timeout_s=1, strategies=["cloth-seg-ft", "cloth-seg"])
+    assert provider == "cloth-seg" and out is not None, err
+
+
+def _two_parsers(monkeypatch, calls, primary, backup):
+    def fake_ft(data):
+        calls.append("cloth-seg-ft")
+        return primary, None
+
+    def fake_backup(data):
+        calls.append("cloth-seg-ft-backup")
+        return backup, None
+    monkeypatch.setattr(cutout, "_cloth_seg_ft", fake_ft)
+    monkeypatch.setattr(cutout, "_cloth_seg_ft_backup", fake_backup)
+
+
+CHAIN = ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
+
+
+def test_a_refused_v2_cut_out_falls_back_to_v1(providers, monkeypatch):
+    _two_parsers(monkeypatch, providers["calls"], cutout_png("one"), cutout_png("none"))
+    out, err, provider = cutout.remove_background(lit_sweep(), timeout_s=1, strategies=CHAIN)
+    assert provider == "cloth-seg-ft-backup" and out is not None, err
+    assert providers["calls"] == ["cloth-seg-ft", "cloth-seg-ft-backup"]
+
+
+def test_both_refused_but_agreeing_is_accepted_before_any_paid_call(providers, monkeypatch):
+    """The leftover check misreads white garments as backdrop (Midtex, 29 Sep
+    2026): when both fine-tuned parsers are refused yet land on the same
+    garment, the check is overruled, and Gemini is never asked."""
+    same = cutout_png("one")
+    _two_parsers(monkeypatch, providers["calls"], same, same)
+    out, err, provider = cutout.remove_background(lit_sweep(), timeout_s=1, strategies=CHAIN)
+    assert provider == cutout.AGREED and out == same, err
+    assert "gemini-mask" not in providers["calls"]
+
+
+def test_both_refused_and_disagreeing_goes_on_to_gemini(providers, monkeypatch):
+    _two_parsers(monkeypatch, providers["calls"], cutout_png("one"), cutout_png("broken"))
+    providers["answers"]["gemini-mask"] = (cutout_png("none"), None)
+    out, err, provider = cutout.remove_background(lit_sweep(), timeout_s=1, strategies=CHAIN)
+    assert provider == "gemini-mask" and out is not None, err
+    assert providers["calls"][:3] == ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
+
+
+def test_agreement_can_be_switched_off(providers, monkeypatch):
+    same = cutout_png("one")
+    _two_parsers(monkeypatch, providers["calls"], same, same)
+    base = cutout.config()
+    monkeypatch.setattr(cutout, "config", lambda pol=None: {**base, "agreement_min_iou": 0})
+    out, _err, provider = cutout.remove_background(lit_sweep(), timeout_s=1, strategies=CHAIN)
+    assert provider != cutout.AGREED
+    assert "gemini-mask" in providers["calls"]
+
+
+def test_a_missing_model_file_is_reported_not_crashed_on(monkeypatch, tmp_path):
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", str(tmp_path / "gone.onnx"))
+    out, err = cutout._cloth_seg_ft(b"irrelevant")
+    assert out is None and "missing" in err
+
+
+# --------------------------------------------------------------------------- #
 # Item 8 — a re-matte that loses garment is never stored
 # --------------------------------------------------------------------------- #
 
