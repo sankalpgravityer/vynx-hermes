@@ -180,7 +180,15 @@ DEFAULTS: dict[str, Any] = {
     # resized to one grid. 1.25 is a quarter larger in each direction, well
     # above the few percent two segmenters differ by and well below the 1.7x
     # that pair measured.
-    "replace_same_scale_max": 1.25,
+    #
+    # 1.06, NOT 1.25 (29 Sep 2026, BOA-006356). The cut-out on file was a mild
+    # zoom — about 1.22x linear, 1.49x the garment pixels — which sat INSIDE
+    # 1.25, so the pair was treated as framed alike and counted pixel for
+    # pixel: both fine-tuned cut-outs from the raw photograph read as "33% less
+    # garment" and the zoom was KEPT. Two honest cut-outs of one photograph
+    # differ by about 1% (0.995, measured below), so 1.06 is still six times
+    # that noise; anything larger is a reframing and is compared by SHAPE.
+    "replace_same_scale_max": 1.06,
     # HOW EQUALLY THE TWO AXES MUST SCALE to count as a reframing rather than a
     # loss. A zoom moves both alike; a mask that ate the shirt back shortens the
     # box on one axis only. Measured: reframings 0.973 and 0.990, losses 0.561
@@ -1922,6 +1930,17 @@ def remove_background(
             if out is not None:
                 log.info("bg-removal %s: accepted despite the leftover check (%s)", AGREED, why)
                 return out, None, AGREED
+            # BOTH MADE A GOOD CUT-OUT AND BOTH LOST ONLY TO THE ONE ON FILE.
+            # A paid strategy is asked the same "is it as complete" question
+            # against the same incumbent and cannot answer it better — on
+            # BOA-006356 it returned two photographs instead of masks, ~30 s
+            # and two billed calls, which pushed the whole call past vnyx-api's
+            # proxy timeout (504). The existing cut-out stands; say so now.
+            if all(any(k.startswith(f + "#") for k in kept_existing) for f in FT):
+                log.info("bg-removal: both fine-tuned cut-outs lost only to the cut-out on file; "
+                         "not asking a paid strategy")
+                return None, ("the existing cut-out was KEPT: no replacement was as complete as it "
+                              "is (" + "; ".join(attempts) + ")"), KEPT_EXISTING
 
     if kept_existing:
         # NOT A FAILURE, AND IT MUST NOT BE FILED AS ONE. Every candidate that
