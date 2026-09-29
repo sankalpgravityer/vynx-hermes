@@ -304,10 +304,26 @@ def test_no_leftover_strategy_means_do_not_re_cut():
     assert cutout.rematte_strategies("collar cut away", cutout.config(off)) is None
 
 
-def test_the_shipped_default_spends_nothing_on_a_leftover():
-    """What actually ships: no paid strategy, so a leftover is left alone."""
+def test_the_shipped_default_re_cuts_a_leftover_with_the_fine_tuned_chain():
+    """What ships since 29 Sep 2026: the default chain starts with the
+    fine-tuned parser, which was trained on podiums and stands, so a leftover is
+    re-cut with the DEFAULT chain (None) rather than left alone ([])."""
     assert cutout.config(None)["leftover_strategies"] == []
-    assert cutout.rematte_strategies("stand visible at bottom") == []
+    assert cutout.config(None)["strategies"][0] == "cloth-seg-ft"
+    assert cutout.rematte_strategies("stand visible at bottom") is None
+
+
+def test_with_only_the_stock_parser_a_leftover_is_still_left_alone():
+    """The old reasoning still holds for the stock parser: re-running it on a
+    podium returns the same podium, so with nothing else configured, skip."""
+    stock = {"imagery": {"cutout": {"strategies": ["cloth-seg"], "leftover_strategies": []}}}
+    assert cutout.rematte_strategies("stand visible at bottom", cutout.config(stock)) == []
+
+
+def test_named_leftover_strategies_still_win_over_the_default_chain():
+    funded = {"imagery": {"cutout": {"strategies": ["cloth-seg-ft", "cloth-seg-ft-backup"],
+                                     "leftover_strategies": ["gemini-mask"]}}}
+    assert cutout.rematte_strategies("stand visible", cutout.config(funded)) == ["gemini-mask"]
 
 
 def test_the_intersection_keeps_only_what_both_masks_kept():
@@ -507,13 +523,29 @@ def test_every_strategy_is_handed_the_upright_photograph(monkeypatch):
 # The fine-tuned garment parser, `cloth-seg-ft`
 # --------------------------------------------------------------------------- #
 
-def test_the_fine_tuned_parser_is_off_unless_policy_names_it(providers, monkeypatch):
-    """Deploying the code changes nothing: the shipped default is still the stock model alone."""
+def test_without_the_model_files_the_policy_chain_is_the_free_stock_parser(providers, monkeypatch):
+    """The shipped policy names the fine-tuned parsers and a PAID strategy
+    after them. On a machine without the model files that chain would skip
+    both and pay for every photo; the stock parser runs alone instead."""
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", "")
+    monkeypatch.setattr(cutout, "_CLOTH_FT_BACKUP_PATH", "")
     monkeypatch.setattr(cutout, "_cloth_seg_ft",
-                        lambda data: pytest.fail("cloth-seg-ft ran without being named"))
+                        lambda data: pytest.fail("cloth-seg-ft ran without a model file"))
     providers["answers"]["cloth-seg"] = (None, "declined")
     cutout.remove_background(lit_sweep(), timeout_s=1)
-    assert providers["calls"] == ["cloth-seg"]
+    assert providers["calls"] == ["cloth-seg"], "and no paid call"
+
+
+def test_with_the_model_files_the_policy_chain_is_v2_v1_then_gemini(providers, monkeypatch, tmp_path):
+    """What auto-approval's matte uses once the models are installed."""
+    model = tmp_path / "cloth_seg_ft_v2.onnx"
+    model.write_bytes(b"x")
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", str(model))
+    _two_parsers(monkeypatch, providers["calls"], cutout_png("one"), cutout_png("broken"))
+    providers["answers"]["gemini-mask"] = (cutout_png("none"), None)
+    out, err, provider = cutout.remove_background(lit_sweep(), timeout_s=1)
+    assert provider == "gemini-mask" and out is not None, err
+    assert providers["calls"][:3] == ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
 
 
 def test_the_fine_tuned_parser_goes_first_and_its_cut_out_is_used(providers, monkeypatch):

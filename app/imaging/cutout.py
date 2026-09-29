@@ -531,6 +531,11 @@ def _cloth_seg_ft(data: bytes) -> tuple[bytes | None, str | None]:
     return _cloth_seg(data, _CLOTH_FT_PATH)
 
 
+def _ft_available() -> bool:
+    """Is at least one fine-tuned model file configured and present on this machine?"""
+    return any(p and os.path.isfile(p) for p in (_CLOTH_FT_PATH, _CLOTH_FT_BACKUP_PATH))
+
+
 def _cloth_seg_ft_backup(data: bytes) -> tuple[bytes | None, str | None]:
     """The previous fine-tune, when one is configured. Never raises."""
     if not _CLOTH_FT_BACKUP_PATH:
@@ -1628,8 +1633,22 @@ def rematte_strategies(reason: str, cfg: dict[str, Any] | None = None) -> list[s
     #
     # `or None` used to collapse the two, so emptying `leftover_strategies` to
     # stop the paid calls would have quietly bought a useless free one instead.
-    return [n for n in list((cfg or config()).get("leftover_strategies") or [])
-            if n in STRATEGY_NAMES]
+    cfg = cfg or config()
+    funded = [n for n in list(cfg.get("leftover_strategies") or []) if n in STRATEGY_NAMES]
+    if funded:
+        return funded
+    # THE FINE-TUNED PARSER CHANGES THE ANSWER (29 Sep 2026). "Re-cutting a
+    # podium with cloth-seg returns the same podium" was true of the stock
+    # parser; the fine-tuned one was trained on exactly these podiums, stands
+    # and hangers (on the fix queue it cut 36% of the photos the stock one was
+    # refused on, 53% of photobooth). So when the default chain starts with it,
+    # a leftover is re-cut with the DEFAULT chain — v2, v1, their agreement,
+    # then whatever paid strategy the chain names — instead of being left alone.
+    # Decided from the policy alone: this runs in the worker, and the parser
+    # itself runs in the API process, which is the one that has the model files.
+    if "cloth-seg-ft" in [str(s) for s in (cfg.get("strategies") or [])]:
+        return None
+    return []
 
 
 def remove_background(
@@ -1712,6 +1731,17 @@ def remove_background(
     # accidentally disable background removal altogether.
     if strategies is None:
         strategies = [str(s) for s in (cfg.get("strategies") or [])] or None
+        # THE POLICY NAMES THE FINE-TUNED PARSERS BUT THIS MACHINE HAS NEITHER
+        # (no HERMES_CLOTH_SEG_FT_PATH, or the file is missing): a laptop, a
+        # test box, a worker deployed without the models. Running the policy's
+        # chain as written would skip both and send EVERY photo to the paid
+        # strategy after them. So the free stock parser stands in, alone, and
+        # the log says why.
+        ft_named = strategies and any(s in ("cloth-seg-ft", "cloth-seg-ft-backup") for s in strategies)
+        if ft_named and not _ft_available():
+            log.warning("bg-removal: the policy names the fine-tuned cloth-seg but no model file is "
+                        "configured here (HERMES_CLOTH_SEG_FT_PATH); using the stock cloth-seg alone")
+            strategies = ["cloth-seg"]
 
     wanted = {str(s) for s in strategies} if strategies else None
     banned = {str(s) for s in (skip or [])}

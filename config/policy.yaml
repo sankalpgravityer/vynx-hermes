@@ -591,7 +591,14 @@ imagery:
     # It needs HERMES_CLOTH_SEG_FT_PATH pointing at the .onnx file; without it
     # the strategy says so in the log and the stock model runs as before.
     # Evidence and the switch-on steps: docs/DEPLOY-BACKGROUND-REMOVAL.md §10.
-    strategies: ["cloth-seg"]
+    #
+    # SWITCHED ON 29 Sep 2026: v2, then v1 (with the agreement rule below), then
+    # Gemini's mask (PAID, tried twice) only when both are refused and disagree.
+    # This is what auto-approval's matte and re-matte use (through vnyx-api's
+    # backfill-bg-removal --provider hermes). On a machine without the model
+    # files the stock "cloth-seg" runs alone instead, and nothing is paid for.
+    # Back to the old behaviour: strategies: ["cloth-seg"]
+    strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
     # When both fine-tuned parsers ("cloth-seg-ft" = v2, "cloth-seg-ft-backup"
     # = v1) are refused by the leftover check but their garments agree at
     # least this well, the v2 cut-out is accepted: the check misreads white and
@@ -665,6 +672,11 @@ imagery:
     # That is a real loss, taken deliberately: those cut-outs stay flagged and
     # unrepaired rather than costing six paid calls each to maybe improve. Put
     # "gemini-mask" back to spend again.
+    #
+    # SINCE 29 Sep 2026: empty no longer means "leave it alone" when
+    # `strategies` above starts with "cloth-seg-ft". The fine-tuned parser was
+    # trained on these podiums and stands, so a leftover is re-cut with the
+    # default chain instead. Names listed here still win over that.
     leftover_strategies: []
     intersect_cloth: true
 
