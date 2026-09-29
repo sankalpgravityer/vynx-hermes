@@ -437,16 +437,46 @@ def test_a_broken_face_re_renders_only_the_lead(wired):
     assert step(r, "regen")["note"].startswith("regenerated AI_FRONT (IMAGE_QUALITY")
 
 
-def test_refused_twice_holds_with_the_second_verdict_and_spends_the_budget_once(wired):
+def test_refused_every_round_holds_with_the_last_verdict_and_stops_at_the_budget(wired):
+    """regen_rounds: 3 (29 Sep 2026). Refused on every look: three paid
+    re-renders, then the product holds — never a fourth."""
     wired["verdicts"][:] = [BUILD_BAD, BUILD_BAD]
     r = _repair(apply=True, approve=True)
-    assert len(wired["calls"]["imagery"]) == 1                # one paid retry, never a loop
-    assert "REFUSED AGAIN" in step(r, "regen")["note"]
+    assert len(wired["calls"]["imagery"]) == 3                # the budget, and not one more
+    note = step(r, "regen")["note"]
+    assert "REFUSED AGAIN" in note and "round 3:" in note
+    assert "the budget is spent (3 regenerations)" in note
+    assert [x["round"] for x in r["regeneration"]["rounds"]] == [1, 2, 3]
     assert r["approval"]["outcome"] == "gate_blocked"
     assert r["approval"]["gate_code"] == "BODY_SIZE_MISMATCH"
     assert wired["calls"]["approve"] == [{"apply": False}]
     v = classify(r)
     assert (v.status, v.outcome) == ("HELD_FOR_HUMAN", "BODY_SIZE_MISMATCH")
+
+
+def test_regen_rounds_1_is_the_old_single_retry(wired, monkeypatch):
+    one = copy.deepcopy(POL)
+    one["readiness"]["regen_rounds"] = 1
+    monkeypatch.setattr(rp, "policy", lambda: one)
+    wired["verdicts"][:] = [BUILD_BAD, BUILD_BAD]
+    r = _repair(apply=True, approve=True)
+    assert len(wired["calls"]["imagery"]) == 1                # one paid retry, never a loop
+    note = step(r, "regen")["note"]
+    assert "REFUSED AGAIN" in note and "the budget is spent (1 regeneration)" in note
+    assert r["approval"]["outcome"] == "gate_blocked"
+
+
+def test_the_brain_turning_it_off_still_means_no_regeneration(wired, monkeypatch):
+    """The Brain sends max_regenerations_per_run 0 when the toggle is off;
+    regen_rounds does not switch it back on."""
+    off = copy.deepcopy(POL)
+    off["readiness"]["max_regenerations_per_run"] = 0
+    off["readiness"]["regen_rounds"] = 3
+    monkeypatch.setattr(rp, "policy", lambda: off)
+    wired["verdicts"][:] = [BUILD_BAD, OK]
+    r = _repair(apply=True)
+    assert wired["calls"]["imagery"] == []
+    assert "max_regenerations_per_run" in step(r, "regen")["why"]
 
 
 def test_a_dry_run_says_what_it_would_re_render_and_keeps_the_first_verdict(wired):
@@ -549,12 +579,33 @@ def test_a_render_the_photo_audit_calls_defective_is_re_rendered_alone_and_judge
     assert calls["n"] == 2 and wired["calls"]["judge"] == 2   # both checks looked again, once
 
 
-def test_a_render_defect_refused_twice_holds_under_its_own_code(wired, monkeypatch):
+CLOSEUP_BAD = GateVerdict("regen", "RENDER_DEFECT",
+                           ["RENDER DEFECT — AI_CLOSEUP render: body dissolves into blur at bottom"],
+                           bad_views=["AI_CLOSEUP"], lead_view="FRONT")
+
+
+def test_boa_006400_the_second_look_names_another_render_and_round_2_fixes_it(wired, monkeypatch):
+    """BOA-006400, 29 Sep 2026: round 1 re-renders AI_FRONT_34, the second look
+    then refuses AI_CLOSEUP. With one round the product held; round 2 re-renders
+    AI_CLOSEUP — that view alone — and the third look passes."""
+    _photo_sequence(monkeypatch, PHOTO_BAD, CLOSEUP_BAD, PHOTO_OK)
+    r = _repair(apply=True, approve=True)
+    renders = [a[a.index("--views") + 1] for a in wired["calls"]["imagery"]]
+    assert renders == ["AI_FRONT_34", "AI_CLOSEUP"]
+    note = step(r, "regen")["note"]
+    assert note.startswith("regenerated AI_FRONT_34") and "round 2: regenerated AI_CLOSEUP" in note
+    assert "photo audit again: passed" in note and "budget is spent" not in note
+    assert r["photos"]["action"] == "ok"
+    assert r["approval"]["outcome"] == "would_approve"
+    assert r["regeneration"]["views"] == ["AI_FRONT_34", "AI_CLOSEUP"]
+
+
+def test_a_render_defect_refused_every_round_holds_under_its_own_code(wired, monkeypatch):
     _photo_sequence(monkeypatch, PHOTO_BAD, PHOTO_BAD)
     r = _repair(apply=True, approve=True)
-    assert len(wired["calls"]["imagery"]) == 1                # one paid retry, never a loop
+    assert len(wired["calls"]["imagery"]) == 3                # the budget, and not one more
     note = step(r, "regen")["note"]
-    assert "photo audit REFUSED AGAIN" in note and "the budget is spent" in note
+    assert "photo audit REFUSED AGAIN" in note and "the budget is spent (3 regenerations)" in note
     assert r["approval"]["outcome"] == "gate_blocked" and r["approval"]["gate_code"] == "RENDER_DEFECT"
     assert wired["calls"]["approve"] == [{"apply": False}]
     assert classify(r).outcome == "RENDER_DEFECT"

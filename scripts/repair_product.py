@@ -2153,17 +2153,47 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         }
 
     def _regen() -> str:
-        nonlocal gate_verdict, photo_verdict
-        from app.imaging import photo_audit
+        """Up to `budget` rounds: re-render what was refused, look again, repeat.
 
+        ROUNDS, 29 Sep 2026. One round fixed one refusal and then held the
+        product on the next: BOA-006400's photo audit refused AI_FRONT_34, the
+        round re-rendered it, and the second look then named AI_CLOSEUP — with
+        the budget spent. Each round re-plans from the verdicts it just got, so
+        round 2 re-renders what round 1's second look refused. It stops the
+        moment nothing is refused, and never runs past the budget.
+        """
         plan = _regen_plan()
-        views = plan["views"]
-        regeneration.update({"attempted": True, "views": views, "code": plan["code"],
-                             "asked_by": plan["askers"],
+        regeneration.update({"attempted": True, "views": [], "code": plan["code"],
+                             "asked_by": plan["askers"], "rounds": [],
                              "before": gate_verdict.as_dict() if gate_verdict is not None else None,
                              "photos_before": photo_verdict.as_dict() if photo_verdict is not None else None})
         regen_report["attempted"] = True
-        regen_report["views"] = views
+        regen_report["views"] = []
+        notes: list[str] = []
+        refused, n = False, 0
+        for n in range(1, budget + 1):
+            note, refused = _regen_round(plan)
+            notes.append(note if n == 1 else f"round {n}: {note}")
+            regeneration["rounds"].append({"round": n, "views": plan["views"], "refused_again": refused})
+            if not apply or not refused:
+                break
+            plan = _regen_plan()
+            if not plan["views"]:
+                break
+        text = " | ".join(notes)
+        if refused and apply:
+            text += (f"; the budget is spent ({n} regeneration{'s' if n != 1 else ''}), "
+                     "the product holds")
+        return text
+
+    def _regen_round(plan: dict[str, Any]) -> tuple[str, bool]:
+        """One re-render of `plan["views"]` and the second look. (note, refused again)."""
+        nonlocal gate_verdict, photo_verdict
+        from app.imaging import photo_audit
+
+        views = plan["views"]
+        regeneration["views"] = regeneration["views"] + [v for v in views if v not in regeneration["views"]]
+        regen_report["views"] = regen_report["views"] + [v for v in views if v not in regen_report["views"]]
         ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
                               [*common, *live, "--views", ",".join(views)],
                               timeout_s=1800, quiet=quiet)
@@ -2177,7 +2207,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             # Nothing was rendered, so there is nothing new to judge. The first
             # verdicts stand — a dry run reports what was refused and what the
             # live run would re-render.
-            return f"would regenerate {scope} ({why}); the checks would judge the new set"
+            return f"would regenerate {scope} ({why}); the checks would judge the new set", False
 
         note = f"regenerated {scope} ({why})"
         if regen_report["failed"]:
@@ -2221,11 +2251,17 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 outcomes.append(f"photo audit again: {photo_audit.summary(second_p)}")
 
         note += " — " + "; ".join(outcomes)
-        if any("REFUSED AGAIN" in o for o in outcomes):
-            note += "; the budget is spent, the product holds"
-        return note
+        return note, any("REFUSED AGAIN" in o for o in outcomes)
 
+    # THE BUDGET. `max_regenerations_per_run` is what the Brain sends (vnyx-api
+    # checks.ts: 1 when "Re-render what a check refuses" is on, 0 when off), so
+    # it is read as ON/OFF; `regen_rounds` (Hermes policy) is how many rounds
+    # "on" buys. Each round is a paid render of the refused views plus a second
+    # photo audit. regen_rounds: 1 is the old one-retry behaviour.
     budget = int(_rd.config(policy()).get("max_regenerations_per_run") or 0)
+    rounds = int(_rd.config(policy()).get("regen_rounds") or 0)
+    if budget >= 1 and rounds > budget:
+        budget = rounds
     regen_plan = _regen_plan()
     if not regen_plan["askers"]:
         regen_why = "the gate did not ask for a re-render, nor did the photo audit"
