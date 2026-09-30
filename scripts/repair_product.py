@@ -270,6 +270,9 @@ def vnyx_api_url() -> str | None:
 # means there was nobody to ask because the steps are spawned locally.
 _LOCAL_TRANSPORT = "*local*"
 _REMOTE_OPTIONS: set[str] | None = None
+# Whether the step runner can run a step in the background and be polled (the
+# ping's `asyncSteps`). None = not asked; False = asked, and it cannot.
+_REMOTE_ASYNC: bool | None = None
 
 
 def remote_options() -> set[str]:
@@ -294,7 +297,7 @@ def remote_options() -> set[str]:
     Never raises: a ping that fails answers "nothing", which is the same
     conservative branch as an old server.
     """
-    global _REMOTE_OPTIONS
+    global _REMOTE_OPTIONS, _REMOTE_ASYNC
     if _REMOTE_OPTIONS is not None:
         return _REMOTE_OPTIONS
 
@@ -319,9 +322,22 @@ def remote_options() -> set[str]:
         )
         body = r.json() if r.status_code == 200 else {}
         _REMOTE_OPTIONS = {str(o) for o in (body.get("options") or [])}
+        _REMOTE_ASYNC = body.get("asyncSteps") is True
     except Exception:  # noqa: BLE001 — a probe that cannot run is not a failure
         _REMOTE_OPTIONS = set()
+        _REMOTE_ASYNC = False
     return _REMOTE_OPTIONS
+
+
+def remote_async() -> bool:
+    """Can the step runner run a step in the background and be polled?
+
+    Only on POSITIVE evidence — the ping said `asyncSteps: true`. Anything else
+    (an older vnyx-api, a ping that failed, the local transport) is the
+    synchronous call, exactly as before.
+    """
+    remote_options()
+    return _REMOTE_ASYNC is True
 
 
 def remote_supports(*options: str) -> bool:
@@ -467,6 +483,9 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
         "options": options,
     }
 
+    if remote_async():
+        return _run_remote_async(base, secret, script, payload, timeout_s=timeout_s, quiet=quiet)
+
     try:
         # A little longer than the step's own budget, so the server's timeout
         # fires first and we get its output rather than a bare read timeout.
@@ -484,7 +503,12 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
             f"{script}: vnyx-api returned {resp.status_code} "
             f"{resp.text[:300]}")
 
-    body = resp.json()
+    return _step_result(resp.json(), script, timeout_s=timeout_s, quiet=quiet)
+
+
+def _step_result(body: dict[str, Any], script: str, *, timeout_s: int,
+                 quiet: bool) -> tuple[bool, str, dict[str, Any] | None]:
+    """A finished step's response body -> (ok, output, results). Shared by both calls."""
     out = str(body.get("output") or "")
     if not quiet:
         for line in out.splitlines():
@@ -493,6 +517,75 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
     if body.get("timedOut"):
         raise StepFailed(f"{script} timed out after {timeout_s}s")
     return bool(body.get("ok")), out, body.get("results")
+
+
+# How often a background step is asked "done yet?", and how many consecutive
+# failed polls (network blips, a 502/504 from the proxy) are tolerated before
+# the step is given up on. Each poll is a sub-second request.
+STEP_POLL_S = float(os.getenv("AUTO_APPROVAL_STEP_POLL_S", "5"))
+STEP_POLL_MAX_ERRORS = 12
+
+
+def _run_remote_async(base: str, secret: str, script: str, payload: dict[str, Any], *,
+                      timeout_s: int, quiet: bool) -> tuple[bool, str, dict[str, Any] | None]:
+    """Start the step in the background and poll it to completion.
+
+    WHY (30 Sep 2026). The step used to be one request held open until the
+    script finished, and the proxy in front of vnyx-api closes any request at
+    ~60 s with a 504 error page — so a matte that asks two fine-tuned
+    segmenters (~50-80 s), a regeneration round, or a render (up to 30 min)
+    failed while the script often ran on with nobody listening. Here no request
+    lasts longer than a second or two, whatever the step takes.
+    """
+    import time as _time
+
+    import httpx
+
+    headers = {"x-internal-secret": secret}
+    try:
+        resp = httpx.post(f"{base}/internal/auto-approval/step", json={**payload, "async": True},
+                          headers=headers, timeout=httpx.Timeout(30, connect=15))
+    except httpx.HTTPError as exc:
+        raise StepFailed(f"{script}: cannot reach vnyx-api ({exc})") from None
+    if resp.status_code not in (200, 202):
+        raise StepFailed(f"{script}: vnyx-api returned {resp.status_code} {resp.text[:300]}")
+    job = (resp.json() or {}).get("jobId")
+    if not job:
+        raise StepFailed(f"{script}: vnyx-api started no job ({resp.text[:200]})")
+
+    # The server kills the script at its own timeout; allow for that plus slack,
+    # so a step the server timed out is reported with the server's output.
+    deadline = _time.monotonic() + timeout_s + 120
+    errors = 0
+    while True:
+        _time.sleep(STEP_POLL_S)
+        try:
+            r = httpx.get(f"{base}/internal/auto-approval/step/{job}", headers=headers,
+                          timeout=httpx.Timeout(30, connect=15))
+        except httpx.HTTPError as exc:
+            errors += 1
+            if errors >= STEP_POLL_MAX_ERRORS:
+                raise StepFailed(f"{script}: lost contact with vnyx-api while the step ran "
+                                 f"(job {job}: {exc})") from None
+            continue
+        if r.status_code == 404:
+            raise StepFailed(f"{script}: the step's job {job} is gone — vnyx-api restarted "
+                             f"while it ran, or it expired")
+        if r.status_code != 200:
+            errors += 1
+            if errors >= STEP_POLL_MAX_ERRORS:
+                raise StepFailed(f"{script}: polling job {job} failed: "
+                                 f"{r.status_code} {r.text[:200]}")
+            continue
+        errors = 0
+        body = r.json() or {}
+        state = body.get("state")
+        if state == "done":
+            return _step_result(body, script, timeout_s=timeout_s, quiet=quiet)
+        if state == "error":
+            raise StepFailed(f"{script}: {body.get('error') or 'the step failed'}")
+        if _time.monotonic() > deadline:
+            raise StepFailed(f"{script}: still running after {timeout_s + 120}s (job {job})")
 
 
 def run_step(vnyx_api: Path, script: str, args: list[str], *,
