@@ -59,6 +59,15 @@ DEFAULTS: dict[str, Any] = {
     "speck_max": 0.005,
     # Pixels of the garment's soft edge kept outside the hard box.
     "edge_pad_px": 3,
+    # --- an OPAQUE cut-out (the one already on file) ------------------------
+    # Its backdrop is the four corners' colour when they agree this closely;
+    # a pixel this far (RGB) from it is garment; and the band round the
+    # garment's box may hold at most this share of garment before the edge
+    # counts as unclear and nothing is cropped.
+    "corner_fraction": 0.04,
+    "corner_agreement": 12,
+    "backdrop_tolerance": 24,
+    "edge_clear_max": 0.005,
     # Already framed: nothing is resampled a second time.
     "same_scale": 0.01,
     "same_offset": 0.005,
@@ -120,13 +129,42 @@ def _garment_box(alpha: Any, cfg: dict[str, Any]) -> tuple[int, int, int, int] |
             max(b[2] for b in boxes), max(b[3] for b in boxes))
 
 
-def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bytes, dict[str, Any]]:
+def _flat_backdrop(rgb: Any, cfg: dict[str, Any]) -> Any:
+    """The colour of a flat, painted backdrop from the four corners, or None.
+
+    A stored cut-out is opaque: vnyx-api flattens it onto the tenant's
+    backdrop. That backdrop is one colour by construction, so all four corners
+    agree; a photograph's wall does not, and then there is no backdrop to find
+    the garment against.
+    """
+    import numpy as np
+
+    h, w = rgb.shape[:2]
+    k = max(2, int(round(min(w, h) * float(cfg.get("corner_fraction") or 0.04))))
+    patches = [rgb[:k, :k], rgb[:k, -k:], rgb[-k:, :k], rgb[-k:, -k:]]
+    medians = np.array([np.median(p.reshape(-1, 3), axis=0) for p in patches])
+    colour = np.median(medians, axis=0)
+    if np.abs(medians - colour).max() > float(cfg.get("corner_agreement") or 12):
+        return None
+    return colour
+
+
+def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None, *,
+                 canvas: tuple[int, int] | None = None) -> tuple[bytes, dict[str, Any]]:
     """The cut-out with its garment scaled to the standard and centred.
 
     Returns (png, info). The canvas is the input's — the photograph's size and
-    ratio, so the canvas check still holds. The input is returned untouched,
-    with `framed: False` and a `note`, when it has no alpha to find the garment
-    by (an opaque picture), no garment, or is already framed.
+    ratio, so the canvas check still holds — or `canvas` when given: a stored
+    cut-out on a smaller canvas (896x1195 for a 3000x4000 photograph) is
+    framed onto the photograph's size, or vnyx-api would pad it back out and
+    shrink the garment again.
+
+    TWO KINDS OF INPUT. A transparent cut-out (a segmenter's) is located by its
+    alpha. An OPAQUE one — the cut-out already on file, flattened onto the
+    tenant's backdrop — by that backdrop's colour, and is framed onto a canvas
+    of the same colour. The input is returned untouched, with `framed: False`
+    and a `note`, when the garment cannot be located safely, or when it is
+    already framed.
     """
     import numpy as np
     from PIL import Image
@@ -138,16 +176,63 @@ def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bytes, 
         im = im.convert("RGBA")
     except Exception as exc:  # noqa: BLE001
         return png, {"framed": False, "note": f"could not decode ({exc.__class__.__name__})"}
-    W, H = im.size
     alpha = np.asarray(im.getchannel("A"))
+    backdrop = None
     if float((alpha == 0).mean()) < 0.02:
-        # Every stored cut-out that went through a compositor is opaque; there is
-        # no alpha to say where the garment is, and guessing from colour is the
-        # judge's job (cutouts.garment_mask), not something to crop by.
-        return png, {"framed": False, "note": "no transparency — the garment cannot be located"}
+        rgb = np.asarray(im.convert("RGB")).astype(np.float32)
+        backdrop = _flat_backdrop(rgb, cfg)
+        if backdrop is None:
+            return png, {"framed": False,
+                         "note": "opaque, and its corners are not one flat backdrop — "
+                                 "the garment cannot be located"}
+        far = np.sqrt(((rgb - backdrop) ** 2).sum(axis=2)) > float(cfg.get("backdrop_tolerance") or 24)
+        try:
+            import cv2
+
+            far = cv2.morphologyEx(far.astype(np.uint8), cv2.MORPH_OPEN,
+                                   np.ones((3, 3), np.uint8)).astype(bool)
+        except Exception:  # noqa: BLE001
+            pass
+        alpha = np.where(far, 255, 0).astype(np.uint8)
+
+    # Onto the requested canvas first (fitted inside, centred), so everything
+    # below works on the photograph's own size.
+    resized = False
+    if canvas and tuple(canvas) != im.size:
+        CW, CH = int(canvas[0]), int(canvas[1])
+        s = min(CW / im.width, CH / im.height)
+        nw, nh = max(1, int(round(im.width * s))), max(1, int(round(im.height * s)))
+        fill_rgba = ((255, 255, 255, 0) if backdrop is None
+                     else (*[int(v) for v in backdrop], 255))
+        base = Image.new("RGBA", (CW, CH), fill_rgba)
+        base.paste(im.resize((nw, nh), Image.Resampling.LANCZOS), ((CW - nw) // 2, (CH - nh) // 2))
+        a = Image.new("L", (CW, CH), 0)
+        a.paste(Image.fromarray(alpha).resize((nw, nh), Image.Resampling.BILINEAR),
+                ((CW - nw) // 2, (CH - nh) // 2))
+        im, alpha, resized = base, np.asarray(a), True
+    W, H = im.size
+
     box = _garment_box(alpha, cfg)
     if box is None:
         return png, {"framed": False, "note": "no garment in the cut-out"}
+    if backdrop is not None:
+        # CROPPING BY COLOUR MUST NOT CUT THE GARMENT. A white shirt on a white
+        # backdrop reads as backdrop at its edges, and a box drawn round what
+        # DID separate would slice the rest off. So the band just outside the
+        # box has to be backdrop; if it is not, the edge is not clear and the
+        # picture is left as it is.
+        x0, y0, x1, y1 = box
+        m = max(2, int(round(min(W, H) * 0.02)))
+        ring = np.zeros((H, W), bool)
+        ring[max(0, y0 - m):min(H, y1 + m), max(0, x0 - m):min(W, x1 + m)] = True
+        ring[y0:y1, x0:x1] = False
+        # Solid garment only: a resized mask has a soft, one-pixel edge that
+        # is the garment's own outline, not a piece beyond it.
+        solid = alpha >= int(cfg.get("alpha_threshold") or 128)
+        if ring.any() and float(solid[ring].mean()) > float(cfg.get("edge_clear_max") or 0.005):
+            return png, {"framed": False,
+                         "note": "the garment's edge is not clear against the backdrop — "
+                                 "not cropped, so none of it is cut off"}
     # The HARD box decides the scale and the centre; the crop takes a few pixels
     # more so the garment's soft edge comes along.
     x0, y0, x1, y1 = box
@@ -161,15 +246,18 @@ def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bytes, 
         "placed_at": [round(gl), round(gt), round(gl + bw * scale), round(gt + bh * scale)],
         "fill_w": round(bw * scale / W, 4), "fill_h": round(bh * scale / H, 4),
         "capped": scale >= float(cfg.get("max_scale") or 2.5) - 1e-6,
+        "source": "alpha" if backdrop is None else "backdrop",
     }
 
-    if (abs(scale - 1.0) <= float(cfg.get("same_scale") or 0.0)
+    if not resized and (abs(scale - 1.0) <= float(cfg.get("same_scale") or 0.0)
             and abs(gl - x0) <= max(1.0, float(cfg.get("same_offset") or 0.0) * W)
             and abs(gt - y0) <= max(1.0, float(cfg.get("same_offset") or 0.0) * H)):
         info.update(framed=False, note="already framed")
         return png, info
 
-    pad = int(cfg.get("edge_pad_px") or 0)
+    # Opaque: take the whole clear band round the box (it is backdrop — checked
+    # above), so a faint shadow at the hem comes along.
+    pad = int(cfg.get("edge_pad_px") or 0) if backdrop is None else m
     px0, py0 = max(0, x0 - pad), max(0, y0 - pad)
     px1, py1 = min(W, x1 + pad), min(H, y1 + pad)
     crop = im.crop((px0, py0, px1, py1))
@@ -181,16 +269,22 @@ def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bytes, 
     # colour must not bleed into the garment's edge as a dark fringe.
     resample = Image.Resampling.LANCZOS
     rgb = crop.convert("RGB").resize((nw, nh), resample)
-    a = crop.getchannel("A").resize((nw, nh), resample)
-    garment = Image.merge("RGBA", (*rgb.split(), a))
-    canvas = Image.new("RGBA", (W, H), (255, 255, 255, 0))
-    # Only the soft-edge pad can reach past the canvas; paste clips it.
-    canvas.paste(garment, (left, top))
-    arr = np.asarray(canvas).copy()
-    arr[arr[:, :, 3] == 0] = (255, 255, 255, 0)
-
     buf = io.BytesIO()
-    Image.fromarray(arr, "RGBA").save(buf, format="PNG", optimize=True)
+    if backdrop is not None:
+        # Opaque: the crop carries its own backdrop, laid on a canvas of the
+        # same colour, so the join cannot be seen.
+        out_im = Image.new("RGB", (W, H), tuple(int(v) for v in backdrop))
+        out_im.paste(rgb, (left, top))
+        out_im.save(buf, format="PNG", optimize=True)
+    else:
+        a = crop.getchannel("A").resize((nw, nh), resample)
+        garment = Image.merge("RGBA", (*rgb.split(), a))
+        out_im = Image.new("RGBA", (W, H), (255, 255, 255, 0))
+        # Only the soft-edge pad can reach past the canvas; paste clips it.
+        out_im.paste(garment, (left, top))
+        arr = np.asarray(out_im).copy()
+        arr[arr[:, :, 3] == 0] = (255, 255, 255, 0)
+        Image.fromarray(arr, "RGBA").save(buf, format="PNG", optimize=True)
     log.info("framing: garment %dx%d at (%d,%d) scaled %.2fx and centred on %dx%d%s",
              bw, bh, x0, y0, scale, W, H, " (capped)" if info["capped"] else "")
     return buf.getvalue(), info

@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -99,6 +100,46 @@ def _both_torn(monkeypatch):
     return arr, mask, raw
 
 
+FOUR = ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+
+
+def stored(arr, mask, backdrop=(235, 235, 235)):
+    """What vnyx-api stores: the cut-out flattened onto the tenant's backdrop."""
+    out = arr.copy()
+    out[~mask] = backdrop
+    b = io.BytesIO()
+    Image.fromarray(out).save(b, "PNG")
+    return b.getvalue()
+
+
+def test_a_stand_in_the_cut_out_on_file_does_not_veto_a_clean_one():
+    """KIL-002120's BACK: the one on file kept the booth's stand; v2 did not.
+    The stand is not garment in the photograph, so it is not 'lost'."""
+    arr, mask = jumper()
+    arr = arr.copy()
+    stand = np.zeros_like(mask)
+    stand[340:400, 120:180] = True                     # the stand under the hem
+    arr[stand] = (150, 150, 155)
+    raw, clean = pair(arr, mask)
+    previous = stored(arr, mask | stand)
+    assert cutout.garment_kept(previous, clean)[0] is False            # the old rule: refused
+    ok, why = cutout.garment_kept(previous, clean, source=raw)
+    assert ok is True and "not garment in the photograph" in why
+
+
+def test_a_strap_really_lost_is_still_refused_with_the_photograph():
+    """KIL-001644's lost strap: the photograph shows garment there, so it counts."""
+    arr, mask = jumper()
+    raw, _sound = pair(arr, mask)
+    previous = stored(arr, mask)
+    cut = mask.copy()
+    cut[80:300, 30:60] = False                         # the whole sleeve gone
+    cut[80:90, 60:70] = False
+    _, lossy = pair(arr, cut)
+    ok, why = cutout.garment_kept(previous, lossy, source=raw)
+    assert ok is False and "KEPT" in why
+
+
 def test_when_both_parsers_tear_it_the_raw_photo_goes_to_gemini(monkeypatch):
     arr, mask, raw = _both_torn(monkeypatch)
     asked: list[str] = []
@@ -108,15 +149,31 @@ def test_when_both_parsers_tear_it_the_raw_photo_goes_to_gemini(monkeypatch):
         asked.append(prompt)
         return gemini_cut, None
     monkeypatch.setattr(cutout, "_gemini", gemini)
-    out, err, provider = cutout.remove_background(
-        raw, strategies=["cloth-seg-ft", "cloth-seg-ft-backup"])
+    monkeypatch.setattr(cutout, "_openai", lambda *a, **k: pytest.fail("gpt-image is not asked"))
+    out, err, provider = cutout.remove_background(raw, strategies=FOUR)
     assert asked and asked[0] == cutout.PROMPT          # the background-removal prompt, not a mask
     assert provider == "gemini-paint" and out == gemini_cut
 
 
-def test_when_gemini_cannot_either_nothing_replaces_the_existing_image(monkeypatch):
+def test_then_openai_when_gemini_cannot(monkeypatch):
+    arr, mask, raw = _both_torn(monkeypatch)
+    _r, openai_cut = pair(arr, mask)
+    monkeypatch.setattr(cutout, "_gemini", lambda data, timeout_s, prompt=None: (None, "no image"))
+    seen: dict = {}
+
+    def openai(data, timeout_s, prompt, transparent=False):
+        seen.update(prompt=prompt, transparent=transparent)
+        return openai_cut, None
+    monkeypatch.setattr(cutout, "_openai", openai)
+    out, err, provider = cutout.remove_background(raw, strategies=FOUR)
+    assert provider == "openai-paint" and out == openai_cut
+    assert seen == {"prompt": cutout.OPENAI_PROMPT, "transparent": True}
+
+
+def test_when_all_four_fail_nothing_new_is_returned(monkeypatch):
+    """The endpoint then crops and centres the cut-out on file (test_framing)."""
     _arr, _mask, raw = _both_torn(monkeypatch)
     monkeypatch.setattr(cutout, "_gemini", lambda data, timeout_s, prompt=None: (None, "no image"))
-    out, err, provider = cutout.remove_background(
-        raw, strategies=["cloth-seg-ft", "cloth-seg-ft-backup"])
+    monkeypatch.setattr(cutout, "_openai", lambda *a, **k: (None, "no image"))
+    out, err, provider = cutout.remove_background(raw, strategies=FOUR)
     assert out is None and provider == "none" and "tore" in err

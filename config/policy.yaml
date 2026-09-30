@@ -598,17 +598,23 @@ imagery:
     # backfill-bg-removal --provider hermes). On a machine without the model
     # files the stock "cloth-seg" runs alone instead, and nothing is paid for.
     # Back to the old behaviour: strategies: ["cloth-seg"]
-    strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
+    #
+    # 30 Sep 2026 — FOUR METHODS: v2, v1, then Gemini's background removal
+    # (`gemini-paint`, on the regen model imagery.generation.model, flash), then
+    # gpt-image's (`openai-paint`, quality imagery.generation.openai_quality,
+    # medium). Every one passes the same checks, the torn-garment check among
+    # them. If none passes, a re-cut crops and centres the cut-out already on
+    # file instead (see app/imaging/framing.py).
+    strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
     # When both fine-tuned parsers ("cloth-seg-ft" = v2, "cloth-seg-ft-backup"
     # = v1) are refused by the leftover check but their garments agree at
     # least this well, the v2 cut-out is accepted: the check misreads white and
     # pale-patterned garments as backdrop. 0 disables. §11 of the deploy doc.
     agreement_min_iou: 0.98
     # The chain POST /v1/imagery/cutout (image URL in, PNG out) uses. Separate
-    # from `strategies`, so it changes nothing for vnyx-api's calls. gemini-mask
-    # is PAID (tried twice) and only runs when v2 and v1 are both refused and
-    # disagree.
-    url_strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
+    # from `strategies`, so it changes nothing for vnyx-api's calls. The two
+    # paid ones (each tried twice) run only when v2 and v1 are both refused.
+    url_strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
     # CROP AND CENTRE EVERY CUT-OUT (30 Sep 2026; app/imaging/framing.py). The
     # garment's own pixels, scaled by one factor so it fills 1 - 2 x margin of
     # the frame on its limiting axis (0.90 at margin 0.05), centred on a canvas

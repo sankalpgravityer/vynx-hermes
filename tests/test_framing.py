@@ -112,11 +112,91 @@ def test_a_tiny_garment_stops_at_max_scale_and_is_still_centred():
     assert abs((x0 + x1) / 2 - 150) <= 1 and abs((y0 + y1) / 2 - 200) <= 1
 
 
-def test_an_opaque_picture_is_returned_untouched():
+def test_an_opaque_photograph_with_no_flat_backdrop_is_returned_untouched():
     raw, _ = photo()
-    data = png(raw.convert("RGBA"))
+    arr = np.asarray(raw).copy()
+    arr[:40, :40] = (40, 40, 40)                       # a corner that is not the wall
+    data = png(Image.fromarray(arr).convert("RGBA"))
     out, info = framing.frame_cutout(data, FCFG)
-    assert out == data and info["framed"] is False
+    assert out == data and info["framed"] is False and "flat backdrop" in info["note"]
+
+
+# --------------------------------------------------------------------------- #
+# the cut-out already on file (opaque, on the tenant's backdrop)
+# --------------------------------------------------------------------------- #
+
+def stored(box=(20, 30, 110, 210), size=(300, 400), backdrop=(255, 255, 255)):
+    """A stored cut-out: opaque, garment flattened onto a flat backdrop."""
+    raw, mask = photo(box=box, size=size)
+    arr = np.asarray(raw).copy()
+    arr[~mask] = backdrop
+    return png(Image.fromarray(arr)), arr[mask].mean(axis=0)
+
+
+def test_an_existing_opaque_cut_out_is_cropped_and_centred_on_its_backdrop():
+    data, colour = stored(backdrop=(235, 235, 235))
+    out, info = framing.frame_cutout(data, FCFG)
+    assert info["framed"] and info["source"] == "backdrop"
+    arr = np.asarray(Image.open(io.BytesIO(out)).convert("RGB")).astype(int)
+    assert tuple(arr[0, 0]) == (235, 235, 235)          # the canvas is the backdrop
+    garment = np.abs(arr - 235).sum(axis=2) > 24
+    ys, xs = np.where(garment.any(axis=1))[0], np.where(garment.any(axis=0))[0]
+    assert abs((ys.max() - ys.min() + 1) - 360) <= 6      # 90% of 400, give or take resize overshoot
+    assert abs((xs.min() + xs.max()) / 2 - 150) <= 2 and abs((ys.min() + ys.max()) / 2 - 200) <= 2
+    assert np.abs(arr[garment].mean(axis=0) - colour).max() < 4   # nothing re-drawn
+
+
+def test_an_existing_cut_out_on_a_smaller_canvas_is_framed_onto_the_photographs():
+    """896x1195 on file for a 3000x4000 photograph: framed at the photograph's size."""
+    data, _ = stored(size=(150, 200), box=(10, 15, 55, 105))
+    out, info = framing.frame_cutout(data, FCFG, canvas=(300, 400))
+    assert info["framed"] and Image.open(io.BytesIO(out)).size == (300, 400)
+
+
+def test_a_garment_whose_edge_is_not_clear_is_not_cropped_at_all():
+    """A white sleeve on white: only its seam separates from the backdrop, a
+    speck too small to widen the box, just outside it. A crop by colour would
+    slice the sleeve off — so the picture is left exactly as it is."""
+    arr = np.full((400, 300, 3), 255, np.uint8)
+    arr[100:300, 100:200] = (60, 60, 90)               # the body: 20,000 px
+    arr[150:180, 203:206] = (90, 90, 90)               # the sleeve's seam: 90 px, under the 0.5% speck floor
+    data = png(Image.fromarray(arr))
+    out, info = framing.frame_cutout(data, FCFG)
+    assert out == data and info["framed"] is False and "not clear" in info["note"]
+
+
+def test_the_endpoint_frames_the_existing_cut_out_when_no_method_worked(monkeypatch):
+    """All four methods failed: the one on file comes back cropped and centred,
+    at the photograph's size, as a replacement for itself."""
+    import base64
+
+    from fastapi.testclient import TestClient
+
+    from app import main
+    from app.imaging import cutout
+
+    monkeypatch.setattr(cutout, "remove_background",
+                        lambda data, timeout_s=180.0, **kw: (None, "v2: torn; v1: torn", "none"))
+    raw, _ = photo(size=(300, 400))
+    rb = io.BytesIO(); raw.save(rb, "JPEG", quality=92)
+    prev, _c = stored(size=(150, 200), box=(10, 15, 55, 105))
+    resp = TestClient(main.app).post("/v1/imagery/remove-background", json={
+        "image_base64": base64.b64encode(rb.getvalue()).decode(),
+        "previous_base64": base64.b64encode(prev).decode()})
+    p = resp.json()
+    assert p["ok"] is True and p["provider"] == main.EXISTING_FRAMED and p["kept_existing"] is False
+    assert p["framing"]["framed"] and "torn" in p["error"]
+    assert Image.open(io.BytesIO(base64.b64decode(p["image_base64"]))).size == (300, 400)
+
+
+def test_a_paid_render_is_brought_to_the_photographs_size_before_framing():
+    from app import main
+
+    raw, mask = photo(size=(300, 400))
+    small = Image.open(io.BytesIO(cutout_of(raw, mask))).resize((150, 200))
+    out = main._at_size(png(small), (300, 400))
+    assert Image.open(io.BytesIO(out)).size == (300, 400)
+    assert main._at_size(b"not an image", (300, 400)) == b"not an image"
 
 
 def test_framing_twice_changes_nothing():

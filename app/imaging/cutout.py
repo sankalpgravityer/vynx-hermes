@@ -142,9 +142,9 @@ DEFAULTS: dict[str, Any] = {
     # THE CHAIN FOR POST /v1/imagery/cutout — the URL-in, PNG-out endpoint. Its
     # own list, so turning it on changes nothing for vnyx-api's calls to
     # /v1/imagery/remove-background, which follow `strategies` above.
-    # gemini-mask is PAID and tried twice; it runs only when both fine-tuned
+    # The paid ones are tried twice each and run only when both fine-tuned
     # parsers are refused and do not agree.
-    "url_strategies": ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"],
+    "url_strategies": ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"],
     # --- holes torn in the garment (_torn_garment, 30 Sep 2026) -------------
     # A cut-out whose mask dropped this share of the garment from INSIDE it —
     # gaps where the photograph shows the garment's colour, not the wall — is
@@ -152,11 +152,20 @@ DEFAULTS: dict[str, Any] = {
     # Calibrated 30 Sep 2026 on 79 sound photobooth cut-outs against the torn
     # green band of 03520c1f's BACK: v2 2.45%, v1 0.40% (streaks), every sound
     # view 0.14% or less. 0.25% sits between.
+    # THE KEEP-BETTER VETO (item 8) IS OFF (30 Sep 2026, the user's call). A
+    # new cut-out is judged on its OWN checks — leftovers, backdrop, the tear
+    # check — and the one on file is only the last resort (cropped and centred
+    # by the endpoint). Measured on 10 products: the veto kept on-file pictures
+    # with the booth's pedestal (KIL-002120 BACK) and a hanger (BLM-000714
+    # FRONT) over clean v2 cut-outs. The cost, accepted: a new cut-out that
+    # drops a whole sleeve is no longer caught by comparison with the old one.
+    # True restores the veto (with the photograph check in garment_kept).
+    "keep_better_veto": False,
     "torn_check": True,
     "torn_min": 0.0025,
-    # What a torn cut-out is sent to: Gemini asked for the background-removed
-    # picture itself (PAID, tried twice). Empty to send it nowhere.
-    "torn_fallback": "gemini-paint",
+    # The most one paid call (Gemini, gpt-image) may take, whatever the
+    # caller's overall budget.
+    "paid_timeout_s": 120,
     "torn_work_px": 1024,
     # A bite out of the outline narrower than this (px at 1024) is closed and
     # read; the blended rim next to the outline is skipped. `torn_reach` (a
@@ -276,6 +285,22 @@ PROMPT = (
     "\n"
     "Do not draw a checkerboard. Do not add a border. Magenta must appear "
     "nowhere on the garment itself."
+)
+
+# gpt-image's background removal (`openai-paint`): the endpoint can return a
+# real alpha channel, so it is asked for transparency rather than magenta.
+OPENAI_PROMPT = (
+    "Remove the background from this photograph and return ONLY the garment on a "
+    "fully transparent background.\n"
+    "\n"
+    "Remove everything that is not the garment: the mannequin, its stand and base, "
+    "the podium, the hanger, the floor, the walls and anything else in the room. "
+    "Any gap you can see through — between a strap and the body, under an arm — "
+    "must be transparent too.\n"
+    "\n"
+    "Return the SAME garment, unchanged: identical colour, texture, print, shape, "
+    "orientation, framing and scale. Do not restyle, relight, retouch, smooth, "
+    "straighten, crop or re-centre it, and do not remove any part of it."
 )
 
 # How far from pure magenta a pixel may sit and still count as background.
@@ -1071,6 +1096,60 @@ def _kept_backdrop(source: bytes, result: bytes,
                   f"bottom band {bottom:.0%}")
 
 
+def _like_nearest_garment(raw: Any, mask: Any, cfg: dict[str, Any]) -> Any | None:
+    """For every pixel of the photograph `raw` (float RGB, the grid of `mask`):
+    is it the colour of the NEAREST pixel of `mask`'s garment? None without one."""
+    import numpy as np
+    import cv2
+
+    m8 = mask.astype(np.uint8)
+    if not m8.any():
+        return None
+    _d, labels = cv2.distanceTransformWithLabels(1 - m8, cv2.DIST_L2, 5,
+                                                 labelType=cv2.DIST_LABEL_PIXEL)
+    gy, gx = np.nonzero(m8)             # scan order == label order for DIST_LABEL_PIXEL
+    colours = raw[gy, gx]
+    near_rgb = colours[np.clip(labels - 1, 0, len(colours) - 1)]
+    garm_tol = float(cfg.get("torn_garment_tolerance") or 50)
+    return np.linalg.norm(raw - near_rgb, axis=2) < garm_tol
+
+
+def _photo_says_garment(raw: Any, mask: Any, cfg: dict[str, Any]) -> Any | None:
+    """For every pixel of the photograph `raw` (float RGB, the grid of `mask`):
+    does it show GARMENT — the colour of the nearest pixel of `mask`'s garment,
+    and not the wall? None when there is no wall in the frame to compare with.
+
+    The question the tear check asks of a hole: a torn-out piece is the
+    garment's colour and not the wall's; a real opening shows the wall.
+    """
+    import numpy as np
+    import cv2
+
+    like_garment = _like_nearest_garment(raw, mask, cfg)
+    if like_garment is None:
+        return None
+    m8 = mask.astype(np.uint8)
+    reach = max(3, int(round(float(cfg.get("torn_reach") or 0.03) * max(mask.shape))))
+    dist_out = cv2.distanceTransform(1 - m8, cv2.DIST_L2, 5)
+
+    # THE WALL, LOCALLY: the colour of the nearest pixel a little further out
+    # than anything looked at. The photograph's border is the wrong answer on
+    # a lit booth wall — beside 1b242dd5's cream jersey the wall is lighter
+    # than at the frame's edge, so a border median called the whole wall round
+    # the jersey "not wall" and 21% of it a tear. Through an enclosed hole the
+    # nearest outer pixel is the wall round the garment, which is what shows.
+    far = (dist_out > 2 * reach).astype(np.uint8)
+    if far.sum() < 50:
+        return None
+    _d2, far_lbl = cv2.distanceTransformWithLabels(1 - far, cv2.DIST_L2, 5,
+                                                   labelType=cv2.DIST_LABEL_PIXEL)
+    fy, fx = np.nonzero(far)
+    wall = raw[fy, fx][np.clip(far_lbl - 1, 0, fy.size - 1)]
+    wall_tol = float(cfg.get("torn_backdrop_tolerance") or 40)
+    not_wall = np.linalg.norm(raw - wall, axis=2) > wall_tol
+    return like_garment & not_wall
+
+
 def _torn_garment(source: bytes, result: bytes,
                   cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
     """Did the mask tear holes in the garment itself? (torn, why)
@@ -1135,33 +1214,10 @@ def _torn_garment(source: bytes, result: bytes,
     rim = max(1, int(round(float(cfg.get("torn_rim_px") or 2) * unit)))
     dist_out = cv2.distanceTransform(1 - m8, cv2.DIST_L2, 5)
     gaps = (enclosed & ~mask) | (closed & ~mask & (dist_out > rim))
-    reach = max(3, int(round(float(cfg.get("torn_reach") or 0.03) * max(size))))
-
-    # The colour of the nearest garment pixel, for every pixel off the mask.
-    _d, labels = cv2.distanceTransformWithLabels(1 - m8, cv2.DIST_L2, 5,
-                                                 labelType=cv2.DIST_LABEL_PIXEL)
-    gy, gx = np.nonzero(m8)             # scan order == label order for DIST_LABEL_PIXEL
-    colours = raw[gy, gx]
-    near_rgb = colours[np.clip(labels - 1, 0, len(colours) - 1)]
-
-    # THE WALL, LOCALLY: the colour of the nearest pixel a little further out
-    # than anything looked at. The photograph's border is the wrong answer on
-    # a lit booth wall — beside 1b242dd5's cream jersey the wall is lighter
-    # than at the frame's edge, so a border median called the whole wall round
-    # the jersey "not wall" and 21% of it a tear. Through an enclosed hole the
-    # nearest outer pixel is the wall round the garment, which is what shows.
-    far = (dist_out > 2 * reach).astype(np.uint8)
-    if far.sum() < 50:
+    garment_coloured = _photo_says_garment(raw, mask, cfg)
+    if garment_coloured is None:
         return False, "not checked (no wall to compare with)"
-    _d2, far_lbl = cv2.distanceTransformWithLabels(1 - far, cv2.DIST_L2, 5,
-                                                   labelType=cv2.DIST_LABEL_PIXEL)
-    fy, fx = np.nonzero(far)
-    wall = raw[fy, fx][np.clip(far_lbl - 1, 0, fy.size - 1)]
-    garm_tol = float(cfg.get("torn_garment_tolerance") or 50)
-    wall_tol = float(cfg.get("torn_backdrop_tolerance") or 40)
-    like_garment = np.linalg.norm(raw - near_rgb, axis=2) < garm_tol
-    not_wall = np.linalg.norm(raw - wall, axis=2) > wall_tol
-    torn_px = gaps & like_garment & not_wall
+    torn_px = gaps & garment_coloured
     # Specks are noise, not a tear.
     torn_px = cv2.morphologyEx(torn_px.astype(np.uint8), cv2.MORPH_OPEN,
                                np.ones((2, 2), np.uint8)).astype(bool)
@@ -1314,12 +1370,20 @@ def _rescaled(old: Any, new: Any, cfg: dict[str, Any]) -> tuple[Any, Any, float]
 
 
 def garment_kept(previous: bytes, candidate: bytes,
-                 cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
+                 cfg: dict[str, Any] | None = None, *,
+                 source: bytes | None = None) -> tuple[bool, str]:
     """Is the candidate at least as complete as the cut-out it would replace?
 
     (ok, why). ok is True when it is — and also when the two cannot honestly be
     compared, because a replacement must be refused on evidence, not on the
     absence of it.
+
+    `source` is the photograph both were cut from. Given it, what the cut-out
+    on file has and the candidate lacks only counts as LOST GARMENT where the
+    photograph shows garment there (_photo_says_garment). 30 Sep 2026: KIL-002120's
+    BACK on file still held the booth's stand and wall, and BLM-000714's FRONT
+    a hanger; clean v2 cut-outs of both were refused as "39% less garment" and
+    "a 4% piece missing", and the broken pictures were kept.
     """
     from PIL import Image
     import numpy as np
@@ -1391,6 +1455,7 @@ def garment_kept(previous: bytes, candidate: bytes,
     # its outline (0.978 on that pair); a mask that ate the shirt back or a
     # strap changes it, because the lost piece is missing from the outline too.
     # That is what keeps KIL-001625's protection intact.
+    new_full = new
     reframed = _rescaled(old, new, cfg)
     note = ""
     if reframed is not None:
@@ -1399,6 +1464,37 @@ def garment_kept(previous: bytes, candidate: bytes,
         note = (f" (the two are the same garment at {scale:.1f}x — compared on a "
                 f"common frame, because the one on file is cropped to the garment "
                 f"and this one is on the photograph's)")
+
+    # WHAT THE ONE ON FILE HAS AND THIS ONE DOES NOT, READ IN THE PHOTOGRAPH.
+    # On the grid the two masks are on now: the candidate's frame at `size`,
+    # or — when rescaled — the candidate's own box on the shape grid.
+    if source is not None:
+        try:
+            photo = np.asarray(Image.open(io.BytesIO(source)).convert("RGB").resize(
+                size, Image.Resampling.BILINEAR)).astype(np.float32)
+            if reframed is not None:
+                ys, xs = np.where(new_full)
+                crop = photo[ys.min(): ys.max() + 1, xs.min(): xs.max() + 1]
+                g = new.shape[1]
+                photo = np.asarray(Image.fromarray(crop.astype(np.uint8)).resize(
+                    (g, new.shape[0]), Image.Resampling.BILINEAR)).astype(np.float32)
+            # ONLY WHAT IS PLAINLY NOT THE GARMENT'S COLOUR is discounted. A
+            # piece the colour of the wall is NOT evidence: a light garment on a
+            # light sweep is the wall's colour too (§1.3), and its lost back
+            # must still be refused.
+            says = _like_nearest_garment(photo, new, cfg)
+        except Exception:  # noqa: BLE001 — without the photograph, the old rule
+            says = None
+        if says is not None:
+            extra = old & ~new & ~says
+            if extra.any():
+                share_extra = float(extra.sum()) / old_area
+                old = old & ~extra
+                old_area = float(old.sum())
+                note += (f" ({share_extra:.0%} of the one on file is not garment in the "
+                         f"photograph — a stand, a hanger or the wall — and was not counted)")
+                if old_area < 100:
+                    return True, f"the cut-out on file is not the garment{note}"
 
     share = new_area / old_area
     drop = 1.0 - share
@@ -1542,7 +1638,7 @@ def _letterbox(data: bytes) -> tuple[bytes, tuple[int, int, int, int]]:
 
 
 def _openai(
-    data: bytes, timeout_s: float, prompt: str
+    data: bytes, timeout_s: float, prompt: str, *, transparent: bool = False
 ) -> tuple[bytes | None, str | None]:
     """One OpenAI attempt against the edits endpoint. Never raises.
 
@@ -1551,6 +1647,12 @@ def _openai(
 
     The source is letterboxed first and the caller crops the result back; see
     _letterbox for why that is not optional here.
+
+    `transparent` asks gpt-image for a real alpha channel (the background
+    removal itself, `openai-paint`); without it the answer is a picture (the
+    mask strategy). The quality tier is the render path's
+    (`imagery.generation.openai_quality`, medium): it is billed per output
+    token, and unset means "auto", which resolves towards the top.
     """
     key = os.getenv("OPENAI_API_KEY")
     if not key:
@@ -1563,13 +1665,17 @@ def _openai(
     except Exception as exc:  # noqa: BLE001
         return None, f"could not prepare the source ({exc.__class__.__name__})"
 
+    gen = (policy().get("imagery") or {}).get("generation") or {}
     files = {"image": ("source.png", padded, "image/png")}
     form = {
         "model": os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1"),
         "prompt": prompt,
         "output_format": "png",
         "size": "auto",
+        "quality": str(gen.get("openai_quality") or "medium").lower(),
     }
+    if transparent:
+        form["background"] = "transparent"
     try:
         with httpx.Client(timeout=timeout_s) as client:
             resp = client.post(
@@ -1702,7 +1808,7 @@ def _intersect_alpha(mask_png: bytes, cloth_png: bytes) -> tuple[bytes | None, s
 # `skip`) and the endpoint has to be able to say which names exist without
 # reaching into the chain below.
 STRATEGY_NAMES = ("cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg", "gemini-mask", "openai-mask",
-                  "gemini-paint")
+                  "gemini-paint", "openai-paint")
 # What a cut-out accepted because the two fine-tuned parsers AGREED is reported
 # as (see `agreement_min_iou`): still the primary's pixels, named apart so the
 # log and the caller can tell it from one the leftover check passed.
@@ -1819,6 +1925,9 @@ def remove_background(
         log.info("bg-removal: source carries EXIF orientation %d; segmenting it upright", orientation)
     if previous is not None:
         previous, _ = _upright(previous)
+    # Compared against only when the veto is on (see `keep_better_veto`);
+    # otherwise the cut-out on file plays no part in choosing a new one.
+    rival = previous if cfg.get("keep_better_veto") else None
 
     # MASK FIRST, PAINT LAST.
     #
@@ -1833,6 +1942,9 @@ def remove_background(
     # variance rather than incapacity: the same model cut one product cleanly
     # and left a mannequin stand in the next. A second ask is far cheaper than
     # a product held for a human.
+    # One paid call may not use the whole budget: the chain can make four of
+    # them (two vendors, two attempts), and a hung one must not starve the rest.
+    paid_t = min(float(timeout_s), float(cfg.get("paid_timeout_s") or 120))
     chain = (
         # THE FINE-TUNED PARSER, BEFORE THE STOCK ONE — when policy lists it
         # (see `_CLOTH_FT_PATH`). Same kind, same checks, same cost; a cut-out
@@ -1851,9 +1963,11 @@ def remove_background(
         # network, no bill and no variance. One attempt, because it is
         # deterministic — a second would return the identical bytes.
         ("cloth-seg", "direct", lambda: _cloth_seg(data)),
-        ("gemini-mask", "mask", lambda: _gemini(data, timeout_s, MASK_PROMPT)),
-        ("openai-mask", "mask", lambda: _openai(data, timeout_s, MASK_PROMPT)),
-        ("gemini-paint", "paint", lambda: _gemini(data, timeout_s, PROMPT)),
+        ("gemini-mask", "mask", lambda: _gemini(data, paid_t, MASK_PROMPT)),
+        ("openai-mask", "mask", lambda: _openai(data, paid_t, MASK_PROMPT)),
+        ("gemini-paint", "paint", lambda: _gemini(data, paid_t, PROMPT)),
+        # gpt-image's own background removal, on a transparent background.
+        ("openai-paint", "paint", lambda: _openai(data, paid_t, OPENAI_PROMPT, transparent=True)),
     )
 
     # THE POLICY'S CHAIN WHEN THE CALLER NAMES NONE. `strategies` is still the
@@ -1883,15 +1997,7 @@ def remove_background(
         # otherwise quietly run the default chain and produce the same stand
         # the caller asked a different segmenter for.
         return None, f"no background-removal strategy is named {', '.join(unknown)}", "none"
-    everything = {s[0]: s for s in chain}
-    chain = [s for s in chain if (wanted is None or s[0] in wanted) and s[0] not in banned]
-    # A TORN CUT-OUT GOES TO GEMINI (30 Sep 2026). When a fine-tuned parser
-    # tears the garment (see _torn_garment), the raw photograph is also sent to
-    # this strategy — Gemini asked for the background-removed picture itself —
-    # even if the policy's chain does not list it. Its answer passes the same
-    # checks; if it cannot produce a good one, nothing is returned and the
-    # cut-out already on file is left alone.
-    torn_fallback = str(cfg.get("torn_fallback") or "")
+    chain = tuple(s for s in chain if (wanted is None or s[0] in wanted) and s[0] not in banned)
     if not chain:
         return None, "every background-removal strategy was excluded by the caller", "none"
 
@@ -1949,8 +2055,8 @@ def remove_background(
         if torn:
             attempts.append(f"{AGREED}: {torn_why}")
             return None, None
-        if previous is not None:
-            better, keep_why = garment_kept(previous, out, cfg)
+        if rival is not None:
+            better, keep_why = garment_kept(rival, out, cfg, source=data)
             if not better:
                 kept_existing.append(AGREED)
                 attempts.append(f"{AGREED}: {keep_why}")
@@ -2048,11 +2154,6 @@ def remove_background(
             if torn:
                 log.info("bg-removal %s tore the garment in %.1fs: %s", label, took, torn_why)
                 attempts.append(f"{label}: {torn_why}")
-                if (torn_fallback in everything and torn_fallback not in banned
-                        and all(s[0] != torn_fallback for s in chain)):
-                    log.info("bg-removal: a torn cut-out — the photograph goes to %s as well",
-                             torn_fallback)
-                    chain.append(everything[torn_fallback])
                 continue
 
             # LAST, AND A PRECONDITION (item 8). Everything above asks whether
@@ -2060,8 +2161,8 @@ def remove_background(
             # one it would destroy. A candidate that is good but worse is not a
             # failure of the segmenter and must not read as one — see
             # `kept_existing` and the return below.
-            if previous is not None:
-                better, keep_why = garment_kept(previous, out, cfg)
+            if rival is not None:
+                better, keep_why = garment_kept(rival, out, cfg, source=data)
                 if not better:
                     log.info("bg-removal %s would lose garment in %.1fs: %s",
                              label, took, keep_why)

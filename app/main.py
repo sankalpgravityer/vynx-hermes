@@ -772,7 +772,8 @@ class CutoutResponse(BaseModel):
     framing: dict | None = None
 
 
-def _framed(out: bytes, frame: bool | None) -> tuple[bytes, dict | None]:
+def _framed(out: bytes, frame: bool | None,
+            canvas: tuple[int, int] | None = None) -> tuple[bytes, dict | None]:
     """The cut-out cropped and centred, when the request or policy asks for it."""
     from app.imaging import framing
 
@@ -780,10 +781,61 @@ def _framed(out: bytes, frame: bool | None) -> tuple[bytes, dict | None]:
     if not (fcfg.get("enabled") if frame is None else frame):
         return out, None
     try:
-        return framing.frame_cutout(out, fcfg)
+        return framing.frame_cutout(out, fcfg, canvas=canvas)
     except Exception as exc:  # noqa: BLE001 — an unframed cut-out beats none
         log.warning("framing failed, returning the cut-out unframed: %s", exc)
         return out, {"framed": False, "note": f"framing failed ({exc.__class__.__name__})"}
+
+
+def _upright_size(raw: bytes) -> tuple[int, int] | None:
+    """The photograph's size as it is SEEN (EXIF orientation applied)."""
+    import io as _io
+
+    from PIL import Image
+
+    from app.imaging import cutout
+
+    try:
+        upright, _o = cutout._upright(raw)
+        return Image.open(_io.BytesIO(upright)).size
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _at_size(out: bytes, size: tuple[int, int] | None) -> bytes:
+    """A cut-out brought to the photograph's resolution.
+
+    Every local strategy already keeps it; Gemini and gpt-image render at
+    their own size (~2K), and vnyx-api would then PAD the smaller picture back
+    out to the source canvas, shrinking the garment again. RGB and alpha are
+    resized apart, so the transparent corners stay (255,255,255,0) rather than
+    premultiplied black. Left alone when the shape differs (a reframed picture
+    is the checks' business, not something to stretch).
+    """
+    import io as _io
+
+    from PIL import Image
+
+    if not size:
+        return out
+    try:
+        img = Image.open(_io.BytesIO(out)).convert("RGBA")
+    except Exception:  # noqa: BLE001 — not ours to judge here; the caller's checks are
+        return out
+    if img.size == tuple(size):
+        return out
+    if abs(img.width / img.height - size[0] / size[1]) / (size[0] / size[1]) > 0.05:
+        return out
+    rgb = img.convert("RGB").resize(size, Image.Resampling.LANCZOS)
+    alpha = img.getchannel("A").resize(size, Image.Resampling.LANCZOS)
+    buf = _io.BytesIO()
+    Image.merge("RGBA", (*rgb.split(), alpha)).save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# What /remove-background answers when no method produced a good cut-out and
+# the one on file was cropped and centred instead.
+EXISTING_FRAMED = "existing-framed"
 
 
 @app.post("/v1/imagery/remove-background", response_model=CutoutResponse)
@@ -862,14 +914,38 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
     # AFTER every check and the keep-better comparison: those judge the
     # segmentation, on the photograph's own frame; framing only moves it.
     framing_info = None
+    size = _upright_size(raw)
     if out is not None:
-        out, framing_info = _framed(out, req.frame)
+        out, framing_info = _framed(_at_size(out, size), req.frame)
+    elif previous is not None:
+        # NO METHOD PRODUCED A GOOD CUT-OUT (v2, v1, Gemini, gpt-image — or
+        # each lost to the one on file). The cut-out on file stays, but it is
+        # cropped and centred like every other: framed onto the photograph's
+        # canvas, and handed back as a replacement for itself. When it cannot
+        # be framed safely (or already is), nothing is returned and nothing is
+        # written, exactly as before.
+        framed_prev, prev_info = _framed(previous, req.frame, canvas=size)
+        if prev_info and prev_info.get("framed"):
+            log.info("bg-removal: no method produced a cut-out; the existing one was cropped "
+                     "and centred instead (%s)", err)
+            return CutoutResponse(
+                ok=True, image_base64=_b64.b64encode(framed_prev).decode(),
+                provider=EXISTING_FRAMED,
+                error=f"no new cut-out was good enough, so the existing one was cropped and "
+                      f"centred: {err}",
+                duration_ms=int((_time.perf_counter() - started) * 1000),
+                framing=prev_info,
+            )
+        framing_info = prev_info
     return CutoutResponse(
         ok=out is not None,
         image_base64=_b64.b64encode(out).decode() if out else None,
         provider=provider,
         error=err,
-        kept_existing=provider == cutout.KEPT_EXISTING,
+        # THE ONE ON FILE STAYS whenever there is one and nothing replaced it —
+        # the last resort, not a failure — so vnyx-api writes nothing and does
+        # not queue the same attempt again.
+        kept_existing=provider == cutout.KEPT_EXISTING or (out is None and previous is not None),
         duration_ms=int((_time.perf_counter() - started) * 1000),
         framing=framing_info,
     )
@@ -906,10 +982,8 @@ def _cutout_png(raw: bytes, timeout_s: float, frame: bool | None = None):
         return JSONResponse(status_code=503, content={
             "ok": False, "error": "the fine-tuned model is not configured on this server "
                                   "(HERMES_CLOTH_SEG_FT_PATH): see docs/DEPLOY-BACKGROUND-REMOVAL.md §11"})
-    try:
-        upright, _orientation = cutout._upright(raw)
-        size = Image.open(_io.BytesIO(upright)).size
-    except Exception:  # noqa: BLE001
+    size = _upright_size(raw)
+    if size is None:
         raise HTTPException(400, "the image could not be decoded")
 
     out, err, provider = cutout.remove_background(raw, timeout_s=timeout_s, strategies=strategies)
@@ -918,18 +992,9 @@ def _cutout_png(raw: bytes, timeout_s: float, frame: bool | None = None):
         return JSONResponse(status_code=422, content={
             "ok": False, "error": err, "provider": provider, "duration_ms": ms})
 
-    # THE SAME RESOLUTION AS THE PHOTOGRAPH. Every local strategy already keeps
-    # it; a paid PAINT strategy may render at its own size, so the result is
-    # brought back to the source's (RGB and alpha resized apart, so the corners
-    # stay (255,255,255,0) rather than premultiplied black).
-    img = Image.open(_io.BytesIO(out)).convert("RGBA")
-    if img.size != size:
-        rgb = img.convert("RGB").resize(size, Image.Resampling.LANCZOS)
-        alpha = img.getchannel("A").resize(size, Image.Resampling.LANCZOS)
-        img = Image.merge("RGBA", (*rgb.split(), alpha))
-        buf = _io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        out = buf.getvalue()
+    # THE SAME RESOLUTION AS THE PHOTOGRAPH (see _at_size).
+    out = _at_size(out, size)
+    img = Image.open(_io.BytesIO(out))
     out, framing_info = _framed(out, frame)
     return Response(content=out, media_type="image/png", headers={
         "X-Cutout-Provider": provider,
