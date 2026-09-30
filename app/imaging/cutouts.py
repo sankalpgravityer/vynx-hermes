@@ -269,6 +269,23 @@ DEFAULTS: dict[str, Any] = {
         # ...and `box_fill_max` turned out not to be able to do it on a portrait
         # garment, which is why this is `auto` rather than `False` now.
         "alignment_check": "auto",
+        # THE PIXEL MATCH (30 Sep 2026) — the framing test that needs no wall.
+        #
+        # `overlap` above asks the PHOTOGRAPH where its garment is, and a light
+        # garment on a light wall cannot say, so below `min_separation` it
+        # abstains. On BOAS that was most of the catalogue: 23 approved products
+        # with zoomed cut-outs went through a live run as "every cut-out is on
+        # its canvas", and `scale_outliers` could not see them either, because
+        # FRONT and BACK were zoomed ALIKE.
+        #
+        # This asks a question the wall cannot spoil: are the cut-out's garment
+        # pixels the photograph's own pixels, at the same place? An honest
+        # cut-out IS the photograph under a mask, so the two correlate almost
+        # perfectly; a zoomed, cropped, shifted or re-drawn one does not.
+        # Measured on all 365 BOAS approved views (29 Sep 2026): 88 zoomed views
+        # at -0.46..0.38, every other view 0.65..1.00 (263 of them over 0.90),
+        # nothing between 0.38 and 0.65. 0.5 sits in that gap. 0 turns it off.
+        "pixel_match_min": 0.5,
         # Fractions of the garment's area. MID-000569's booth FRONT: the form's
         # neck 2.3%; MID-000253's old booth FRONT 1.6%; the flat lays 0.0-0.2%.
         "loss_min": 0.005,
@@ -966,6 +983,17 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
 
     raw_back = ring_median(r)
     garment_rgb = np.median(r[garment], axis=0)
+
+    # THE PIXEL MATCH (see `pixel_match_min`): the cut-out's garment pixels
+    # against the photograph's at the same coordinates, as a correlation of
+    # their brightness. Brightness only, so a backdrop colour, a white balance
+    # or a contrast lift on an honest cut-out does not read as a different
+    # picture; None when either side is flat (nothing to correlate).
+    cut_grey = np.asarray(cut_small.convert("RGB")).astype(np.float32).mean(axis=2)[garment]
+    raw_grey = r.mean(axis=2)[garment]
+    pixel_match = None
+    if cut_grey.size >= 500 and float(cut_grey.std()) > 1.0 and float(raw_grey.std()) > 1.0:
+        pixel_match = float(np.corrcoef(cut_grey, raw_grey)[0, 1])
     # HOW FAR APART THE PHOTOGRAPH'S GARMENT AND ITS BACKDROP ACTUALLY ARE.
     #
     # This is the number that decides whether `overlap` below means anything, and
@@ -1011,6 +1039,7 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
     residue = hole & ~loss & ~opening
     out = {
         "aligned": aligned, "overlap": round(overlap, 3),
+        "pixel_match": None if pixel_match is None else round(pixel_match, 3),
         # The separation, and the two colours it was taken between, so a reading
         # of the JSON can see WHY the alignment test judged or abstained without
         # re-deriving anything from the pictures.
@@ -1099,6 +1128,20 @@ def frame_problem(m: dict[str, Any] | None, cfg: dict[str, Any], *,
     view disagree for an honest reason — so that is a note, never a defect.
     """
     gc = {**(DEFAULTS.get("garment_check") or {}), **(cfg.get("garment_check") or {})}
+
+    # THE PIXEL MATCH FIRST — it needs no wall, so it judges where `overlap`
+    # below has to abstain (see `pixel_match_min`).
+    pm = (m or {}).get("pixel_match")
+    pm_min = float(gc.get("pixel_match_min") or 0.0)
+    if pm is not None and pm_min > 0 and float(pm) < pm_min:
+        text = (f"framing: the cut-out's garment does not line up with its photograph "
+                f"(pixel match {float(pm):.2f}; a correct cut-out scores over 0.90) — it is "
+                f"zoomed, cropped, shifted or re-drawn against the photograph it was cut from")
+        if not derived:
+            return (text + "; the original was matched by view, not by a derivation edge, "
+                    "so the two may simply be different photographs"), False
+        return text + ". Re-cut it from the original on the source canvas.", True
+
     mode = _alignment_mode(gc.get("alignment_check"))
     if mode == "off":
         return None, False
