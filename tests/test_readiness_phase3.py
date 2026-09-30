@@ -508,7 +508,12 @@ def test_two_pictures_that_do_not_cover_the_same_frame_are_not_asked_about_a_nec
 # six were transparent. It is retired (`alignment_check`, item 2); what catches
 # the zoom now is the cut-out's own bounding box (item 3, further down).
 
-ALIGN_ON = {**CFG, "garment_check": {**(CFG.get("garment_check") or {}), "alignment_check": True}}
+# The OVERLAP test on its own, with the pixel match (30 Sep 2026) switched off:
+# these tests pin what `overlap` does and does not decide, and a genuinely
+# zoomed pair is now caught by the pixel match first — see test_pixel_match.py
+# and test_the_pixel_match_catches_the_zoom_the_overlap_may_not below.
+NO_PM = {**CFG, "garment_check": {**(CFG.get("garment_check") or {}), "pixel_match_min": 0}}
+ALIGN_ON = {**NO_PM, "garment_check": {**(NO_PM.get("garment_check") or {}), "alignment_check": True}}
 
 
 def zoomed_pair(scale: float = 1.45) -> tuple[bytes, bytes]:
@@ -526,11 +531,19 @@ def test_the_overlap_is_still_measured_and_still_named_when_switched_back_on():
     """The measurement survives item 2 untouched — it simply cannot flag."""
     m = cutouts.garment_hole(*zoomed_pair(), CFG)
     assert m["aligned"] is False and m["overlap"] < 0.9      # still on the row, still in the JSON
-    assert cutouts.frame_problem(m, CFG, derived=True) == (None, False)
+    assert cutouts.frame_problem(m, NO_PM, derived=True) == (None, False)
     why, fixable = cutouts.frame_problem(m, ALIGN_ON, derived=True)
     assert why and "zoomed or shifted" in why and "Re-cut it" in why and fixable
     # The ratio test and the edge test, which is why this had to be measured.
     assert cutouts.canvas_mismatch((896, 1195), (3000, 4000), 0.02) is None
+
+
+def test_the_pixel_match_catches_the_zoom_the_overlap_may_not():
+    """What ships (30 Sep 2026): the same zoomed pair, with nothing switched off,
+    is a fixable framing defect — found by the pixel match, not the overlap."""
+    m = cutouts.garment_hole(*zoomed_pair(), CFG)
+    why, fixable = cutouts.frame_problem(m, CFG, derived=True)
+    assert why and "does not line up" in why and "pixel match" in why and fixable
 
 
 def test_the_same_framing_says_nothing_about_framing():
@@ -555,13 +568,32 @@ def test_judge_no_longer_holds_a_product_on_the_overlap_alone():
                 width=3000, height=4000)
     cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png",
                 width=896, height=1195)
+    import copy as _copy
+
+    no_pm = _copy.deepcopy(POL)
+    gc = ((no_pm.setdefault("readiness", {}).setdefault("cutouts", {})).setdefault("garment_check", {}))
+    gc["pixel_match_min"] = 0                            # the overlap alone, as this test pins
     c, r = zoomed_pair()
     fetch, read_dims = fake_io({"https://r2/cut.png": c, "https://r2/raw.jpg": r})
-    v = cutouts.judge(snap([cut, raw]), POL, fetch=fetch, read_dims=read_dims)
+    v = cutouts.judge(snap([cut, raw]), no_pm, fetch=fetch, read_dims=read_dims)
     assert v.action == "ok"
     assert not any("framing:" in reason for reason in v.reasons)
     assert cut.border["garment"]["overlap"] < 0.9        # measured, recorded, silent
-    assert "IMG.026" not in ids(snap([cut, raw]))
+
+
+def test_judge_re_cuts_a_zoom_the_pixel_match_sees():
+    """What ships: the same pair, pixel match on — held as a fixable framing defect."""
+    raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg",
+                width=3000, height=4000)
+    cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png",
+                width=896, height=1195)
+    c, r = zoomed_pair()
+    fetch, read_dims = fake_io({"https://r2/cut.png": c, "https://r2/raw.jpg": r})
+    v = cutouts.judge(snap([cut, raw]), POL, fetch=fetch, read_dims=read_dims)
+    assert v.action == "bad" and v.bad_views == ["FRONT"]
+    assert any("does not line up" in reason for reason in v.reasons)
+    # …and the review rule reading the same measurement says so too.
+    assert "IMG.026" in ids(snap([cut, raw]))
 
 
 def test_judge_re_cuts_a_lost_collar_and_leaves_the_forms_neck_alone():
