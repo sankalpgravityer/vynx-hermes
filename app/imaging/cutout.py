@@ -145,6 +145,28 @@ DEFAULTS: dict[str, Any] = {
     # gemini-mask is PAID and tried twice; it runs only when both fine-tuned
     # parsers are refused and do not agree.
     "url_strategies": ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"],
+    # --- holes torn in the garment (_torn_garment, 30 Sep 2026) -------------
+    # A cut-out whose mask dropped this share of the garment from INSIDE it —
+    # gaps where the photograph shows the garment's colour, not the wall — is
+    # refused and the next strategy runs (v1, then Gemini's mask).
+    # Calibrated 30 Sep 2026 on 79 sound photobooth cut-outs against the torn
+    # green band of 03520c1f's BACK: v2 2.45%, v1 0.40% (streaks), every sound
+    # view 0.14% or less. 0.25% sits between.
+    "torn_check": True,
+    "torn_min": 0.0025,
+    # What a torn cut-out is sent to: Gemini asked for the background-removed
+    # picture itself (PAID, tried twice). Empty to send it nowhere.
+    "torn_fallback": "gemini-paint",
+    "torn_work_px": 1024,
+    # A bite out of the outline narrower than this (px at 1024) is closed and
+    # read; the blended rim next to the outline is skipped. `torn_reach` (a
+    # fraction of the long edge) places the local wall sample: the nearest
+    # pixel beyond twice it.
+    "torn_close_px": 15,
+    "torn_rim_px": 2,
+    "torn_reach": 0.03,
+    "torn_garment_tolerance": 50,
+    "torn_backdrop_tolerance": 40,
     # --- item 8: a replacement is never worse than what it replaces --------
     #
     # How much less garment the new cut-out may have than the one it would
@@ -1049,6 +1071,108 @@ def _kept_backdrop(source: bytes, result: bytes,
                   f"bottom band {bottom:.0%}")
 
 
+def _torn_garment(source: bytes, result: bytes,
+                  cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Did the mask tear holes in the garment itself? (torn, why)
+
+    30 Sep 2026, 03520c1f's BACK: the v2 cut-out of a black jumper with a green
+    band came back with white patches through the green — the parser read the
+    lit knit as background. Every check before this one asks what the cut-out
+    KEPT that it should not have; none asks what it dropped from inside the
+    garment, so a torn cut-out passed and went on to be framed and enlarged.
+
+    A GAP IN THE MASK IS NOT ALWAYS A TEAR. Between a sleeve and the body, or
+    through an open neck, the photograph shows the wall — those are real. So
+    every pixel the mask left out, inside the garment (an enclosed hole) or
+    just outside its outline (a piece bitten off — the hem v1 dropped from the
+    same jumper), is read in the PHOTOGRAPH against the colour of the NEAREST
+    garment pixel: a tear is that colour and far from the wall; a real opening
+    is the wall, and the booth's stand is neither. The rim right next to the
+    outline is left out, where every mask blends into its backdrop. A white
+    garment on a white wall cannot be told apart and is passed.
+
+    On a finer grid than the other checks (`torn_work_px`): v1's streaks
+    across the same jumper's green band are 3-4 px wide on a 2048 photo and
+    vanish at 448.
+    """
+    import numpy as np
+    from PIL import Image
+
+    cfg = cfg if cfg is not None else config()
+    if not cfg.get("torn_check", True):
+        return False, "not checked (torn_check off)"
+    try:
+        import cv2
+
+        src = Image.open(io.BytesIO(source)).convert("RGB")
+        cut = Image.open(io.BytesIO(result)).convert("RGBA")
+    except Exception as exc:  # noqa: BLE001
+        return False, f"not checked ({exc.__class__.__name__})"
+    work = int(cfg.get("torn_work_px") or 1024)
+    k = min(1.0, work / float(max(cut.size)))
+    size = (max(8, int(round(cut.width * k))), max(8, int(round(cut.height * k))))
+    raw = np.asarray(src.resize(size, Image.Resampling.BILINEAR)).astype(np.float32)
+    mask = (np.asarray(cut.getchannel("A").resize(size, Image.Resampling.NEAREST)) >= 128)
+    area = int(mask.sum())
+    if area < 500:
+        return False, "not checked (almost no garment)"
+
+    m8 = mask.astype(np.uint8)
+    # Enclosed holes: what a flood from the frame's border cannot reach.
+    flood = np.pad(1 - m8, 1, constant_values=1)
+    cv2.floodFill(flood, None, (0, 0), 2)
+    enclosed = (flood[1:-1, 1:-1] == 1)
+    # Narrow bites out of the outline: what a closing fills, past the blended
+    # rim. NOT everything just outside the outline — that was tried, and it
+    # counted the booth's own stand under the hem (a white form beside a white
+    # knit, a red strap) and the hanger's tag as tears: 1.7-1.8% on sound
+    # cut-outs. A garment piece dropped where the stand is cannot be told from
+    # the stand by colour, so a hem cut off wholesale is left to the photo
+    # audit.
+    unit = max(size) / 1024.0
+    c = max(3, int(round(float(cfg.get("torn_close_px") or 15) * unit))) | 1
+    closed = cv2.morphologyEx(m8, cv2.MORPH_CLOSE, np.ones((c, c), np.uint8)).astype(bool)
+    rim = max(1, int(round(float(cfg.get("torn_rim_px") or 2) * unit)))
+    dist_out = cv2.distanceTransform(1 - m8, cv2.DIST_L2, 5)
+    gaps = (enclosed & ~mask) | (closed & ~mask & (dist_out > rim))
+    reach = max(3, int(round(float(cfg.get("torn_reach") or 0.03) * max(size))))
+
+    # The colour of the nearest garment pixel, for every pixel off the mask.
+    _d, labels = cv2.distanceTransformWithLabels(1 - m8, cv2.DIST_L2, 5,
+                                                 labelType=cv2.DIST_LABEL_PIXEL)
+    gy, gx = np.nonzero(m8)             # scan order == label order for DIST_LABEL_PIXEL
+    colours = raw[gy, gx]
+    near_rgb = colours[np.clip(labels - 1, 0, len(colours) - 1)]
+
+    # THE WALL, LOCALLY: the colour of the nearest pixel a little further out
+    # than anything looked at. The photograph's border is the wrong answer on
+    # a lit booth wall — beside 1b242dd5's cream jersey the wall is lighter
+    # than at the frame's edge, so a border median called the whole wall round
+    # the jersey "not wall" and 21% of it a tear. Through an enclosed hole the
+    # nearest outer pixel is the wall round the garment, which is what shows.
+    far = (dist_out > 2 * reach).astype(np.uint8)
+    if far.sum() < 50:
+        return False, "not checked (no wall to compare with)"
+    _d2, far_lbl = cv2.distanceTransformWithLabels(1 - far, cv2.DIST_L2, 5,
+                                                   labelType=cv2.DIST_LABEL_PIXEL)
+    fy, fx = np.nonzero(far)
+    wall = raw[fy, fx][np.clip(far_lbl - 1, 0, fy.size - 1)]
+    garm_tol = float(cfg.get("torn_garment_tolerance") or 50)
+    wall_tol = float(cfg.get("torn_backdrop_tolerance") or 40)
+    like_garment = np.linalg.norm(raw - near_rgb, axis=2) < garm_tol
+    not_wall = np.linalg.norm(raw - wall, axis=2) > wall_tol
+    torn_px = gaps & like_garment & not_wall
+    # Specks are noise, not a tear.
+    torn_px = cv2.morphologyEx(torn_px.astype(np.uint8), cv2.MORPH_OPEN,
+                               np.ones((2, 2), np.uint8)).astype(bool)
+    share = float(torn_px.sum()) / area
+    floor = float(cfg.get("torn_min") or 0.0025)
+    if share >= floor:
+        return True, (f"the mask tore {share:.1%} of the garment out — holes that show the "
+                      f"garment's own colour in the photograph, not the wall")
+    return False, f"no tear ({share:.2%} of the garment)"
+
+
 # --------------------------------------------------------------------------- #
 # A replacement is never worse than what it replaces — item 8
 # --------------------------------------------------------------------------- #
@@ -1759,7 +1883,15 @@ def remove_background(
         # otherwise quietly run the default chain and produce the same stand
         # the caller asked a different segmenter for.
         return None, f"no background-removal strategy is named {', '.join(unknown)}", "none"
-    chain = tuple(s for s in chain if (wanted is None or s[0] in wanted) and s[0] not in banned)
+    everything = {s[0]: s for s in chain}
+    chain = [s for s in chain if (wanted is None or s[0] in wanted) and s[0] not in banned]
+    # A TORN CUT-OUT GOES TO GEMINI (30 Sep 2026). When a fine-tuned parser
+    # tears the garment (see _torn_garment), the raw photograph is also sent to
+    # this strategy — Gemini asked for the background-removed picture itself —
+    # even if the policy's chain does not list it. Its answer passes the same
+    # checks; if it cannot produce a good one, nothing is returned and the
+    # cut-out already on file is left alone.
+    torn_fallback = str(cfg.get("torn_fallback") or "")
     if not chain:
         return None, "every background-removal strategy was excluded by the caller", "none"
 
@@ -1813,6 +1945,10 @@ def remove_background(
                      "n/a" if agree is None else f"{agree:.3f}", need)
             return None, None
         out = ft_refused["cloth-seg-ft"]
+        torn, torn_why = _torn_garment(data, out, cfg)
+        if torn:
+            attempts.append(f"{AGREED}: {torn_why}")
+            return None, None
         if previous is not None:
             better, keep_why = garment_kept(previous, out, cfg)
             if not better:
@@ -1903,6 +2039,20 @@ def remove_background(
                 attempts.append(f"{label}: {backdrop_why}")
                 if name in FT:
                     ft_refused[name] = out
+                continue
+
+            # HOLES TORN IN THE GARMENT (see _torn_garment). Not added to
+            # `ft_refused`: two parsers agreeing on a torn outline is no reason
+            # to accept it, so this goes on to the next strategy (v1, Gemini).
+            torn, torn_why = _torn_garment(data, out, cfg)
+            if torn:
+                log.info("bg-removal %s tore the garment in %.1fs: %s", label, took, torn_why)
+                attempts.append(f"{label}: {torn_why}")
+                if (torn_fallback in everything and torn_fallback not in banned
+                        and all(s[0] != torn_fallback for s in chain)):
+                    log.info("bg-removal: a torn cut-out — the photograph goes to %s as well",
+                             torn_fallback)
+                    chain.append(everything[torn_fallback])
                 continue
 
             # LAST, AND A PRECONDITION (item 8). Everything above asks whether

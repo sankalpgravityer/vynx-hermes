@@ -922,6 +922,179 @@ def background_mismatch(border: dict[str, Any], expected: Backdrop,
 #
 # numpy, not the pure-PIL loops above: 270k pixels compared three ways.
 
+def _correlation(a: Any, b: Any) -> float | None:
+    """Pearson correlation of two brightness samples; None when either is flat."""
+    import numpy as np
+
+    if a.size < 500 or float(a.std()) <= 1.0 or float(b.std()) <= 1.0:
+        return None
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _register(cut_grey: Any, garment: Any, raw_grey: Any, backdrop: float,
+              fcfg: dict[str, Any]) -> dict[str, Any] | None:
+    """The scale and shift that put the photograph's garment on the cut-out's.
+
+    `cut = scale * raw + (dx, dy)`, on the working grid. Found by sliding the
+    cut-out's garment (its box, with the backdrop replaced by the photograph's
+    own wall colour so the flat white does not fight the match) over the
+    photograph at a ladder of scales, then refining around the best. Normalised
+    cross-correlation, so exposure does not matter. None without cv2 or a
+    garment to match.
+    """
+    import numpy as np
+
+    try:
+        import cv2
+    except Exception:  # noqa: BLE001
+        return None
+    ys = np.where(garment.any(axis=1))[0]
+    xs = np.where(garment.any(axis=0))[0]
+    if ys.size == 0 or xs.size == 0:
+        return None
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    img = raw_grey.astype(np.float32)
+    H, W = img.shape
+    bw, bh = x1 - x0, y1 - y0
+
+    # THE ROUGH SEARCH: MASKED, AND SMALL. Only the garment's own pixels are
+    # compared — a box with the backdrop filled in fought the decision studio's
+    # clutter (stands, reflectors, the rig) and peaked at the wrong scale — on a
+    # quarter-size grid, where a masked match is cheap enough for a ladder of
+    # scales.
+    q = float(fcfg.get("register_coarse") or 0.25)
+    small = cv2.resize(img, (max(8, int(W * q)), max(8, int(H * q))), interpolation=cv2.INTER_AREA)
+    sh, sw = small.shape
+    tpl = cut_grey[y0:y1, x0:x1].astype(np.float32)
+    tmask = garment[y0:y1, x0:x1].astype(np.float32)
+
+    def attempt(s: float):
+        tw, th = int(round(bw * q / s)), int(round(bh * q / s))
+        if tw < 6 or th < 6 or tw > sw or th > sh:
+            return None
+        t = cv2.resize(tpl, (tw, th), interpolation=cv2.INTER_AREA)
+        mk = (cv2.resize(tmask, (tw, th), interpolation=cv2.INTER_AREA) > 0.5).astype(np.float32)
+        if mk.sum() < 20 or float(t[mk > 0].std()) < 1.0:
+            return None
+        res = np.nan_to_num(cv2.matchTemplate(small, t, cv2.TM_CCOEFF_NORMED, mask=mk),
+                            nan=-1.0, posinf=-1.0, neginf=-1.0)
+        _mn, mx, _l, loc = cv2.minMaxLoc(res)
+        # Back to the working grid: the garment box's top-left in the photograph.
+        return float(mx), bw / (tw / q), bh / (th / q), (loc[0] / q, loc[1] / q)
+
+    lo = float(fcfg.get("register_scale_min") or 0.35)
+    hi = float(fcfg.get("register_scale_max") or 4.0)
+    found = []
+    for s in np.geomspace(lo, hi, int(fcfg.get("register_steps") or 40)):
+        got = attempt(float(s))
+        if got:
+            found.append(got)
+    if not found:
+        return None
+
+    # THE ROUGH PEAK IS A STARTING POINT, NOT THE ANSWER: a quarter-size grid
+    # is a pixel or two off at full size, and the pixel match notices. So the
+    # few best peaks at DIFFERENT scales are each refined on the quantity
+    # actually judged — the correlation over the garment's own pixels, on a
+    # fixed sample of them — and the best refined one wins.
+    gy, gx = np.nonzero(garment)
+    every = max(1, gy.size // int(fcfg.get("register_sample") or 6000))
+    gy, gx = gy[::every], gx[::every]
+    cut_px = cut_grey[gy, gx].astype(np.float32)
+
+    def match(s: float, dx: float, dy: float) -> float:
+        # The photograph sampled (bilinear) where each garment pixel lands.
+        px = (gx - dx) / s
+        py = (gy - dy) / s
+        ok = (px >= 0) & (py >= 0) & (px <= W - 1.001) & (py <= H - 1.001)
+        if ok.mean() < 0.8:
+            return -1.0
+        x, y = px[ok], py[ok]
+        xi, yi = x.astype(np.int32), y.astype(np.int32)
+        fx, fy = x - xi, y - yi
+        v = (img[yi, xi] * (1 - fx) * (1 - fy) + img[yi, xi + 1] * fx * (1 - fy)
+             + img[yi + 1, xi] * (1 - fx) * fy + img[yi + 1, xi + 1] * fx * fy)
+        c = _correlation(cut_px[ok], v)
+        return -1.0 if c is None else c
+
+    found.sort(key=lambda g: -g[0])
+    seeds: list[tuple[float, float, float]] = []
+    for score, sx, sy, (lx, ly) in found:
+        s = (sx + sy) / 2
+        if all(abs(s / t[0] - 1) > 0.06 for t in seeds):
+            seeds.append((s, x0 - s * lx, y0 - s * ly))
+        if len(seeds) >= int(fcfg.get("register_seeds") or 5):
+            break
+
+    best = None
+    for s, dx, dy in seeds:
+        cur = match(s, dx, dy)
+        step_s, step_p = 0.03, 4.0
+        while step_s > 0.002 or step_p > 0.4:
+            moved = False
+            for ds, ddx, ddy in ((step_s, 0, 0), (-step_s, 0, 0), (0, step_p, 0), (0, -step_p, 0),
+                                 (0, 0, step_p), (0, 0, -step_p)):
+                # A scale step about the garment's centre, so it does not also
+                # shift the garment and fight the translation steps.
+                ns = s * (1 + ds)
+                cx, cy = x0 + bw / 2, y0 + bh / 2
+                ndx = cx - (cx - dx) * ns / s + ddx
+                ndy = cy - (cy - dy) * ns / s + ddy
+                v = match(ns, ndx, ndy)
+                if v > cur + 1e-4:
+                    s, dx, dy, cur, moved = ns, ndx, ndy, v, True
+                    break
+            if not moved:
+                step_s, step_p = step_s / 2, step_p / 2
+        if best is None or cur > best[0]:
+            best = (cur, s, dx, dy)
+    cur, s, dx, dy = best
+    return {"scale": round(float(s), 4), "dx": round(float(dx), 2),
+            "dy": round(float(dy), 2), "score": round(float(cur), 3)}
+
+
+def standard_problem(box: dict[str, Any] | None, garment: dict[str, Any] | None,
+                     fcfg: dict[str, Any]) -> str | None:
+    """A sentence when a cut-out is not cropped and centred to the standard.
+
+    Only with framing on (app/imaging/framing.py). From the cut-out's own mask
+    box: the garment's centre against the frame's, and the share of the frame
+    it fills on its limiting axis against 1 - 2 x margin. TOO SMALL is judged
+    only when the enlargement is known — from the registration against the
+    photograph — because a garment photographed very small stops at
+    `max_scale` on purpose and must not be re-framed forever.
+    """
+    if not fcfg.get("enabled"):
+        return None
+    if not box or str(box.get("source") or "unknown") == "unknown" or not box.get("bbox"):
+        return None
+    from app.imaging.framing import target_fill
+
+    x0, y0, x1, y1 = (float(v) for v in box["bbox"])
+    lim = max(float(box.get("fill_w") or 0), float(box.get("fill_h") or 0))
+    target = target_fill(fcfg)
+    tol_f = float(fcfg.get("fill_tolerance") or 0.05)
+    tol_c = float(fcfg.get("center_tolerance") or 0.03)
+    dx, dy = (x0 + x1) / 2 - 0.5, (y0 + y1) / 2 - 0.5
+    said: list[str] = []
+    if abs(dx) > tol_c or abs(dy) > tol_c:
+        said.append(f"sits off centre ({dx:+.0%} across, {dy:+.0%} down)")
+    if lim > target + tol_f:
+        said.append(f"fills {lim:.0%} of the frame, tighter than the standard {target:.0%}")
+    elif lim < target - tol_f:
+        g = garment or {}
+        scale = (g.get("registered") or {}).get("scale")
+        if scale is None and g.get("pixel_match") is not None and float(g["pixel_match"]) >= 0.9:
+            scale = 1.0          # lines up with the photograph where it is: never enlarged
+        capped = scale is not None and float(scale) >= 0.97 * float(fcfg.get("max_scale") or 2.5)
+        if scale is not None and not capped:
+            said.append(f"fills only {lim:.0%} of the frame against the standard {target:.0%}")
+    if not said:
+        return None
+    return ("framing: the garment " + " and ".join(said) + " — not cropped and centred like the "
+            "rest of the catalogue. Re-cut it and frame it.")
+
+
 def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[str, Any] | None:
     """Measure the neckline hole of a cut-out against its photograph.
 
@@ -981,19 +1154,43 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
     if area < 100:
         return {"aligned": False, "mask": mask_info, "note": "no garment found in the cut-out"}
 
+    # The photograph's own backdrop, from its own border — taken BEFORE any
+    # registration below, which would move the garment into that border.
     raw_back = ring_median(r)
-    garment_rgb = np.median(r[garment], axis=0)
 
     # THE PIXEL MATCH (see `pixel_match_min`): the cut-out's garment pixels
     # against the photograph's at the same coordinates, as a correlation of
     # their brightness. Brightness only, so a backdrop colour, a white balance
     # or a contrast lift on an honest cut-out does not read as a different
     # picture; None when either side is flat (nothing to correlate).
-    cut_grey = np.asarray(cut_small.convert("RGB")).astype(np.float32).mean(axis=2)[garment]
-    raw_grey = r.mean(axis=2)[garment]
-    pixel_match = None
-    if cut_grey.size >= 500 and float(cut_grey.std()) > 1.0 and float(raw_grey.std()) > 1.0:
-        pixel_match = float(np.corrcoef(cut_grey, raw_grey)[0, 1])
+    cut_grey_all = np.asarray(cut_small.convert("RGB")).astype(np.float32).mean(axis=2)
+    pixel_match = _correlation(cut_grey_all[garment], r.mean(axis=2)[garment])
+
+    # A FRAMED CUT-OUT (app/imaging/framing.py) holds the garment scaled and
+    # centred, so at the same coordinates it matches nothing, and every test
+    # below would call the framing a zoom. With framing on, the photograph is
+    # REGISTERED to the cut-out first — the scale and shift that line the two
+    # up — and everything is measured there. What that leaves the pixel match
+    # to catch is the defect framing cannot excuse: a garment that is not the
+    # photograph's own pixels (re-drawn, "enhanced").
+    registered = None
+    fcfg = cfg.get("framing") or {}
+    if fcfg.get("enabled") and (pixel_match is None or pixel_match < float(
+            fcfg.get("register_below") or 0.9)):
+        reg = _register(cut_grey_all, garment, r.mean(axis=2), float(np.mean(raw_back)), fcfg)
+        if reg is not None:
+            import cv2
+
+            m = np.float32([[reg["scale"], 0, reg["dx"]], [0, reg["scale"], reg["dy"]]])
+            warped = cv2.warpAffine(r, m, (width, height), flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_REPLICATE)
+            pm = _correlation(cut_grey_all[garment], warped.mean(axis=2)[garment])
+            if pm is not None and pm > (pixel_match if pixel_match is not None else -1.0) + 0.05:
+                registered = {**reg, "pixel_match_unregistered": (
+                    None if pixel_match is None else round(pixel_match, 3))}
+                r, pixel_match = warped, pm
+
+    garment_rgb = np.median(r[garment], axis=0)
     # HOW FAR APART THE PHOTOGRAPH'S GARMENT AND ITS BACKDROP ACTUALLY ARE.
     #
     # This is the number that decides whether `overlap` below means anything, and
@@ -1040,6 +1237,10 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
     out = {
         "aligned": aligned, "overlap": round(overlap, 3),
         "pixel_match": None if pixel_match is None else round(pixel_match, 3),
+        # Where the photograph had to be moved to line up (framing): None when
+        # it lined up where it was. `scale` is the cut-out's garment over the
+        # photograph's.
+        "registered": registered,
         # The separation, and the two colours it was taken between, so a reading
         # of the JSON can see WHY the alignment test judged or abstained without
         # re-deriving anything from the pictures.
@@ -1134,9 +1335,16 @@ def frame_problem(m: dict[str, Any] | None, cfg: dict[str, Any], *,
     pm = (m or {}).get("pixel_match")
     pm_min = float(gc.get("pixel_match_min") or 0.0)
     if pm is not None and pm_min > 0 and float(pm) < pm_min:
-        text = (f"framing: the cut-out's garment does not line up with its photograph "
-                f"(pixel match {float(pm):.2f}; a correct cut-out scores over 0.90) — it is "
-                f"zoomed, cropped, shifted or re-drawn against the photograph it was cut from")
+        reg = (m or {}).get("registered")
+        if reg:
+            # Already lined up for the framing, and still not the same pixels.
+            text = (f"framing: the cut-out's garment is not the photograph's own pixels even "
+                    f"lined up at {float(reg.get('scale') or 1):.2f}x (pixel match {float(pm):.2f}; "
+                    f"a correct cut-out scores over 0.90) — it is re-drawn or enhanced")
+        else:
+            text = (f"framing: the cut-out's garment does not line up with its photograph "
+                    f"(pixel match {float(pm):.2f}; a correct cut-out scores over 0.90) — it is "
+                    f"zoomed, cropped, shifted or re-drawn against the photograph it was cut from")
         if not derived:
             return (text + "; the original was matched by view, not by a derivation edge, "
                     "so the two may simply be different photographs"), False
@@ -1362,7 +1570,12 @@ def judge(p: Any, pol: dict[str, Any] | None, *,
     from app.net import fetch_all, image_dims_all
     from app.rules import imagery
 
+    from app.imaging import framing
+
     cfg = config(pol)
+    # What the cut-outs are MEANT to look like (`imagery.cutout.framing`):
+    # garment_hole registers against it and standard_problem judges it.
+    cfg["framing"] = framing.config(pol if pol is not None else {})
     hold = str(cfg.get("hold") or "soft")
     if not enabled(pol):
         return CutoutVerdict("skipped", hold, reasons=["disabled in policy (readiness.cutouts)"])
@@ -1488,13 +1701,26 @@ def judge(p: Any, pol: dict[str, Any] | None, *,
         elif raw is not None and gc_on:
             check["garment_note"] = "photograph could not be downloaded — garment not compared"
 
+        # CROPPED AND CENTRED LIKE THE REST (framing). Last, and only when
+        # nothing above already asks for a re-cut: that re-cut frames it too.
+        if not check["problems"]:
+            why = standard_problem(border.get("box"), check.get("garment"), cfg["framing"])
+            if why:
+                check["problems"].append(why)
+
         checks.append(check)
 
     # THE CROSS-VIEW SCALE TEST, after the loop because it is the one question
     # that is about the product rather than about a picture. Folded into the
     # per-check `problems` first, so a reader of the JSON finds it on the row it
     # belongs to rather than only in the run's reasons.
-    for view, why in scale_outliers(checks, cfg).items():
+    #
+    # NOT WITH FRAMING ON. Framed cut-outs are MEANT to differ from the scale
+    # they were photographed at, and a framed FRONT beside a BACK not yet
+    # framed would read as "zoomed"; the registration against the photograph
+    # and standard_problem cover what this was for.
+    outliers = {} if cfg["framing"].get("enabled") else scale_outliers(checks, cfg)
+    for view, why in outliers.items():
         for c in checks:
             if str(c.get("view") or "?") == view and c.get("measured"):
                 if why not in c["problems"]:

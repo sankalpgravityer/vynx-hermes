@@ -749,6 +749,10 @@ class CutoutRequest(BaseModel):
     # way (§2.1). Omitted, nothing is compared and nothing is refused.
     previous_base64: str | None = None
     previous_url: str | None = None
+    # CROP AND CENTRE THE RESULT (app/imaging/framing.py). Omitted, policy
+    # decides (`imagery.cutout.framing.enabled`); false keeps the photograph's
+    # own framing.
+    frame: bool | None = None
 
 
 class CutoutResponse(BaseModel):
@@ -764,6 +768,22 @@ class CutoutResponse(BaseModel):
     # between this and `ok: false` with an error, and the reason it is a field
     # of its own rather than a sentence in one.
     kept_existing: bool = False
+    # What framing did: the scale, where the garment was and where it now is.
+    framing: dict | None = None
+
+
+def _framed(out: bytes, frame: bool | None) -> tuple[bytes, dict | None]:
+    """The cut-out cropped and centred, when the request or policy asks for it."""
+    from app.imaging import framing
+
+    fcfg = framing.config()
+    if not (fcfg.get("enabled") if frame is None else frame):
+        return out, None
+    try:
+        return framing.frame_cutout(out, fcfg)
+    except Exception as exc:  # noqa: BLE001 — an unframed cut-out beats none
+        log.warning("framing failed, returning the cut-out unframed: %s", exc)
+        return out, {"framed": False, "note": f"framing failed ({exc.__class__.__name__})"}
 
 
 @app.post("/v1/imagery/remove-background", response_model=CutoutResponse)
@@ -839,6 +859,11 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
     out, err, provider = cutout.remove_background(
         raw, timeout_s=req.timeout_s,
         strategies=req.strategies, skip=req.skip, previous=previous)
+    # AFTER every check and the keep-better comparison: those judge the
+    # segmentation, on the photograph's own frame; framing only moves it.
+    framing_info = None
+    if out is not None:
+        out, framing_info = _framed(out, req.frame)
     return CutoutResponse(
         ok=out is not None,
         image_base64=_b64.b64encode(out).decode() if out else None,
@@ -846,6 +871,7 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
         error=err,
         kept_existing=provider == cutout.KEPT_EXISTING,
         duration_ms=int((_time.perf_counter() - started) * 1000),
+        framing=framing_info,
     )
 
 
@@ -855,9 +881,11 @@ class CutoutUrlRequest(BaseModel):
     image_url: str | None = None
     image_base64: str | None = None
     timeout_s: float = 180.0
+    # Crop and centre (see CutoutRequest.frame); omitted, policy decides.
+    frame: bool | None = None
 
 
-def _cutout_png(raw: bytes, timeout_s: float):
+def _cutout_png(raw: bytes, timeout_s: float, frame: bool | None = None):
     """Cut `raw` with the URL endpoint's chain; the PNG at the photo's resolution."""
     import io as _io
     import os as _os
@@ -902,9 +930,12 @@ def _cutout_png(raw: bytes, timeout_s: float):
         buf = _io.BytesIO()
         img.save(buf, format="PNG", optimize=True)
         out = buf.getvalue()
+    out, framing_info = _framed(out, frame)
     return Response(content=out, media_type="image/png", headers={
         "X-Cutout-Provider": provider,
         "X-Cutout-Width": str(img.width), "X-Cutout-Height": str(img.height),
+        "X-Cutout-Framed": "yes" if (framing_info or {}).get("framed") else "no",
+        "X-Cutout-Scale": str((framing_info or {}).get("scale", 1.0)),
         "X-Duration-Ms": str(ms),
     })
 
@@ -962,15 +993,15 @@ def imagery_cutout(req: CutoutUrlRequest, x_api_key: str | None = Header(default
         raw = _fetch_image(req.image_url)
     else:
         raise HTTPException(400, "pass image_url or image_base64")
-    return _cutout_png(raw, req.timeout_s)
+    return _cutout_png(raw, req.timeout_s, req.frame)
 
 
 @app.get("/v1/imagery/cutout")
-def imagery_cutout_get(image_url: str, timeout_s: float = 180.0,
+def imagery_cutout_get(image_url: str, timeout_s: float = 180.0, frame: bool | None = None,
                        x_api_key: str | None = Header(default=None)):
-    """The same, as a GET: /v1/imagery/cutout?image_url=<url-encoded URL>."""
+    """The same, as a GET: /v1/imagery/cutout?image_url=<url-encoded URL>[&frame=false]."""
     _check_cutout_key(x_api_key)
-    return _cutout_png(_fetch_image(image_url), timeout_s)
+    return _cutout_png(_fetch_image(image_url), timeout_s, frame)
 
 
 @app.post("/v1/imagery/verify", response_model=ImageryVerdict)

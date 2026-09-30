@@ -609,6 +609,19 @@ imagery:
     # is PAID (tried twice) and only runs when v2 and v1 are both refused and
     # disagree.
     url_strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
+    # CROP AND CENTRE EVERY CUT-OUT (30 Sep 2026; app/imaging/framing.py). The
+    # garment's own pixels, scaled by one factor so it fills 1 - 2 x margin of
+    # the frame on its limiting axis (0.90 at margin 0.05), centred on a canvas
+    # the photograph's size. A crop and a resize — nothing is re-drawn. The
+    # checks register the photograph to the cut-out before comparing them, and
+    # re-cut any cut-out not framed to this standard. `enabled: false` returns
+    # the photograph's own framing again; a request can also pass frame: false.
+    framing:
+      enabled: true
+      margin: 0.05
+      max_scale: 2.5
+      fill_tolerance: 0.05
+      center_tolerance: 0.03
     # The long edge every pixel comparison below is made on. 448 to match
     # `readiness.cutouts.garment_check.work_width`: the two ask the same
     # question of the same garment and a different grid would give them

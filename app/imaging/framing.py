@@ -1,0 +1,196 @@
+"""Crop and centre a cut-out: every garment at one scale, in the middle of its frame.
+
+30 Sep 2026. A booth photographs the garment wherever it hangs — high, low, small
+in a corner of a 3000x4000 frame — so the cut-outs that come out of it are the
+same photographs with the wall taken away, and a gallery of them looks untidy:
+one shirt fills the picture, the next is a small thing near the top.
+
+THIS IS A CROP AND A RESIZE, NOTHING ELSE. The garment's own pixels are cut out
+of the cut-out along its bounding box, scaled by one factor (the same on both
+axes) and pasted in the centre of a transparent canvas of the SAME size as the
+photograph. No model looks at it and nothing is re-drawn, sharpened or relit,
+which is the whole difference between this and the "zoomed and enhanced" Gemini
+cut-outs: those were a different picture; this is the same picture, framed.
+
+    before   3000x4000, shirt 1200x1500 at the top left
+    after    3000x4000, the same shirt at 2.4x — 3600 tall would not fit, so
+             the height decides: 4000 x 0.90 = 3600 / 1500 = 2.4 — centred
+
+WHAT THE CHECKS NEED TO KNOW ABOUT IT. The garment no longer sits where the
+photograph has it, so every test that laid the cut-out over its photograph at
+the same coordinates would call the framing a zoom. cutouts.garment_hole
+REGISTERS the photograph to the cut-out first (it finds the scale and shift
+that line the two up) and measures there; see cutouts._register.
+"""
+from __future__ import annotations
+
+import io
+import logging
+from copy import deepcopy
+from typing import Any
+
+log = logging.getLogger("hermes.cutout")
+
+# `imagery.cutout.framing` in policy.
+DEFAULTS: dict[str, Any] = {
+    # Frame every cut-out Hermes returns from /v1/imagery/remove-background (the
+    # auto-approval matte) and /v1/imagery/cutout. A request can still pass
+    # `frame: false` for the photograph's own framing.
+    "enabled": True,
+    # The empty band left on EACH side of the axis the garment fills: 0.05 is a
+    # garment 90% of the frame's height (or width, for a wide one) — the look of
+    # a shop's catalogue, with room left for a sleeve not to kiss the edge.
+    # It also keeps the other checks quiet by construction: a framed box covers
+    # at most 0.90 x 0.90 = 0.81 of the frame, under `box_fill_max`, and no edge
+    # is touched.
+    "margin": 0.05,
+    # The largest enlargement. A garment photographed very small would otherwise
+    # be blown up until it is soft; past this it stays smaller than the standard,
+    # centred all the same. 2.5x takes a garment from 36% of a frame's height
+    # to 90%.
+    "max_scale": 2.5,
+    # The alpha at which a pixel is garment, for the bounding box.
+    "alpha_threshold": 128,
+    # Loose specks — a thread, a speck of the wall the mask kept — must not
+    # decide where the box is. A separate piece smaller than this share of the
+    # garment is left out of the box (and, outside it, out of the picture). A
+    # real part of the garment that is detached in the mask (a belt, a tie) is
+    # far bigger than a speck.
+    "speck_max": 0.005,
+    # Pixels of the garment's soft edge kept outside the hard box.
+    "edge_pad_px": 3,
+    # Already framed: nothing is resampled a second time.
+    "same_scale": 0.01,
+    "same_offset": 0.005,
+    # --- the judge (cutouts.standard_problem) ------------------------------
+    # How far from the standard a cut-out may sit before it is re-framed.
+    "fill_tolerance": 0.05,
+    "center_tolerance": 0.03,
+}
+
+
+def config(pol: dict[str, Any] | None = None) -> dict[str, Any]:
+    """`imagery.cutout.framing` with defaults filled in."""
+    if pol is None:
+        from app.config import policy
+
+        pol = policy()
+    out = deepcopy(DEFAULTS)
+    over = (((pol or {}).get("imagery") or {}).get("cutout") or {}).get("framing")
+    if isinstance(over, bool):
+        over = {"enabled": over}
+    over = over or {}
+    for k, v in over.items():
+        if v is not None:
+            out[k] = v
+    return out
+
+
+def target_fill(cfg: dict[str, Any]) -> float:
+    """The share of the frame the garment fills on its limiting axis."""
+    return max(0.1, 1.0 - 2.0 * float(cfg.get("margin") or 0.0))
+
+
+def _garment_box(alpha: Any, cfg: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    """(x0, y0, x1, y1), exclusive, of the garment without its loose specks."""
+    import numpy as np
+
+    mask = alpha >= int(cfg.get("alpha_threshold") or 128)
+    total = int(mask.sum())
+    if total == 0:
+        return None
+    boxes: list[tuple[int, int, int, int]] = []
+    try:
+        import cv2
+
+        n, _lbl, stats, _c = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+        floor = float(cfg.get("speck_max") or 0.0) * total
+        for i in range(1, n):
+            if stats[i, cv2.CC_STAT_AREA] >= floor:
+                x, y, w, h = (int(stats[i, k]) for k in (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP,
+                                                          cv2.CC_STAT_WIDTH, cv2.CC_STAT_HEIGHT))
+                boxes.append((x, y, x + w, y + h))
+    except Exception:  # noqa: BLE001 — no cv2: every garment pixel counts
+        boxes = []
+    if not boxes:
+        rows = np.where(mask.any(axis=1))[0]
+        cols = np.where(mask.any(axis=0))[0]
+        boxes = [(int(cols.min()), int(rows.min()), int(cols.max()) + 1, int(rows.max()) + 1)]
+    return (min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+
+def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bytes, dict[str, Any]]:
+    """The cut-out with its garment scaled to the standard and centred.
+
+    Returns (png, info). The canvas is the input's — the photograph's size and
+    ratio, so the canvas check still holds. The input is returned untouched,
+    with `framed: False` and a `note`, when it has no alpha to find the garment
+    by (an opaque picture), no garment, or is already framed.
+    """
+    import numpy as np
+    from PIL import Image
+
+    cfg = cfg if cfg is not None else config()
+    try:
+        im = Image.open(io.BytesIO(png))
+        im.load()
+        im = im.convert("RGBA")
+    except Exception as exc:  # noqa: BLE001
+        return png, {"framed": False, "note": f"could not decode ({exc.__class__.__name__})"}
+    W, H = im.size
+    alpha = np.asarray(im.getchannel("A"))
+    if float((alpha == 0).mean()) < 0.02:
+        # Every stored cut-out that went through a compositor is opaque; there is
+        # no alpha to say where the garment is, and guessing from colour is the
+        # judge's job (cutouts.garment_mask), not something to crop by.
+        return png, {"framed": False, "note": "no transparency — the garment cannot be located"}
+    box = _garment_box(alpha, cfg)
+    if box is None:
+        return png, {"framed": False, "note": "no garment in the cut-out"}
+    # The HARD box decides the scale and the centre; the crop takes a few pixels
+    # more so the garment's soft edge comes along.
+    x0, y0, x1, y1 = box
+    bw, bh = x1 - x0, y1 - y0
+    fill = target_fill(cfg)
+    scale = min(fill * W / bw, fill * H / bh, float(cfg.get("max_scale") or 2.5))
+    gl, gt = (W - bw * scale) / 2, (H - bh * scale) / 2      # where the hard box lands
+    info: dict[str, Any] = {
+        "framed": True, "scale": round(scale, 4), "canvas": [W, H],
+        "garment_box": [x0, y0, x1, y1],
+        "placed_at": [round(gl), round(gt), round(gl + bw * scale), round(gt + bh * scale)],
+        "fill_w": round(bw * scale / W, 4), "fill_h": round(bh * scale / H, 4),
+        "capped": scale >= float(cfg.get("max_scale") or 2.5) - 1e-6,
+    }
+
+    if (abs(scale - 1.0) <= float(cfg.get("same_scale") or 0.0)
+            and abs(gl - x0) <= max(1.0, float(cfg.get("same_offset") or 0.0) * W)
+            and abs(gt - y0) <= max(1.0, float(cfg.get("same_offset") or 0.0) * H)):
+        info.update(framed=False, note="already framed")
+        return png, info
+
+    pad = int(cfg.get("edge_pad_px") or 0)
+    px0, py0 = max(0, x0 - pad), max(0, y0 - pad)
+    px1, py1 = min(W, x1 + pad), min(H, y1 + pad)
+    crop = im.crop((px0, py0, px1, py1))
+    nw = max(1, int(round((px1 - px0) * scale)))
+    nh = max(1, int(round((py1 - py0) * scale)))
+    left = int(round(gl - (x0 - px0) * scale))
+    top = int(round(gt - (y0 - py0) * scale))
+    # RGB and alpha resized apart, as _cutout_png does: a transparent pixel's
+    # colour must not bleed into the garment's edge as a dark fringe.
+    resample = Image.Resampling.LANCZOS
+    rgb = crop.convert("RGB").resize((nw, nh), resample)
+    a = crop.getchannel("A").resize((nw, nh), resample)
+    garment = Image.merge("RGBA", (*rgb.split(), a))
+    canvas = Image.new("RGBA", (W, H), (255, 255, 255, 0))
+    # Only the soft-edge pad can reach past the canvas; paste clips it.
+    canvas.paste(garment, (left, top))
+    arr = np.asarray(canvas).copy()
+    arr[arr[:, :, 3] == 0] = (255, 255, 255, 0)
+
+    buf = io.BytesIO()
+    Image.fromarray(arr, "RGBA").save(buf, format="PNG", optimize=True)
+    log.info("framing: garment %dx%d at (%d,%d) scaled %.2fx and centred on %dx%d%s",
+             bw, bh, x0, y0, scale, W, H, " (capped)" if info["capped"] else "")
+    return buf.getvalue(), info
