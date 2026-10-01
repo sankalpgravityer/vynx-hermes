@@ -402,6 +402,11 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
     # modes follow remote_supports the same way.
     if "--no-publish" in args:
         options["noPublish"] = True
+    # The agent's Shopify status on approval (the Brain's
+    # publishActiveOnApprove); approve_check sends it only to a server that
+    # lists it. A closed enum on the server, like every other option.
+    if "--publish-status" in args:
+        options["publishStatus"] = args[args.index("--publish-status") + 1]
     if "--rounding-only" in args:
         options["roundingOnly"] = True
     if "--skip-rounding" in args:
@@ -1054,8 +1059,16 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
                   apply: bool, skip_bin: bool,
                   quiet: bool,
                   allow_stage: list[str] | None = None,
-                  publish: bool = True) -> dict[str, Any]:
+                  publish: bool = True,
+                  publish_status: str | None = None) -> dict[str, Any]:
     """Run approve-products.ts and read back its structured verdict.
+
+    `publish_status` ('active' | 'draft') is the Auto Approval agent's Shopify
+    status for this approval — the runner passes it, a person at the CLI never
+    does, so a manual approval is exactly what it always was. vnyx-api writes
+    the product Draft (Archived stays Archived) and sets it to what Shopify
+    reports once the push lands. A server too old to take it approves the old
+    way, and the verdict says so (`publishStatusSkipped`).
 
     Shelled out rather than reimplemented for the reason in the module
     docstring: the pre-flight is only half of it, and the other half —
@@ -1078,6 +1091,12 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
         args.append("--apply")
     if not publish:
         args.append("--no-publish")
+    status_skipped = False
+    if apply and publish and publish_status in ("active", "draft"):
+        if remote_supports("publishStatus"):
+            args.extend(["--publish-status", publish_status])
+        else:
+            status_skipped = True
     if skip_bin:
         args.append("--skip-bin")
     if allow_stage:
@@ -1096,7 +1115,10 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
     rows = payload.get("results") or []
     if not rows:
         raise StepFailed("approve-products.ts returned no verdict")
-    return rows[0]
+    verdict = rows[0]
+    if status_skipped:
+        verdict = {**verdict, "publishStatusSkipped": publish_status}
+    return verdict
 
 
 def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
@@ -1126,6 +1148,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            #                 after a run that changed it. Never creates one.
            price_mode: str | None = None,
            publish: bool = True,
+           # 'active' | 'draft': the Shopify status the AGENT's approval
+           # publishes with (the Brain's publishActiveOnApprove). None — every
+           # manual/CLI run — approves exactly as it always has.
+           publish_status: str | None = None,
            sync_changes: bool = False,
            ) -> dict[str, Any]:
     # SILENT SHADOWS THE BUILTIN, deliberately and only inside this function.
@@ -2564,7 +2590,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                                 apply=apply and approve and not blocked,
                                 skip_bin=skip_bin,
                                 quiet=quiet, allow_stage=allow_stage,
-                                publish=publish)
+                                publish=publish, publish_status=publish_status)
         if blocked:
             gate_problems = [f"{label}: {r}" for label, v in refusing for r in v.reasons]
             # A real refusal names its code; only when EVERY refusing verdict is
@@ -2587,8 +2613,21 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         outcome = verdict.get("outcome", "?")
         problems = verdict.get("problems") or []
         if outcome == "approved":
-            pushed = ("Shopify upsert enqueued" if verdict.get("published", True)
-                      else "NOT published — the Brain has the Shopify push off")
+            ps = verdict.get("publishStatus")
+            if not verdict.get("published", True):
+                pushed = "NOT published — the Brain has the Shopify push off"
+            elif ps == "active":
+                pushed = ("Shopify upsert enqueued as ACTIVE — the status turns Active "
+                          "once Shopify has it live")
+            elif ps == "draft":
+                pushed = "Shopify upsert enqueued as a DRAFT — status Draft"
+            elif ps == "archived":
+                pushed = "Archived on Shopify — kept Archived, synced only"
+            elif verdict.get("publishStatusSkipped"):
+                pushed = ("Shopify upsert enqueued the old way — this vnyx-api cannot "
+                          "take publishStatus yet")
+            else:
+                pushed = "Shopify upsert enqueued"
             return (f'APPROVED — {verdict.get("stageBefore")} '
                     f'{ARROW} {verdict.get("stageAfter")}, {pushed}')
         if (outcome == "would_approve" and apply and approve and not publish
@@ -2637,10 +2676,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # (reconcile runs on every product).
     wrote = bool(apply) and sync_changes and (
         needs(dsn, product_id)["loaded"]["record"].get("updatedAt") != started_updated_at)
-    if not sync_changes:
-        sync_why = "off in the Brain (syncChangesToShopify)"
-    elif verdict.get("outcome") == "approved":
+    # "Just approved" FIRST: the approval has already pushed this product, so
+    # the re-sync is not needed whatever the switch says — and naming the
+    # switch instead read as though the product had not gone to Shopify.
+    if verdict.get("outcome") == "approved":
         sync_why = "just approved — the approval pushed it"
+    elif not sync_changes:
+        sync_why = "off in the Brain (syncChangesToShopify)"
     elif not wrote:
         sync_why = "nothing was repaired this run"
     elif not shopify_product_id(dsn, product_id):

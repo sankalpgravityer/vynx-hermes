@@ -472,6 +472,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
         f"{'' if rs.gate else ' · image gate off'}"
         f"{'' if rs.price_mode == 'full' else f' · price {rs.price_mode}'}"
         f"{'' if rs.publish_on_approve else ' · Shopify push off'}"
+        f"{' · publish as Active' if rs.publish_on_approve and rs.publish_active else ''}"
         f"{' · sync repairs to Shopify' if rs.sync_changes else ''}",
         run_id=row["runId"],
         run_product_id=row["id"],
@@ -555,6 +556,9 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                 skip_gate=not rs.gate,
                 price_mode=price_mode,
                 publish=rs.publish_on_approve,
+                # The agent's approvals only (this is the runner, never the
+                # manual flow): which Shopify status the approval publishes with.
+                publish_status="active" if rs.publish_active else "draft",
                 sync_changes=rs.sync_changes,
                 approve=approve,
                 skip_bin=rs.skip_bin_placement,

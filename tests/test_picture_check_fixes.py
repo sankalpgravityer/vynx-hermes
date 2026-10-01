@@ -383,6 +383,11 @@ def providers(monkeypatch):
     monkeypatch.setattr(cutout, "_cloth_seg", fake_cloth)
     monkeypatch.setattr(cutout, "_gemini", fake_gemini)
     monkeypatch.setattr(cutout, "_openai", fake_openai)
+    # NOT THIS MACHINE'S MODELS. A .env naming the fine-tuned parsers (as a dev
+    # box running the agent does) would otherwise put the real ONNX files in the
+    # chain; tests that want them set the paths themselves.
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", "")
+    monkeypatch.setattr(cutout, "_CLOTH_FT_BACKUP_PATH", "")
     # The mask strategies return a SILHOUETTE; _apply_mask is what turns one
     # into a cut-out of the original bytes. Stubbed so a test can hand back a
     # finished cut-out and still exercise the chain around it.
@@ -517,6 +522,9 @@ def test_every_strategy_is_handed_the_upright_photograph(monkeypatch):
         return None, "stubbed"
 
     monkeypatch.setattr(cutout, "_cloth_seg", fake_cloth)
+    # The stock chain, whatever this machine's .env names (see `providers`).
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", "")
+    monkeypatch.setattr(cutout, "_CLOTH_FT_BACKUP_PATH", "")
     cutout.remove_background(sideways_jpeg(6), timeout_s=1)
     assert seen == [(300, 400)]
 

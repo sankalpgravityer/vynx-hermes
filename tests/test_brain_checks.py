@@ -122,6 +122,13 @@ def test_the_compiled_checks_are_read():
         (False, False, "rounding_only", False, True)
 
 
+def test_publish_active_is_off_unless_the_brain_says_so():
+    """The Brain's publishActiveOnApprove, compiled as chain.publishActive."""
+    assert settings_from_snapshot({}).publish_active is False
+    rs = settings_from_snapshot({"brain": {"compiled": {"chain": {"publishActive": True}}}})
+    assert rs.publish_active is True
+
+
 def test_an_unknown_price_mode_falls_back_to_the_full_step():
     rs = settings_from_snapshot({"brain": {"compiled": {"chain": {"priceMode": "later"}}}})
     assert rs.price_mode == "full"
@@ -167,7 +174,7 @@ def wired(monkeypatch):
         return True, "", None
 
     def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet,
-                           allow_stage=None, publish=True):
+                           allow_stage=None, publish=True, publish_status=None):
         calls["approve"].append({"apply": apply, "publish": publish})
         return dict(outcome)
 
@@ -258,6 +265,15 @@ def test_sync_is_off_by_default(wired):
     assert "off in the Brain" in step(r, "sync")["why"]
 
 
+def test_after_an_approval_sync_says_the_approval_pushed_it(wired):
+    """Not "off in the Brain": the approval itself enqueued the Shopify push."""
+    wired["approve"].update({"outcome": "approved", "stageBefore": "REVIEW",
+                             "stageAfter": "APPROVED"})
+    r = _repair(approve=True)
+    assert step(r, "sync")["ran"] is False
+    assert "the approval pushed it" in step(r, "sync")["why"]
+
+
 def test_sync_skips_a_run_that_wrote_nothing(wired):
     wired["shopify"]["id"] = "gid://shopify/Product/1"
     r = _repair(sync_changes=True)
@@ -310,6 +326,64 @@ def test_approve_check_withholds_the_move_when_the_server_cannot_hold_the_push(m
     assert "--apply" not in sent[-1]
 
 
+def _approve(monkeypatch, *, supports=True, verdict=None, **kw):
+    sent: list[list[str]] = []
+    monkeypatch.setattr(rp, "remote_supports", lambda *o: supports)
+    monkeypatch.setattr(rp, "run_step", lambda v, s, a, **k: sent.append(a) or
+                        (True, "", {"results": [verdict or {"outcome": "approved"}]}))
+    out = rp.approve_check(Path("."), DSN, PID, skip_bin=False, quiet=True, **kw)
+    return sent[-1], out
+
+
+def test_the_agents_approval_carries_its_shopify_status(monkeypatch):
+    args, _ = _approve(monkeypatch, apply=True, publish=True, publish_status="active")
+    assert args[args.index("--publish-status") + 1] == "active"
+    args, _ = _approve(monkeypatch, apply=True, publish=True, publish_status="draft")
+    assert args[args.index("--publish-status") + 1] == "draft"
+
+
+def test_a_manual_approval_never_sends_a_shopify_status(monkeypatch):
+    """None — the CLI and every caller but the runner — approves as it always did."""
+    args, _ = _approve(monkeypatch, apply=True, publish=True)
+    assert "--publish-status" not in args
+
+
+def test_no_status_without_the_push_or_without_approving(monkeypatch):
+    args, _ = _approve(monkeypatch, apply=True, publish=False, publish_status="active")
+    assert "--publish-status" not in args and "--no-publish" in args
+    args, _ = _approve(monkeypatch, apply=False, publish=True, publish_status="active")
+    assert "--publish-status" not in args
+
+
+def test_an_older_vnyx_api_approves_the_old_way_and_says_so(monkeypatch):
+    args, out = _approve(monkeypatch, supports=False, apply=True, publish=True,
+                         publish_status="active")
+    assert "--publish-status" not in args and "--apply" in args
+    assert out["publishStatusSkipped"] == "active"
+
+
+def test_run_remote_sends_the_publish_status_as_a_typed_option(monkeypatch):
+    sent: dict[str, Any] = {}
+
+    class Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"ok": True, "output": "", "results": None}
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "post", lambda url, json, headers, timeout: sent.update(json) or Resp())
+    monkeypatch.setenv("VNYX_API_URL", "http://api.test")
+    monkeypatch.setenv("AUTO_APPROVAL_INTERNAL_SECRET", "s")
+    monkeypatch.setattr(rp, "_REMOTE_ASYNC", False, raising=False)
+    rp.run_remote("approve-products.ts",
+                  ["--db", DSN, "--product", PID, "--apply", "--publish-status", "active"],
+                  timeout_s=10, quiet=True)
+    assert sent["options"] == {"publishStatus": "active", "approve": True}
+
+
 def test_run_remote_sends_the_brain_flags_as_typed_options(monkeypatch):
     sent: dict[str, Any] = {}
 
@@ -325,6 +399,10 @@ def test_run_remote_sends_the_brain_flags_as_typed_options(monkeypatch):
     monkeypatch.setattr(httpx, "post", lambda url, json, headers, timeout: sent.update(json) or Resp())
     monkeypatch.setenv("VNYX_API_URL", "http://api.test")
     monkeypatch.setenv("AUTO_APPROVAL_INTERNAL_SECRET", "s")
+    # The synchronous call. Pinned, because a real vnyx-api answering the ping
+    # earlier in the process (a local dev server) would otherwise leave the
+    # background-step path cached on.
+    monkeypatch.setattr(rp, "_REMOTE_ASYNC", False, raising=False)
     rp.run_remote("approve-products.ts", ["--db", DSN, "--product", PID, "--apply", "--no-publish"],
                   timeout_s=10, quiet=True)
     assert sent["options"] == {"noPublish": True, "approve": True}
