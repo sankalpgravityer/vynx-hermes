@@ -374,6 +374,27 @@ class ProductSnapshot(BaseModel):
             and m.url
         ]
 
+    @property
+    def garment_view_urls(self) -> list[str]:
+        """The whole garment, FRONT then BACK — the cut-out when there is one,
+        else the photograph — from the typed media rows. Empty without them.
+
+        For the evidence layer's FILE-THE-GARMENT question (1 Oct 2026). It used
+        to see `images[:n]`, the gallery cache in whatever order it happened to
+        be in; on three Levi's shorts that was close-ups, and the model said so —
+        "leg length is not visible" — then filed them as Jeans from the label's
+        "511 W34 L34". The garment type is a question about the WHOLE garment.
+        """
+        out: list[str] = []
+        for view in ("FRONT", "BACK"):
+            rows = [m for m in self.media
+                    if (m.view or "").upper() == view and m.is_current
+                    and not m.deleted_at and m.url]
+            rows.sort(key=lambda m: 0 if (m.processing or "").upper() == "BG_REMOVED" else 1)
+            if rows:
+                out.append(rows[0].url)
+        return out
+
     def prov(self, field: str) -> Provenance:
         if field in self.locked_fields:
             return Provenance.HUMAN

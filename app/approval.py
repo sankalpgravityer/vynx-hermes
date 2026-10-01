@@ -793,6 +793,9 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
             plan.append({
                 "kind": "set_column", "field": "subCategory", "value": named[0],
                 "reason": "DATA.010", "detail": named[1],
+                # Title words are the weakest evidence for the garment TYPE; the
+                # photographs may overrule this (_photo_type_over_title).
+                "source": "title",
             })
         # None named, or no clear house spelling: left for the evidence layer or
         # a human. No escalate entry here — _plan_escalations already names an
@@ -836,6 +839,7 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
             "reason": "TAX.003",
             "detail": (f"'{p.subcategory}' is not offered under "
                        f"'{p.master_category} > {p.category}'; {named[1]}"),
+            "source": "title",
         })
         return
 
@@ -1062,6 +1066,71 @@ def _plan_column_drift(findings: list[Finding],
             })
 
 
+def _photo_type_over_title(p: ProductSnapshot, plan: list[dict[str, Any]],
+                           ev: Any, pol: dict[str, Any]) -> None:
+    """Overrule a subcategory taken from the TITLE when the photographs show a
+    different garment TYPE (policy `garment_types`). Category / subcategory only.
+
+    BOA-006863, 1 Oct 2026: denim shorts titled "LEVI STRAUSS & CO. 511 Light
+    Wash Jeans W34 L34". TAX.003 fired, `_subcategory_from_title` found "Jeans"
+    and wrote it — over a `properties` copy that said Shorts — and the picture's
+    own answer was then withdrawn by the anchor rule in _plan_fields, because
+    the subcategory had been claimed. The gate read "shorts" on the render after
+    it was already approved as Jeans.
+
+    A title is somebody's (or an earlier run's) words; the photograph is the
+    garment. So when the title's pick and the photographs' pick are different
+    TYPES — shorts against full-length — the photographs win:
+
+      at `taxonomy_from_picture.type_min_confidence` or above, the entry is
+      rewritten to the photographs' subcategory;
+      below it, the entry becomes an ESCALATION. The title's value is never
+      written in its place: a person picks.
+
+    Same type (Jeans against Trousers, both full length) is left to the title,
+    which is what can tell those apart. Only the picture's pick on the SAME
+    branch counts; moving the category is resolve_taxonomy's pair business.
+    """
+    from app.imaging.quality_gate import garment_type
+    from app.resolver import _match, _tenant_branch
+
+    entry = next((a for a in plan
+                  if a.get("kind") == "set_column" and a.get("field") == "subCategory"
+                  and a.get("source") == "title"), None)
+    sug = getattr(getattr(ev, "vision", None), "taxonomy", None)
+    if entry is None or sug is None or not sug.subcategory or not sug.category:
+        return
+    branch = _tenant_branch(p) or {}
+    if _match(sug.category, [p.category or ""]) is None:
+        return
+    pick = _match(sug.subcategory, branch.get(p.category or "") or [])
+    if pick is None:
+        return
+    t_title = garment_type(entry.get("value"), pol)
+    t_photo = garment_type(pick, pol)
+    t_seen = garment_type(sug.garment, pol)
+    if not (t_title and t_photo) or t_title == t_photo or t_seen not in (None, t_photo):
+        return
+
+    cfg = pol.get("taxonomy_from_picture") or {}
+    floor = float(cfg.get("type_min_confidence") or cfg.get("min_confidence") or 0.9)
+    said = (f"the title suggests '{entry.get('value')}' ({t_title.replace('_', ' ')}) but the "
+            f"photographs show {sug.garment or pick} ({t_photo.replace('_', ' ')}, "
+            f"confidence {sug.confidence:.2f})")
+    if sug.confidence >= floor:
+        entry.update({
+            "value": pick, "source": "photo",
+            "detail": f"{said} — the garment type is taken from the photographs",
+        })
+    else:
+        entry.update({
+            "kind": "escalate", "value": None, "source": "photo",
+            "detail": (f"{said}, below the {floor:.2f} floor — not written from the "
+                       f"title either; a person picks between '{entry.get('value')}' "
+                       f"and '{pick}'"),
+        })
+
+
 def _plan_fields(p: ProductSnapshot, pol: dict[str, Any],
                  findings: list[Finding], llm: Any | None,
                  plan: list[dict[str, Any]]) -> None:
@@ -1109,6 +1178,10 @@ def _plan_fields(p: ProductSnapshot, pol: dict[str, Any],
     # behind their back.
     def _flat(s: Any) -> str:
         return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
+
+    # THE PHOTOGRAPHS SETTLE THE GARMENT TYPE, NOT THE TITLE'S WORDS (1 Oct 2026).
+    # Before the anchor rule below gets to withdraw the picture's answer.
+    _photo_type_over_title(p, plan, ev, pol)
 
     claimed = {_flat(a.get("field")) for a in plan if a.get("field")}
     kept = [pt for pt in patches

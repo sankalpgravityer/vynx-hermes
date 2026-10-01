@@ -189,6 +189,26 @@ garment_families:
   adjacent:
     - ["tops", "outerwear"]
 
+# GARMENT TYPES WITHIN A FAMILY — category and subcategory only (1 Oct 2026).
+#
+# The families above put shorts, jeans and trousers all in `bottoms`, so a
+# product filed `Bottoms > Jeans` whose photographs show denim SHORTS passed the
+# gate and the taxonomy repair alike — three Levi's shorts went live on BOAS as
+# Jeans / Trousers while the gate's own read said "shorts". A type is a
+# difference a photograph shows at a glance; it is used ONLY to decide the
+# category / subcategory (app/approval.py, app/resolver.py) and to check it
+# (quality_gate IMG.040). Nothing else reads it.
+#
+# FIRST MATCH WINS, in this order, and only inside the type's own family: "jean
+# shorts" and "cargo shorts" are shorts, and "short sleeve shirt" (two families)
+# is no type at all. A word or name matching no type decides nothing.
+garment_types:
+  - {type: shorts, family: bottoms, words: ["short", "bermuda"]}
+  - {type: skirts, family: bottoms, words: ["skirt", "skort"]}
+  - {type: dungarees, family: bottoms, words: ["dungaree", "overall"]}
+  - {type: full_length, family: bottoms,
+     words: ["jean", "trouser", "pant", "chino", "jogger", "legging", "cargo", "denim"]}
+
 # --------------------------------------------------------------------------- #
 # Filing the garment from its photographs — app/resolver.py resolve_taxonomy
 #
@@ -235,6 +255,13 @@ taxonomy_from_picture:
   # 0.70, which is roughly the spread to expect; 0.9 keeps the confident
   # readings and sends the hesitant ones to a person as a `propose`.
   min_confidence: 0.9
+  # A DIFFERENT GARMENT TYPE (policy `garment_types`) — shorts filed as jeans —
+  # is written at the single-field AI floor instead (confidence
+  # .llm_apply_threshold, 0.85; nothing below it is ever written unattended).
+  # Leg length is not the hesitant reading `min_confidence` guards against, and
+  # these moves stay inside one category, so it is one field, not a pair. Below
+  # this the title is NOT used instead: the field is held for a person.
+  type_min_confidence: 0.85
 
 guardrails:
   # Fields the LLM is NEVER allowed to write directly. It may only supply

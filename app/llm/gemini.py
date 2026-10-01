@@ -302,7 +302,13 @@ class GeminiEvidence:
         # is downloaded, or a hit would still pay for the fetch — which is the
         # slow part. A label that fails to download therefore no longer frees
         # its slot for a fourth garment view; that answer is not cached anyway.
-        garment_urls = [str(u) for u in p.images[: max(cap - len(label_urls), 1)]]
+        # THE WHOLE GARMENT FIRST: its FRONT and BACK views, then the gallery.
+        # The gallery cache's order is not the garment's — on three Levi's
+        # shorts its head was close-ups, the model could not see the leg length,
+        # and it filed them as Jeans (1 Oct 2026). See garment_view_urls.
+        pool = [str(u) for u in p.garment_view_urls]
+        pool += [str(u) for u in p.images if str(u) not in pool]
+        garment_urls = pool[: max(cap - len(label_urls), 1)]
         if not label_urls and not garment_urls:
             return VisionAudit()
 
@@ -366,6 +372,12 @@ class GeminiEvidence:
                       "nothing in the list fits the garment, return null for both "
                       "rather than the closest miss — a wrong shelf is worse than an "
                       "empty one. Set `confidence` to how sure you are of the pair."
+                      "\n\nDecide the garment TYPE from its SHAPE in the garment "
+                      "photographs — shorts against full-length jeans or trousers, a "
+                      "skirt against shorts — never from a label's model name, fit "
+                      "or size code (a 'W34 L34' tag or a model number does not make "
+                      "a pair of shorts into jeans). If the photographs do not show "
+                      "enough of the garment to tell, lower `confidence` and say so."
                 )
 
             return self._generate(
