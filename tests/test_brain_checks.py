@@ -171,6 +171,8 @@ def wired(monkeypatch):
             return True, "", {"ok": True, "applied": ["gender"], "failed": []}
         if script == "fix-selling-price.ts":
             return True, "", {"results": []}
+        if script == "resync-listings.ts":
+            return True, calls.get("resync_out", "  T-1: queued\n\n--- summary ---\n  queued  : 1\n"), None
         return True, "", None
 
     def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet,
@@ -301,8 +303,102 @@ def test_sync_repushes_a_live_product_after_a_repair(wired):
     r = _repair(sync_changes=True)
     assert step(r, "sync")["ran"] and step(r, "sync")["ok"]
     args = next(a for s, a in wired["calls"]["scripts"] if s == "resync-listings.ts")
-    assert args == ["--product", PID, "--apply"]
-    assert r["sync"]["ran"] is True
+    # --include-synced: a live product's last push SUCCEEDED, and without the
+    # flag the script re-drives failed pushes only — it queued nothing (4 Oct).
+    assert args == ["--product", PID, "--include-synced", "--apply"]
+    assert r["sync"]["ran"] is True and r["sync"]["queued"] == 1
+    assert "queued the Shopify push" in step(r, "sync")["note"]
+
+
+def test_sync_says_so_when_nothing_was_queued(wired):
+    wired["shopify"]["id"] = "gid://shopify/Product/1"
+    wired["stamp"]["after"] = "2026-09-23T10:00:00"
+    wired["calls"]["resync_out"] = ("  T-1: skipped — this tenant has no connected Shopify account\n"
+                                    "\n--- summary ---\n  queued  : 0\n  skipped : 1\n")
+    r = _repair(sync_changes=True)
+    assert r["sync"]["ran"] is False
+    assert step(r, "sync")["note"] == "NOT pushed — this tenant has no connected Shopify account"
+
+
+def test_sync_against_an_old_vnyx_api_does_not_claim_a_push(wired, monkeypatch):
+    wired["shopify"]["id"] = "gid://shopify/Product/1"
+    wired["stamp"]["after"] = "2026-09-23T10:00:00"
+    monkeypatch.setattr(rp, "remote_supports", lambda *o: "includeSynced" not in o)
+    r = _repair(sync_changes=True)
+    assert "NOT pushed" in step(r, "sync")["note"]
+    assert not any(s == "resync-listings.ts" for s, _ in wired["calls"]["scripts"])
+
+
+# --------------------------------------------------------------------------- #
+# A run Hermes opens carries the Brain (4 Oct 2026)
+# --------------------------------------------------------------------------- #
+
+_CFG_ROW = {"mode": "SHADOW", "shadowWritesRepairs": True, "ruleGroups": [],
+            "severityOverrides": None, "useLlm": True, "readCareLabel": True,
+            "minExtractionConfidence": 70, "inferAttributes": False, "skipRender": False,
+            "skipBinPlacement": True, "maxAttempts": 3, "leaseSeconds": 1800,
+            "scheduleEnabled": False, "scheduleStartMinute": 0, "scheduleEndMinute": 0,
+            "scheduleTimezone": "UTC", "scheduleDays": []}
+_TENANT = "6f1d2c3b-4a5e-4f60-9b1c-2d3e4f5a6b7c"
+
+
+@pytest.fixture
+def opened(monkeypatch):
+    from app.services.auto_approval import sweep
+
+    written: dict[str, Any] = {}
+    monkeypatch.setattr(sweep.db, "write_returning",
+                        lambda sql, params: written.update(params) or {"id": "run-1"})
+    monkeypatch.setenv("VNYX_API_URL", "http://api")
+    monkeypatch.setenv("AUTO_APPROVAL_INTERNAL_SECRET", "s")
+    return sweep, written
+
+
+def _answer(monkeypatch, status: int, body: dict[str, Any]) -> list[str]:
+    import httpx
+
+    asked: list[str] = []
+
+    class R:
+        status_code = status
+        text = str(body)
+
+        def json(self):
+            return body
+
+    monkeypatch.setattr(httpx, "get", lambda url, headers=None, timeout=None: asked.append(url) or R())
+    return asked
+
+
+def test_a_hermes_opened_run_takes_vnyx_apis_snapshot_with_the_brain_compiled(opened, monkeypatch):
+    sweep, written = opened
+    compiled = {"mode": "SHADOW", "shadowWritesRepairs": True,
+                "brain": {"compiled": {"chain": {"syncChanges": True, "priceMode": "rounding_only"},
+                                       "policy": {}}}}
+    asked = _answer(monkeypatch, 200, {"snapshot": compiled})
+    sweep._create_scheduled_run(_TENANT, _CFG_ROW, source="MANUAL_FULL_REVIEW")
+    assert asked == [f"http://api/internal/auto-approval/snapshot/{_TENANT}"]
+    snap = written["s"].obj
+    assert snap["openedBy"] == "hermes-sweep" and written["src"] == "MANUAL_FULL_REVIEW"
+    rs = settings_from_snapshot(snap)
+    assert rs.sync_changes is True and rs.price_mode == "rounding_only"
+
+
+def test_without_vnyx_api_the_run_is_built_here_as_before(opened, monkeypatch):
+    sweep, written = opened
+    _answer(monkeypatch, 404, {"error": "no config"})
+    sweep._create_scheduled_run(_TENANT, _CFG_ROW)
+    snap = written["s"].obj
+    assert "compiled" not in snap["brain"] and snap["openedBy"] == "hermes-sweep"
+    assert settings_from_snapshot(snap).sync_changes is False
+
+
+def test_no_url_means_no_request(opened, monkeypatch):
+    sweep, written = opened
+    monkeypatch.delenv("VNYX_API_URL")
+    asked = _answer(monkeypatch, 200, {"snapshot": {}})
+    sweep._create_scheduled_run(_TENANT, _CFG_ROW)
+    assert asked == [] and written["s"].obj["brain"]["skipRender"] is False
 
 
 # --------------------------------------------------------------------------- #

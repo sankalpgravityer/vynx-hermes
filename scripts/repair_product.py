@@ -140,6 +140,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import product_audit  # noqa: E402
 from app.config import policy, settings  # noqa: E402
 from app.llm import cache as vision_cache  # noqa: E402
+from app.rules import shot_sequence  # noqa: E402
 
 # Where the TypeScript half lives. Every write this script causes happens in
 # there, because that is where R2, the ProductMedia invariants, the price mirror
@@ -461,6 +462,18 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
         ]
         key = "matteViews" if script == "backfill-bg-removal.ts" else "views"
         options[key] = picked
+    # THE PRODUCT'S IMAGE SEQUENCE (3 Oct 2026): the render makes the shots its
+    # sequence asks for (`--shots` narrows them). Sent only to a vnyx-api whose
+    # /ping lists `sequence` (_sequence_render); both are closed on the server.
+    if "--sequence" in args:
+        options["sequence"] = True
+    # The `sync` step's push of a LIVE product (resync-listings.ts
+    # --include-synced); without it only failed pushes are re-driven.
+    if "--include-synced" in args:
+        options["includeSynced"] = True
+    if "--shots" in args:
+        options["shots"] = [s.strip().lower()
+                            for s in args[args.index("--shots") + 1].split(",") if s.strip()]
     # The copy step's two halves (readiness phase 5). Neither flag means both.
     if "--title" in args:
         options["title"] = True
@@ -713,6 +726,21 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
     garment_photos = [m for m in garments
                       if not any(k in str(m.get("url") or "").lower() for k in markers)]
 
+    # THE PRODUCT'S IMAGE SEQUENCE (3 Oct 2026). How many renders it gets, and
+    # which, is the sequence's — the tenant default or its category's override —
+    # counted per shot (BOAS: six with the full front twice; its shoes: three
+    # close-ups and nothing on the torso). Without one, the fixed five views.
+    seq = _sequence_plan(record, render_rows)
+    if seq is not None:
+        renders_present = len(seq.present)
+        renders_expected = len(seq.expected)
+        renders_missing = len(seq.missing)
+        mislabelled = shot_sequence.looks_mislabelled(seq, render_rows)
+    else:
+        renders_present, renders_expected = len(renders), 5
+        renders_missing = 5 - len(renders)
+        mislabelled = len(renders) < len(render_rows)
+
     summary = (record.get("summary") or "").strip()
     return {
         "loaded": loaded,
@@ -733,9 +761,16 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
         "master": record.get("masterCategory"),
         "mannequin": record.get("mannequinType"),
         "size": record.get("size") or record.get("internationalSize"),
-        "renders": len(renders),
+        "renders": renders_present,
         "render_rows": len(render_rows),
-        "renders_missing": 5 - len(renders),
+        "renders_missing": renders_missing,
+        "renders_expected": renders_expected,
+        # The sequence's missing shot instances (`full_front#2`), its name, and
+        # the renders outside it (reported, never deleted).
+        "missing_shots": [i.label for i in seq.missing] if seq else [],
+        "sequence": seq.resolved.describe() if seq else None,
+        "renders_extra": len(seq.extra) if seq else 0,
+        "mislabelled": mislabelled,
         # Read before and after the chain by the canary in repair(): a flip to
         # GENERATING that the render step did not cause means a repair write is
         # triggering paid regeneration.
@@ -751,6 +786,40 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
             ) if not value
         ],
     }
+
+
+def _sequence_plan(record: dict[str, Any], render_rows: list[dict[str, Any]]) -> Any:
+    """The product's live renders against its image sequence, or None (no sequence
+    on the record, or `imagery.sequence.enabled` off)."""
+    if not (((policy().get("imagery") or {}).get("sequence") or {}).get("enabled", True)):
+        return None
+    resolved = shot_sequence.from_payload(record.get("shotSequence"))
+    return shot_sequence.plan(resolved, render_rows) if resolved else None
+
+
+def _sequence_views(state: dict[str, Any]) -> list[str] | None:
+    """The views the product's sequence renders onto, in sequence order."""
+    loaded = state.get("loaded") or {}
+    resolved = shot_sequence.from_payload((loaded.get("record") or {}).get("shotSequence"))
+    if resolved is None:
+        return None
+    out: list[str] = []
+    for inst in resolved.expanded:
+        if inst.view not in out:
+            out.append(inst.view)
+    return out
+
+
+def _renders_of(state: dict[str, Any]) -> str:
+    """`5/6`: renders on the product against what its sequence asks for."""
+    return f'{state.get("renders", 0)}/{state.get("renders_expected") or 5}'
+
+
+def _sequence_render(state: dict[str, Any]) -> bool:
+    """Render by the product's sequence (vnyx-api `--sequence`)? Only with a sequence
+    on the record and a vnyx-api that takes the option — an older one gets the
+    fixed-view render, as before."""
+    return bool(state.get("sequence")) and remote_supports("sequence")
 
 
 def _generation_in_flight(state: dict[str, Any]) -> bool:
@@ -945,7 +1014,7 @@ def run_fixture(path: Path, *,
         would.append("care label")
     if gate["repair_plan"]:
         would.append("reconcile")
-    if state["renders_missing"]:
+    if state["renders_missing"] > 0:
         would.append("render")
 
     return {
@@ -960,8 +1029,9 @@ def run_fixture(path: Path, *,
         "price": gate.get("price"),
         "master": master_decision,
         "would_run": would,
-        "state": {k: state[k] for k in ("description_chars", "care_label", "unmatted",
-                                        "renders", "attributes_missing")},
+        "state": {k: state.get(k) for k in ("description_chars", "care_label", "unmatted",
+                                            "renders", "renders_expected", "missing_shots",
+                                            "attributes_missing")},
         "dumped": data.get("_fixture") or {},
     }
 
@@ -1005,7 +1075,7 @@ def run_fixtures(paths: list[Path], *, out: str | None = None) -> int:
               f'{(r["title"] or "")[:60]}')
         print(paint(f'        {r["tenant"]} {DOT} {r["stage"]} {DOT} '
                     f'{st["description_chars"]} chars {DOT} care label {st["care_label"]} '
-                    f'{DOT} {st["unmatted"]} unmatted {DOT} {st["renders"]}/5 renders {DOT} '
+                    f'{DOT} {st["unmatted"]} unmatted {DOT} {_renders_of(st)} renders {DOT} '
                     f'missing {", ".join(st["attributes_missing"]) or "nothing"}', DIM))
         verdict = (paint("verified", GREEN) if r["verified"]
                    else paint(f'{len(r["blocking"])} blocking', RED))
@@ -1187,8 +1257,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         f'  description {state["description_chars"]} chars {DOT} '
         f'care label {state["care_label"]} {DOT} '
         f'{state["unmatted"]} view(s) unmatted {DOT} '
-        f'{state["renders"]}/5 renders {DOT} '
-        f'missing {", ".join(state["attributes_missing"]) or "nothing"}', DIM))
+        f'{_renders_of(state)} renders'
+        + (f' ({state["sequence"]})' if state.get("sequence") else '')
+        + f' {DOT} missing {", ".join(state["attributes_missing"]) or "nothing"}', DIM))
 
     def step(name: str, why: str, run) -> None:
         if why:
@@ -1567,7 +1638,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             raise StepFailed("relabel returned non-zero")
         return "recovered the true view from the filenames"
 
-    mislabelled = state["renders"] < state["render_rows"]
+    # Per shot when the product has a sequence (needs_from): three close-ups on a
+    # three-close-up sequence are not mislabelled; five old AI_FRONT rows are.
+    mislabelled = state.get("mislabelled", state["renders"] < state["render_rows"])
     step("relabel",
          "" if mislabelled else "every render is filed under its own view",
          _relabel)
@@ -1576,8 +1649,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # counts are re-read rather than reused. Skipping this re-read would leave
     # render regenerating five views the relabel had just recovered.
     if mislabelled and apply:
-        state = {**state, **{k: needs(dsn, product_id)[k]
-                             for k in ("renders", "renders_missing")}}
+        fresh = needs(dsn, product_id)
+        state = {**state, **{k: fresh[k] for k in (
+            "renders", "renders_missing", "renders_expected", "missing_shots", "mislabelled")
+            if k in fresh}}
 
     # ---- 2. extract -------------------------------------------------------
     #
@@ -1886,12 +1961,21 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     def _render() -> str:
         render_report["attempted"] = True
+        # BY THE SEQUENCE (3 Oct 2026): vnyx-api makes exactly the missing shot
+        # instances of the product's sequence — a back close-up, a second full
+        # front — on the gallery's own model, and nothing the sequence does not
+        # ask for. Without it, the fixed views Hermes' verify plan names.
+        by_seq = _sequence_render(state)
+        render_report["sequence"] = state.get("sequence") if by_seq else None
         ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
-                           [*common, *live], timeout_s=1800, quiet=quiet)
+                           [*common, *live, *(["--sequence"] if by_seq else [])],
+                           timeout_s=1800, quiet=quiet)
         _read_render(out, render_report)
         if not ok:
             raise StepFailed("imagery backfill returned non-zero")
-        note = f'{state["renders_missing"]} view(s)'
+        note = (f'{state["renders_missing"]} of {state.get("renders_expected")} from '
+                f'{state["sequence"]} ({", ".join(state.get("missing_shots") or [])})'
+                if by_seq else f'{state["renders_missing"]} view(s)')
         if render_report["failed"]:
             note += f' — could not produce {", ".join(render_report["failed"])}'
             if render_report["refused"]:
@@ -1903,8 +1987,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     is_kids = _rd.is_kids(state.get("master"), state.get("mannequin"), policy())
     if skip_render:
         render_why = "--no-render"
-    elif not state["renders_missing"]:
-        render_why = "all five views already exist"
+    elif state["renders_missing"] <= 0:
+        render_why = (f'every render {state["sequence"]} asks for exists ({_renders_of(state)})'
+                      if state.get("sequence") else "all five views already exist")
     elif is_kids and _rd.config(policy()).get("kids_renders") == "hold":
         # Decision 4 is `generate`; this branch exists so a tenant can turn it
         # off without a code change, and says so.
@@ -2261,10 +2346,22 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         all_views = list((pol.get("imagery") or {}).get("all_views")
                          or ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK", "AI_CLOSEUP"])
         wanted = {v for _, _, _, vs in askers for v in vs}
-        views = [v for v in all_views if v in wanted] + sorted(v for v in wanted if v not in all_views)
+        outside: list[str] = []
+        seq_views = _sequence_views(state) if _sequence_render(state) else None
+        if seq_views is not None:
+            # ONLY THE SEQUENCE'S SHOTS are re-rendered: a refused view's every
+            # instance in the sequence (both close-ups on a close-up and a back
+            # close-up), and nothing for a refused render outside it.
+            outside = sorted(v for v in wanted if v not in seq_views)
+            all_views = seq_views
+            views = [v for v in seq_views if v in wanted]
+        else:
+            views = [v for v in all_views if v in wanted] + sorted(v for v in wanted if v not in all_views)
         return {
             "askers": [a for a, _, _, _ in askers],
             "views": views,
+            "outside": outside,
+            "sequence": seq_views is not None,
             "all_views": all_views,
             "code": next((c for a, c, _, _ in askers if a == "gate"), None)
                     or next((c for _, c, _, _ in askers), None),
@@ -2313,8 +2410,11 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         views = plan["views"]
         regeneration["views"] = regeneration["views"] + [v for v in views if v not in regeneration["views"]]
         regen_report["views"] = regen_report["views"] + [v for v in views if v not in regen_report["views"]]
+        # By the sequence: the named views' instances are re-made (`--replace`),
+        # each retiring only the render it pairs with.
+        seq_args = ["--sequence", "--replace"] if plan.get("sequence") else []
         ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
-                              [*common, *live, "--views", ",".join(views)],
+                              [*common, *live, "--views", ",".join(views), *seq_args],
                               timeout_s=1800, quiet=quiet)
         _read_render(out, regen_report)
         if not ok:
@@ -2388,6 +2488,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         regen_why = "--no-render"
     elif budget < 1:
         regen_why = "readiness.max_regenerations_per_run is 0"
+    elif not regen_plan["views"] and regen_plan.get("outside"):
+        regen_why = (f'the refused render(s) {", ".join(regen_plan["outside"])} are not in '
+                     f'{state.get("sequence")} — nothing of the sequence to re-render')
     elif not regen_plan["views"]:
         regen_why = "nothing to regenerate for this verdict"
     elif _generation_in_flight(state):
@@ -2661,14 +2764,33 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     sync_report: dict[str, Any] = {"ran": False, "why": None}
 
     def _sync() -> str:
-        ok, _, _ = run_step(vnyx_api, "resync-listings.ts",
-                            ["--product", product_id, *live],
-                            timeout_s=120, quiet=quiet)
+        # `--include-synced` (4 Oct 2026): without it resync-listings.ts only
+        # re-drives FAILED pushes, so a live product — whose last push did
+        # succeed — matched nothing, nothing was queued, and this said
+        # "re-pushed" anyway (BOA-005474, BOA-006161: last synced Aug / Sep).
+        if not remote_supports("includeSynced"):
+            return ("NOT pushed — this vnyx-api cannot re-push a listing whose last sync "
+                    "succeeded (its step runner has no `includeSynced`); deploy vnyx-api")
+        ok, out, _ = run_step(vnyx_api, "resync-listings.ts",
+                              ["--product", product_id, "--include-synced", *live],
+                              timeout_s=120, quiet=quiet)
         if not ok:
             raise StepFailed("resync-listings.ts returned non-zero")
-        sync_report["ran"] = bool(apply)
-        return ("re-pushed to Shopify — the storefront gets this run's repairs"
-                if apply else "would re-push to Shopify")
+        if not apply:
+            return "would re-push to Shopify"
+        # WHAT THE SCRIPT DID, not what it was asked: its summary says how many
+        # pushes it queued, and each skip says why (no connected account, the
+        # approval gate). The push itself is the backend's Shopify worker's.
+        m = re.search(r"queued\s*:\s*(\d+)", out or "")
+        queued = int(m.group(1)) if m else 0
+        sync_report["ran"] = queued > 0
+        sync_report["queued"] = queued
+        if queued:
+            return ("queued the Shopify push — the backend's Shopify worker sends this run's "
+                    "repairs to the storefront")
+        why = [ln.split("skipped —", 1)[1].strip() for ln in (out or "").splitlines()
+               if "skipped —" in ln]
+        return "NOT pushed — " + ("; ".join(why) or "the resync queued nothing")
 
     # "Did this run change the product" from the ROW, not the step notes: every
     # write lands through updateProduct or the media cache rebuild, and both
@@ -2835,7 +2957,7 @@ def report(r: dict[str, Any]) -> None:
     line("description", f'{b["description_chars"]} chars',
          f'{a["description_chars"]} chars')
     line("unmatted", b["unmatted"], a["unmatted"])
-    line("renders", f'{b["renders"]}/5', f'{a["renders"]}/5')
+    line("renders", _renders_of(b), _renders_of(a))
     line("missing attrs", ", ".join(b["attributes_missing"]) or "none",
          ", ".join(a["attributes_missing"]) or "none")
     print(f'    {"issues left":14} {r["issues"]}'
@@ -3129,8 +3251,8 @@ def write_sheet(results: list[dict[str, Any]], out: Path, *,
             (f'{b["description_chars"]} {ARROW} {a["description_chars"]}'
              if b["description_chars"] != a["description_chars"]
              else str(a["description_chars"])),
-            (f'{b["renders"]} {ARROW} {a["renders"]}/5'
-             if b["renders"] != a["renders"] else f'{a["renders"]}/5'),
+            (f'{b["renders"]} {ARROW} {_renders_of(a)}'
+             if b["renders"] != a["renders"] else _renders_of(a)),
             (f'{b["unmatted"]} {ARROW} {a["unmatted"]}'
              if b["unmatted"] != a["unmatted"] else str(a["unmatted"])),
             ", ".join(filled) or "—",

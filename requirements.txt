@@ -69,8 +69,19 @@ tzdata==2025.2 ; sys_platform == "win32"
 #
 # Brings scipy, numba, llvmlite, scikit-image, pymatting and pooch with it
 # (~300 MB installed). It does NOT pull an onnxruntime of its own, so the pin
-# above still governs.
+# above still governs. The hung-bottoms refinement (app/imaging/garment_cutout.py)
+# uses the opencv, scipy and pymatting that come with it.
 #
 # The 168 MB model is fetched on first use into U2NET_HOME — pre-fetch it at
 # deploy or the first product pays for it inside a step that has a timeout.
 rembg==2.0.84
+
+# OPTIONAL — LaMa for the hanger strategy (app/imaging/hanger_cutout.py): paints
+# the hanger bar out of a photo hung on the wall. Without torch, or without
+# HERMES_LAMA_PATH pointing at big-lama.pt (196 MB, fetch it at deploy:
+# https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt),
+# OpenCV's inpainting stands in, which leaves a grey smear where the bar crossed
+# the waistband. CPU build (~200 MB download):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# The strategy also needs rembg's isnet-general-use model in U2NET_HOME (170 MB;
+# rembg fetches it on first use — pre-fetch it at deploy).

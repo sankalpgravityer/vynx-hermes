@@ -206,6 +206,43 @@ def test_mid_000521_a_stand_under_the_garment_is_clear_and_still_a_cutout_defect
     assert _decide(raw).bad_cutouts == ["FRONT", "BACK"]
 
 
+def test_the_hangers_clips_are_kept_on_purpose_and_never_a_cutout_defect():
+    """1 Oct 2026: a garment hung on the wall is cut with its clips on
+    (imagery.cutout.hanger). Read as a leftover, every such cut-out would be
+    re-cut on every run and come back with the clips again."""
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": False, "issue": "hanger clips visible",
+                        "missing_parts": [], "leftovers": [{"part": "hanger clips", "extent": "clear"}]}
+    v = _decide(raw)
+    assert v.soft == [] and v.reasons == [] and pa.rematte_views(v, POL) == []
+    # the free text alone, no measurement
+    raw["images"][0] = {"index": 1, "ok": False, "issue": "metal clips at the waistband",
+                        "missing_parts": []}
+    assert _decide(raw).soft == []
+    # a clip beside a real complaint: the complaint stands, the clip does not
+    raw["images"][0] = {"index": 1, "ok": False, "issue": "clips visible; collar cut away",
+                        "missing_parts": [], "leftovers": [{"part": "clips", "extent": "clear"}]}
+    assert _decide(raw).soft == ["CUTOUT DEFECT — FRONT cut-out: collar cut away"]
+
+
+def test_a_hanger_or_a_stand_named_beside_the_clips_is_still_a_defect():
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": True, "issue": "", "missing_parts": [],
+                        "leftovers": [{"part": "hanger and clips", "extent": "clear"}]}
+    assert _decide(raw).soft == ["CUTOUT DEFECT — FRONT cut-out: hanger and clips visible"]
+    raw["images"][0]["leftovers"] = [{"part": "hanger clips", "extent": "clear"},
+                                     {"part": "stand", "extent": "clear"}]
+    assert _decide(raw).soft == ["CUTOUT DEFECT — FRONT cut-out: stand visible"]
+
+
+def test_the_clips_switch_brings_the_old_reading_back():
+    pol = {**POL, "photo_audit": {"gallery": {"clips_are_leftovers": True}}}
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": True, "issue": "", "missing_parts": [],
+                        "leftovers": [{"part": "hanger clips", "extent": "clear"}]}
+    assert _decide(raw, pol=pol).soft == ["CUTOUT DEFECT — FRONT cut-out: hanger clips visible"]
+
+
 def test_leftovers_are_read_on_a_cutout_and_nowhere_else():
     """A render's duplicated hand and a photograph shot on its hanger are other
     questions — the threshold must not quietly answer them too."""

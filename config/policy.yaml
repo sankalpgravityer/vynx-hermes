@@ -522,6 +522,17 @@ imagery:
   # because it is the one advisory view that is tenant-configurable.
   close_up_view: "AI_CLOSEUP"
 
+  # THE PRODUCT'S IMAGE SEQUENCE (3 Oct 2026; app/rules/shot_sequence.py).
+  # Each tenant's default sequence, or the one on the product's category /
+  # subcategory, says which on-model shots it gets and how many — BOAS: six,
+  # the full front twice; BOAS Men > Shoes: three close-ups, no torso. When
+  # on: renders are counted per shot against it (required_views only where the
+  # sequence asks for them), the chain renders and regenerates ONLY its shots
+  # through vnyx-api's `--sequence` render, and the gallery order (IMG.025) is
+  # the sequence's. Off: the fixed views above, as before.
+  sequence:
+    enabled: true
+
   # Views background removal applies to. Care labels and size charts are excluded
   # because a macro of a wash tag is all fabric: the segmenter has no foreground
   # to find and mangles it. Matches needsBackgroundRemoval() in vnyx-api.
@@ -632,7 +643,11 @@ imagery:
     # medium). Every one passes the same checks, the torn-garment check among
     # them. If none passes, a re-cut crops and centres the cut-out already on
     # file instead (see app/imaging/framing.py).
-    strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    #
+    # 1 Oct 2026 — HUNG ON THE WALL, IS-NET FIRST (`hanger-isnet`, block `hanger`
+    # below). Runs only when vnyx-api says the photo's origin is one `hanger.origins`
+    # names; the photobooth and decision panel skip it and start at v2.
+    strategies: ["hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
     # When both fine-tuned parsers ("cloth-seg-ft" = v2, "cloth-seg-ft-backup"
     # = v1) are refused by the leftover check but their garments agree at
     # least this well, the v2 cut-out is accepted: the check misreads white and
@@ -641,20 +656,121 @@ imagery:
     # The chain POST /v1/imagery/cutout (image URL in, PNG out) uses. Separate
     # from `strategies`, so it changes nothing for vnyx-api's calls. The two
     # paid ones (each tried twice) run only when v2 and v1 are both refused.
-    url_strategies: ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    url_strategies: ["hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    # PHOTOS HUNG ON THE WALL (1 Oct 2026; app/imaging/hanger_cutout.py, the
+    # `hanger-isnet` strategy). IS-Net finds the whole garment, clips included;
+    # only THIN parts at the top — the bar, the hook, the wall wire — are masked,
+    # painted out of the photo (LaMa when HERMES_LAMA_PATH points at big-lama.pt
+    # and torch is installed, OpenCV's inpainting otherwise) and the cleaned photo
+    # segmented again. Outside the hanger mask the second pass can only ADD
+    # garment, so no cloth is removed; the clips stay, by design.
+    #
+    # `origins`: the raw photo's ProductMedia origin that routes here. PHOTOBOOTH
+    # and DECISION are left out on purpose: their podium and stand are what the
+    # fine-tuned cloth-seg is trained to remove, and IS-Net would keep them.
+    # `require_bar`: no hanger bar found (a model wearing it, a web image on
+    # white) means not a hanger photo — the chain goes on to v2.
+    # `refuse_on_review`: the script flags what it is unsure of ("hanger mask
+    # covers a lot of garment: check the waistband" — BOA-003065, where the
+    # fill smeared the front waistband); nobody reviews in auto-approval, so a
+    # flagged cut-out goes on to v2 too.
+    # `max_wall_kept`: IS-Net can take a block of white wall for part of a white
+    # or cream garment (BOA-005343: the lit wall between the legs) where the
+    # leftover check is silent. What it kept beyond v2's outline that is solid
+    # (`wall_open_px`) and smooth like paint, not woven (`wall_smooth_max`), above
+    # this share of the garment, refuses it. Measured 1 Oct 2026 on 22 views:
+    # BOA-005343 1.11% / 0.55%, every other view 0.25% or less. Smooth but far
+    # from the wall's colour (`not_wall_dist`: black cloth v2 missed) never counts.
+    #
+    # WHEN IT REFUSES — no bar found, a review flag, the wall, Hermes' checks —
+    # the photo goes to Gemini's background removal (`then`), once
+    # (`paid_attempts` below), before v2 and v1, which keep the bar and the clips
+    # on these photos. gpt-image comes after v2 and v1: on 12 hung photos it
+    # REDREW every garment (lettering, embroidery, creases invented) and the
+    # fidelity check refuses that anyway (`paint_min_*` below), so asking it
+    # before v2 bought a minute and a bill for nothing. Add "openai-paint" to
+    # `then` to ask it sooner. `hanger: false` turns the strategy off.
+    hanger:
+      enabled: true
+      origins: ["WEB", "MANUAL"]
+      model: "isnet-general-use"
+      require_bar: true
+      refuse_on_review: true
+      max_wall_kept: 0.004
+      wall_open_px: 21
+      wall_smooth_max: 4.0
+      not_wall_dist: 60.0
+      then: ["gemini-paint"]
+      # The script's guided-filter edge refinement (3 Oct 2026 revision). OFF:
+      # measured on BLM-001006 FRONT it WIDENED the soft edge (2.9 -> 4.3 px per
+      # outline px) rather than sharpening it, and where the reference outputs
+      # were made (opencv-python, no ximgproc) it never ran at all.
+      refine_edges: false
+    # HOW MANY TIMES A PAID STRATEGY IS ASKED ABOUT THE SAME PHOTO (1 Oct 2026,
+    # was a fixed 2). Asked again it mostly answers the same way and bills twice;
+    # the chain moves on to the next method instead.
+    paid_attempts: 1
+    # IS A PAINTED CUT-OUT THE PHOTO'S OWN GARMENT? (1 Oct 2026) Its edges and
+    # texture, correlated with the photo's at the same place, decide; brightness
+    # is a floor for a gross mismatch — Gemini relights a garment it keeps
+    # faithfully (brightness 0.54..0.95, edges 0.73..0.94 on ten faithful
+    # cut-outs). gpt-image REDREW all 12 hung garments ("RipCurl" came back
+    # "PpCuy", one waistband's text came back an obscenity): edges -0.02..0.63.
+    # Gemini's zoomed or redrawn answers -0.01..0.41. v2 1.00 / 0.99. Below
+    # either, the painted result is refused and the chain moves on. Every paint
+    # strategy, every route. 0 turns a check off.
+    paint_min_pixel_match: 0.50
+    paint_min_edge_match: 0.70
     # CROP AND CENTRE EVERY CUT-OUT (30 Sep 2026; app/imaging/framing.py). The
     # garment's own pixels, scaled by one factor so it fills 1 - 2 x margin of
-    # the frame on its limiting axis (0.90 at margin 0.05), centred on a canvas
-    # the photograph's size. A crop and a resize — nothing is re-drawn. The
-    # checks register the photograph to the cut-out before comparing them, and
-    # re-cut any cut-out not framed to this standard. `enabled: false` returns
-    # the photograph's own framing again; a request can also pass frame: false.
+    # the frame on its limiting axis, centred on a canvas the photograph's size.
+    # A crop and a resize — nothing is re-drawn. The checks register the
+    # photograph to the cut-out before comparing them, and re-cut any cut-out not
+    # framed to this standard. `enabled: false` returns the photograph's own
+    # framing again; a request can also pass frame: false.
+    #
+    # MARGIN 0.15 (1 Oct 2026, was 0.05): the BOAS shop's own product page — a
+    # 3:4 photo, the garment centred, 15% clear above and below it and 19% at
+    # the sides — fills 70% on the limiting axis. 0.05 filled 90%, edge to edge.
+    #
+    # NO ENLARGEMENT (3 Oct 2026, `upscale: false`): "the same quality as the
+    # original". A garment smaller than the standard is no longer scaled up —
+    # the canvas shrinks around it instead (same 3:4 ratio, garment at 70%, its
+    # pixels exactly as photographed); vnyx-api keeps that canvas (the response
+    # says `framing.standard`). Only a garment too big for the standard is
+    # scaled, down. `upscale: true` brings the enlargement back, to `max_scale`.
     framing:
       enabled: true
-      margin: 0.05
+      margin: 0.15
+      upscale: false
       max_scale: 2.5
       fill_tolerance: 0.05
       center_tolerance: 0.03
+    # HUNG BOTTOMS REFINED BEFORE THEY ARE CHECKED (1 Oct 2026; app/imaging/refine.py
+    # running app/imaging/garment_cutout.py). On each v2 / v1 / mask cut-out: the
+    # hanger and its clips taken out, the fabric they hid filled in from the
+    # garment's own texture, the wall between fringe threads removed, the edge
+    # colour cleaned. Only for products whose category says bottoms (vnyx-api
+    # sends it as `garment`), never dungarees: the script cuts everything above
+    # the waistband line. The parser's own cut-out is kept whenever the
+    # refinement fails, makes up more than `max_generated_frac` of the garment,
+    # takes away more than `max_lost_frac` of it, cuts away more of what the
+    # photo shows as fabric than `max_fabric_taken`, or meets a waistband with
+    # less than `min_waistband_contrast` against the wall (cream or grey on the
+    # white wall). `refine: false` turns it off.
+    #
+    # OFF SINCE 1 Oct 2026: hung photos go to `hanger-isnet` above, which keeps
+    # the clips and never removes cloth. This refinement removes the clips and
+    # redraws the waistband, which is what cut cloth on grey and pale garments.
+    refine:
+      enabled: false
+      families: ["bottoms"]
+      skip_types: ["dungarees"]
+      max_generated_frac: 0.02
+      max_lost_frac: 0.08
+      max_fabric_taken: 0.0025
+      min_waistband_contrast: 4.0
+      lama_path: null
     # The long edge every pixel comparison below is made on. 448 to match
     # `readiness.cutouts.garment_check.work_width`: the two ask the same
     # question of the same garment and a different grid would give them

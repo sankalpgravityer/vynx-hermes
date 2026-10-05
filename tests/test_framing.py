@@ -23,6 +23,9 @@ from app.imaging import cutouts, framing  # noqa: E402
 from app.models import ImagerySettings, MediaAsset, ProductSnapshot  # noqa: E402
 
 FCFG = framing.config({})
+# The enlargement mode, off by default since 3 Oct 2026 ("the same quality as the
+# original"): the garment scaled up onto the photograph's own canvas.
+UP = {**FCFG, "upscale": True}
 CFG = {**cutouts.config({}), "framing": FCFG}
 BACKDROP = (180, 176, 174)
 
@@ -75,16 +78,43 @@ def alpha_box(data: bytes):
 # framing itself
 # --------------------------------------------------------------------------- #
 
-def test_the_garment_is_scaled_to_the_standard_and_centred_on_the_same_canvas():
+def test_a_small_garment_gets_a_smaller_canvas_not_bigger_pixels():
+    """3 Oct 2026: reaching the standard would need 1.56x; the canvas shrinks to
+    193x257 (the photo's 3:4) instead and the garment stays at 1x."""
     raw, mask = photo(box=(20, 30, 110, 210))          # 90x180, high and to the left
-    out, info = framing.frame_cutout(cutout_of(raw, mask), FCFG)
+    cut = cutout_of(raw, mask)
+    out, info = framing.frame_cutout(cut, FCFG)
+    im = Image.open(io.BytesIO(out)).convert("RGBA")
+    assert info["framed"] and info["scale"] == 1.0 and info["cropped"] and info["standard"]
+    assert im.size == (193, 257) and abs(im.width / im.height - 0.75) < 0.01
+    x0, y0, x1, y1 = alpha_box(out)
+    assert (x1 - x0, y1 - y0) == (90, 180)              # the photographed size
+    assert abs((y1 - y0) / im.height - 0.70) < 0.01     # 70% of the frame, 15% clear above/below
+    assert abs((x0 + x1) / 2 - im.width / 2) <= 1 and abs((y0 + y1) / 2 - im.height / 2) <= 1
+    # Every garment pixel is the photograph's, untouched.
+    got = np.asarray(im)[y0:y1, x0:x1, :3]
+    assert np.array_equal(got, np.asarray(raw)[30:210, 20:110])
+
+
+def test_with_upscale_on_the_garment_is_scaled_onto_the_photos_canvas():
+    raw, mask = photo(box=(20, 30, 110, 210))
+    out, info = framing.frame_cutout(cutout_of(raw, mask), UP)
     im = Image.open(io.BytesIO(out))
     assert im.size == (300, 400) and info["framed"]
     x0, y0, x1, y1 = alpha_box(out)
-    # The height decides: 0.90 x 400 = 360 from 180, so 2x.
-    assert abs((y1 - y0) - 360) <= 2
+    # The height decides: 0.70 x 400 = 280 from 180, so 1.56x.
+    assert abs((y1 - y0) - 280) <= 2
     assert abs((x0 + x1) / 2 - 150) <= 1 and abs((y0 + y1) / 2 - 200) <= 1
-    assert info["scale"] == pytest.approx(2.0, rel=0.01)
+    assert info["scale"] == pytest.approx(280 / 180, rel=0.01)
+
+
+def test_a_garment_too_big_for_the_standard_is_scaled_down_on_the_photos_canvas():
+    raw, mask = photo(box=(10, 5, 290, 395))           # fills 97% of the height
+    out, info = framing.frame_cutout(cutout_of(raw, mask), FCFG)
+    assert Image.open(io.BytesIO(out)).size == (300, 400)
+    assert info["scale"] < 1.0 and not info["cropped"]
+    x0, y0, x1, y1 = alpha_box(out)
+    assert abs((y1 - y0) - 280) <= 3
 
 
 def test_nothing_is_redrawn_the_colours_are_the_photographs():
@@ -105,9 +135,10 @@ def test_a_loose_speck_does_not_move_the_box():
 
 
 def test_a_tiny_garment_stops_at_max_scale_and_is_still_centred():
+    """Only with `upscale` on; off, a tiny garment just gets a tiny canvas."""
     raw, mask = photo(box=(10, 10, 40, 60))            # 30x50
-    out, info = framing.frame_cutout(cutout_of(raw, mask), FCFG)
-    assert info["capped"] and info["scale"] == pytest.approx(FCFG["max_scale"])
+    out, info = framing.frame_cutout(cutout_of(raw, mask), UP)
+    assert info["capped"] and info["scale"] == pytest.approx(UP["max_scale"])
     x0, y0, x1, y1 = alpha_box(out)
     assert abs((x0 + x1) / 2 - 150) <= 1 and abs((y0 + y1) / 2 - 200) <= 1
 
@@ -138,18 +169,25 @@ def test_an_existing_opaque_cut_out_is_cropped_and_centred_on_its_backdrop():
     out, info = framing.frame_cutout(data, FCFG)
     assert info["framed"] and info["source"] == "backdrop"
     arr = np.asarray(Image.open(io.BytesIO(out)).convert("RGB")).astype(int)
+    H, W = arr.shape[:2]
+    assert abs(W / H - 0.75) < 0.01                      # the photograph's ratio
     assert tuple(arr[0, 0]) == (235, 235, 235)          # the canvas is the backdrop
     garment = np.abs(arr - 235).sum(axis=2) > 24
     ys, xs = np.where(garment.any(axis=1))[0], np.where(garment.any(axis=0))[0]
-    assert abs((ys.max() - ys.min() + 1) - 360) <= 6      # 90% of 400, give or take resize overshoot
-    assert abs((xs.min() + xs.max()) / 2 - 150) <= 2 and abs((ys.min() + ys.max()) / 2 - 200) <= 2
+    assert ys.max() - ys.min() + 1 == 180                # not resampled: its own size
+    assert abs((ys.max() - ys.min() + 1) / H - 0.70) < 0.01
+    assert abs((xs.min() + xs.max()) / 2 - W / 2) <= 2 and abs((ys.min() + ys.max()) / 2 - H / 2) <= 2
     assert np.abs(arr[garment].mean(axis=0) - colour).max() < 4   # nothing re-drawn
 
 
-def test_an_existing_cut_out_on_a_smaller_canvas_is_framed_onto_the_photographs():
-    """896x1195 on file for a 3000x4000 photograph: framed at the photograph's size."""
+def test_an_existing_cut_out_on_a_smaller_canvas_is_framed_on_its_own_canvas():
+    """896x1195 on file for a 3000x4000 photograph: framed where it is, not blown up
+    to the photograph's size (3 Oct 2026). With `upscale` on, the old behaviour."""
     data, _ = stored(size=(150, 200), box=(10, 15, 55, 105))
     out, info = framing.frame_cutout(data, FCFG, canvas=(300, 400))
+    w, h = Image.open(io.BytesIO(out)).size
+    assert info["framed"] and info["scale"] == 1.0 and w <= 150 and abs(w / h - 0.75) < 0.01
+    out, info = framing.frame_cutout(data, UP, canvas=(300, 400))
     assert info["framed"] and Image.open(io.BytesIO(out)).size == (300, 400)
 
 
@@ -185,8 +223,9 @@ def test_the_endpoint_frames_the_existing_cut_out_when_no_method_worked(monkeypa
         "previous_base64": base64.b64encode(prev).decode()})
     p = resp.json()
     assert p["ok"] is True and p["provider"] == main.EXISTING_FRAMED and p["kept_existing"] is False
-    assert p["framing"]["framed"] and "torn" in p["error"]
-    assert Image.open(io.BytesIO(base64.b64decode(p["image_base64"]))).size == (300, 400)
+    assert p["framing"]["framed"] and p["framing"]["standard"] and "torn" in p["error"]
+    w, h = Image.open(io.BytesIO(base64.b64decode(p["image_base64"]))).size
+    assert abs(w / h - 0.75) < 0.01 and w <= 150          # its own pixels, not blown up
 
 
 def test_a_paid_render_is_brought_to_the_photographs_size_before_framing():
@@ -235,7 +274,10 @@ def framed_pair(seed=1, box=(40, 50, 160, 230)):
 def test_a_framed_cut_out_is_registered_to_its_photograph_and_matches():
     cut, raw, info = framed_pair()
     m = cutouts.garment_hole(cut, raw, CFG)
-    assert m["registered"]["scale"] == pytest.approx(info["scale"], rel=0.03)
+    # On the working grid the photograph is squeezed to the cut-out's canvas, so the
+    # registered scale is the garment's scale times the canvas ratio (1.0 x 300/193).
+    expected = info["scale"] * 300 / info["canvas"][0]
+    assert m["registered"]["scale"] == pytest.approx(expected, rel=0.03)
     assert m["pixel_match"] > 0.9
     assert cutouts.frame_problem(m, CFG, derived=True) == (None, False)
 
@@ -274,8 +316,22 @@ def test_the_standard_passes_a_framed_cut_out_and_flags_an_unframed_one():
 
 
 def test_a_garment_at_max_scale_is_not_re_framed_forever():
-    cut, raw, info = framed_pair(box=(10, 10, 40, 60))
+    """With `upscale` on, a tiny garment stops at max_scale, short of the standard."""
+    raw, mask = photo(box=(10, 10, 40, 60))
+    out, info = framing.frame_cutout(cutout_of(raw, mask), UP)
     assert info["capped"]
+    rb = io.BytesIO()
+    raw.save(rb, "JPEG", quality=95)
+    cut = on_white(out)
+    up_cfg = {**CFG, "framing": UP}
+    m = cutouts.garment_hole(cut, rb.getvalue(), up_cfg)
+    box = cutouts.measure(cut, up_cfg, (255, 255, 255))["box"]
+    assert cutouts.standard_problem(box, m, UP) is None
+
+
+def test_a_tiny_garment_framed_without_enlargement_meets_the_standard():
+    cut, raw, info = framed_pair(box=(10, 10, 40, 60))
+    assert info["scale"] == 1.0 and info["cropped"]
     m = cutouts.garment_hole(cut, raw, CFG)
     box = cutouts.measure(cut, CFG, (255, 255, 255))["box"]
     assert cutouts.standard_problem(box, m, FCFG) is None

@@ -5,16 +5,18 @@ in a corner of a 3000x4000 frame — so the cut-outs that come out of it are the
 same photographs with the wall taken away, and a gallery of them looks untidy:
 one shirt fills the picture, the next is a small thing near the top.
 
-THIS IS A CROP AND A RESIZE, NOTHING ELSE. The garment's own pixels are cut out
-of the cut-out along its bounding box, scaled by one factor (the same on both
-axes) and pasted in the centre of a transparent canvas of the SAME size as the
-photograph. No model looks at it and nothing is re-drawn, sharpened or relit,
-which is the whole difference between this and the "zoomed and enhanced" Gemini
-cut-outs: those were a different picture; this is the same picture, framed.
+THIS IS A CROP, NOTHING ELSE (3 Oct 2026; a crop and a resize until then). The
+garment's own pixels are cut out of the cut-out along its bounding box and pasted,
+untouched, in the centre of a transparent canvas of the PHOTOGRAPH'S RATIO, sized
+so the garment fills the standard share of it. No model looks at it and nothing is
+re-drawn, sharpened, relit — or enlarged: a small garment gets a smaller canvas,
+not bigger pixels. Only a garment too big for the standard is scaled, DOWN, onto
+the photograph's own canvas. (`upscale: true` restores the old enlargement.)
 
     before   3000x4000, shirt 1200x1500 at the top left
-    after    3000x4000, the same shirt at 2.4x — 3600 tall would not fit, so
-             the height decides: 4000 x 0.90 = 3600 / 1500 = 2.4 — centred
+    after    3000x4000 would need the shirt at 1.87x (4000 x 0.70 / 1500), so
+             the canvas is 1607x2143 instead and the shirt is at 1x — centred,
+             70% of the height, every pixel the photograph's
 
 WHAT THE CHECKS NEED TO KNOW ABOUT IT. The garment no longer sits where the
 photograph has it, so every test that laid the cut-out over its photograph at
@@ -37,17 +39,24 @@ DEFAULTS: dict[str, Any] = {
     # auto-approval matte) and /v1/imagery/cutout. A request can still pass
     # `frame: false` for the photograph's own framing.
     "enabled": True,
-    # The empty band left on EACH side of the axis the garment fills: 0.05 is a
-    # garment 90% of the frame's height (or width, for a wide one) — the look of
-    # a shop's catalogue, with room left for a sleeve not to kiss the edge.
-    # It also keeps the other checks quiet by construction: a framed box covers
-    # at most 0.90 x 0.90 = 0.81 of the frame, under `box_fill_max`, and no edge
-    # is touched.
-    "margin": 0.05,
-    # The largest enlargement. A garment photographed very small would otherwise
-    # be blown up until it is soft; past this it stays smaller than the standard,
-    # centred all the same. 2.5x takes a garment from 36% of a frame's height
-    # to 90%.
+    # The empty band left on EACH side of the axis the garment fills: 0.15 is a
+    # garment 70% of the frame's height (or width, for a wide one). Measured on
+    # the BOAS shop's own product page, 1 Oct 2026: a 3:4 photo, the garment
+    # centred, 15% clear above and below, 19% at the sides. (0.05 — 90%, edge to
+    # edge — until then.) It also keeps the other checks quiet by construction:
+    # a framed box covers at most 0.70 x 0.70 = 0.49 of the frame, under
+    # `box_fill_max`, and no edge is touched.
+    "margin": 0.15,
+    # NEVER ENLARGE THE GARMENT (3 Oct 2026). Reaching the standard by scaling a
+    # small garment up makes it soft — the photo's pixels spread over more pixels,
+    # no detail added. With `upscale: false` the CANVAS shrinks around the garment
+    # instead: the same 3:4 frame (the photo's ratio), the garment at 70% of it,
+    # its pixels exactly as photographed. A garment too big for the standard is
+    # still scaled DOWN onto the photo's canvas. `upscale: true` brings back the
+    # old behaviour, capped at `max_scale`.
+    "upscale": False,
+    # The largest enlargement when `upscale` is on. 2.5x takes a garment from 28%
+    # of a frame's height to 70%.
     "max_scale": 2.5,
     # The alpha at which a pixel is garment, for the bounding box.
     "alpha_threshold": 128,
@@ -170,9 +179,12 @@ def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None, *,
     from PIL import Image
 
     cfg = cfg if cfg is not None else config()
+    upscale = bool(cfg.get("upscale", False))
     try:
         im = Image.open(io.BytesIO(png))
         im.load()
+        # The photograph's colour profile rides along (see cutout._png_with_icc).
+        icc = im.info.get("icc_profile")
         im = im.convert("RGBA")
     except Exception as exc:  # noqa: BLE001
         return png, {"framed": False, "note": f"could not decode ({exc.__class__.__name__})"}
@@ -196,9 +208,12 @@ def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None, *,
         alpha = np.where(far, 255, 0).astype(np.uint8)
 
     # Onto the requested canvas first (fitted inside, centred), so everything
-    # below works on the photograph's own size.
+    # below works on the photograph's own size. Without `upscale`, only when that
+    # canvas is not larger: a stored cut-out smaller than its photograph is framed
+    # on its own canvas rather than blown up to the photograph's.
     resized = False
-    if canvas and tuple(canvas) != im.size:
+    if canvas and tuple(canvas) != im.size and (
+            upscale or (int(canvas[0]) <= im.width and int(canvas[1]) <= im.height)):
         CW, CH = int(canvas[0]), int(canvas[1])
         s = min(CW / im.width, CH / im.height)
         nw, nh = max(1, int(round(im.width * s))), max(1, int(round(im.height * s)))
@@ -238,18 +253,36 @@ def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None, *,
     x0, y0, x1, y1 = box
     bw, bh = x1 - x0, y1 - y0
     fill = target_fill(cfg)
-    scale = min(fill * W / bw, fill * H / bh, float(cfg.get("max_scale") or 2.5))
-    gl, gt = (W - bw * scale) / 2, (H - bh * scale) / 2      # where the hard box lands
+    # The scale that would meet the standard on this canvas.
+    need = min(fill * W / bw, fill * H / bh)
+    same = float(cfg.get("same_scale") or 0.0)
+    CW, CH = W, H
+    if upscale:
+        scale = min(need, float(cfg.get("max_scale") or 2.5))
+    elif need > 1.0 + same:
+        # NO ENLARGEMENT: the frame shrinks to the garment instead — the photo's
+        # ratio, the garment at the standard fill, its pixels untouched.
+        scale = 1.0
+        CW, CH = max(1, int(round(W / need))), max(1, int(round(H / need)))
+    else:
+        # Within `same_scale` of the standard: moved, not resampled. Too big:
+        # scaled down onto the canvas.
+        scale = 1.0 if need > 1.0 - same else need
+    gl, gt = (CW - bw * scale) / 2, (CH - bh * scale) / 2    # where the hard box lands
     info: dict[str, Any] = {
-        "framed": True, "scale": round(scale, 4), "canvas": [W, H],
+        "framed": True, "scale": round(scale, 4), "canvas": [CW, CH],
         "garment_box": [x0, y0, x1, y1],
         "placed_at": [round(gl), round(gt), round(gl + bw * scale), round(gt + bh * scale)],
-        "fill_w": round(bw * scale / W, 4), "fill_h": round(bh * scale / H, 4),
-        "capped": scale >= float(cfg.get("max_scale") or 2.5) - 1e-6,
+        "fill_w": round(bw * scale / CW, 4), "fill_h": round(bh * scale / CH, 4),
+        "capped": upscale and scale >= float(cfg.get("max_scale") or 2.5) - 1e-6,
+        "cropped": (CW, CH) != (W, H),
         "source": "alpha" if backdrop is None else "backdrop",
+        # THE OUTPUT MEETS THE STANDARD AS IT IS — vnyx-api must not pad it back
+        # out to the photograph's canvas (which would shrink the garment again).
+        "standard": True,
     }
 
-    if not resized and (abs(scale - 1.0) <= float(cfg.get("same_scale") or 0.0)
+    if not resized and (CW, CH) == (W, H) and (abs(scale - 1.0) <= same
             and abs(gl - x0) <= max(1.0, float(cfg.get("same_offset") or 0.0) * W)
             and abs(gt - y0) <= max(1.0, float(cfg.get("same_offset") or 0.0) * H)):
         info.update(framed=False, note="already framed")
@@ -261,30 +294,40 @@ def frame_cutout(png: bytes, cfg: dict[str, Any] | None = None, *,
     px0, py0 = max(0, x0 - pad), max(0, y0 - pad)
     px1, py1 = min(W, x1 + pad), min(H, y1 + pad)
     crop = im.crop((px0, py0, px1, py1))
-    nw = max(1, int(round((px1 - px0) * scale)))
-    nh = max(1, int(round((py1 - py0) * scale)))
     left = int(round(gl - (x0 - px0) * scale))
     top = int(round(gt - (y0 - py0) * scale))
-    # RGB and alpha resized apart, as _cutout_png does: a transparent pixel's
-    # colour must not bleed into the garment's edge as a dark fringe.
-    resample = Image.Resampling.LANCZOS
-    rgb = crop.convert("RGB").resize((nw, nh), resample)
+    # Where the hard box ACTUALLY lands: rounding `left` after the pad can put it a
+    # pixel off `round(gl)`, and a caller comparing pixels needs the real place.
+    bx, by = left + (x0 - px0) * scale, top + (y0 - py0) * scale
+    info["placed_at"] = [round(bx), round(by), round(bx + bw * scale), round(by + bh * scale)]
+    if scale == 1.0:
+        # NOT RESAMPLED AT ALL: the garment's pixels are the cut-out's, moved.
+        rgb, a_ch = crop.convert("RGB"), crop.getchannel("A")
+    else:
+        nw = max(1, int(round((px1 - px0) * scale)))
+        nh = max(1, int(round((py1 - py0) * scale)))
+        # RGB and alpha resized apart, as _cutout_png does: a transparent pixel's
+        # colour must not bleed into the garment's edge as a dark fringe.
+        resample = Image.Resampling.LANCZOS
+        rgb = crop.convert("RGB").resize((nw, nh), resample)
+        a_ch = crop.getchannel("A").resize((nw, nh), resample)
     buf = io.BytesIO()
+    extra = {"icc_profile": icc} if icc else {}
     if backdrop is not None:
         # Opaque: the crop carries its own backdrop, laid on a canvas of the
         # same colour, so the join cannot be seen.
-        out_im = Image.new("RGB", (W, H), tuple(int(v) for v in backdrop))
+        out_im = Image.new("RGB", (CW, CH), tuple(int(v) for v in backdrop))
         out_im.paste(rgb, (left, top))
-        out_im.save(buf, format="PNG", optimize=True)
+        out_im.save(buf, format="PNG", optimize=True, **extra)
     else:
-        a = crop.getchannel("A").resize((nw, nh), resample)
-        garment = Image.merge("RGBA", (*rgb.split(), a))
-        out_im = Image.new("RGBA", (W, H), (255, 255, 255, 0))
+        garment = Image.merge("RGBA", (*rgb.split(), a_ch))
+        out_im = Image.new("RGBA", (CW, CH), (255, 255, 255, 0))
         # Only the soft-edge pad can reach past the canvas; paste clips it.
         out_im.paste(garment, (left, top))
         arr = np.asarray(out_im).copy()
         arr[arr[:, :, 3] == 0] = (255, 255, 255, 0)
-        Image.fromarray(arr, "RGBA").save(buf, format="PNG", optimize=True)
-    log.info("framing: garment %dx%d at (%d,%d) scaled %.2fx and centred on %dx%d%s",
-             bw, bh, x0, y0, scale, W, H, " (capped)" if info["capped"] else "")
+        Image.fromarray(arr, "RGBA").save(buf, format="PNG", optimize=True, **extra)
+    log.info("framing: garment %dx%d at (%d,%d) %s and centred on %dx%d%s",
+             bw, bh, x0, y0, "not resampled" if scale == 1.0 else f"scaled {scale:.2f}x",
+             CW, CH, " (capped)" if info["capped"] else "")
     return buf.getvalue(), info

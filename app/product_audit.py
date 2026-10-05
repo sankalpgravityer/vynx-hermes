@@ -87,6 +87,7 @@ from psycopg.types.json import Jsonb
 from app import approval
 from app.config import ROOT
 from app.rules import gate as _gate
+from app.rules import shot_sequence
 
 log = logging.getLogger("hermes.product-audit")
 
@@ -338,7 +339,7 @@ SELECT bl."binCode", bl."binNumber", z.code, w.code, l."lpnCode"
 # `derivedFromId` are what the pairing and the check read.
 MEDIA_SQL = """
 SELECT id::text, url, view::text, origin::text, processing::text, "mediaType"::text,
-       position, width, height, "derivedFromId"::text, "isCurrent"
+       position, width, height, "derivedFromId"::text, "isCurrent", "shotKey"
   FROM "ProductMedia"
  WHERE "productId" = %s::uuid
    AND "deletedAt" IS NULL
@@ -394,6 +395,19 @@ SELECT "isModelGenerationEnabled", "isRemoveBgEnabled", "isCloseUpEnabled",
   FROM "ImageGenerationSettings"
  WHERE "tenantId" = %s::uuid
  LIMIT 1
+"""
+
+# The tenant's per-category image sequences, each with its category's path
+# (three levels: the seeded tree is master > category > subcategory). What
+# vnyx-api's loadOverrideCandidates reads; app/rules/shot_sequence matches a
+# product against them exactly as matchOverride does.
+SHOT_OVERRIDES_SQL = """
+SELECT s.shots, c.name, p.name, g.name
+  FROM "ImageShotSequence" s
+  JOIN "Category" c ON c.id = s."categoryId" AND c."deletedAt" IS NULL
+  LEFT JOIN "Category" p ON p.id = c."parentId"
+  LEFT JOIN "Category" g ON g.id = p."parentId"
+ WHERE s."tenantId" = %s::uuid
 """
 
 # The tenant's working vocabulary: which subcategory values its live products
@@ -481,6 +495,16 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
     cur.execute(GUIDE_USAGE_SQL, (tenant_id,))
     guide_usage = {f"{m}>{c}>{g}": int(n) for m, c, g, n in cur.fetchall()}
 
+    # In a savepoint: a database from before image sequences has no such table,
+    # and the products must still load — with no overrides, as they would have.
+    shot_overrides: list[Any] = []
+    try:
+        with cur.connection.transaction():
+            cur.execute(SHOT_OVERRIDES_SQL, (tenant_id,))
+            shot_overrides = shot_sequence.override_candidates(cur.fetchall())
+    except psycopg.Error:
+        shot_overrides = []
+
     categories: dict[str, dict[str, list[str]]] = {}
     for path, depth in paths:
         parts = path.split(">")
@@ -532,6 +556,7 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
         "imagery_settings": imagery_settings,
         # Kept whole so the chart state can resolve a guide by id.
         "guides": guides,
+        "shot_overrides": shot_overrides,
     }
 
 
@@ -630,10 +655,20 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
         {"id": mid, "url": url, "view": view, "origin": origin, "processing": processing,
          "mediaType": media_type, "isCurrent": bool(is_current), "deletedAt": None,
          "position": position, "width": width, "height": height,
-         "derivedFromId": derived_from}
+         "derivedFromId": derived_from, "shotKey": shot_key}
         for (mid, url, view, origin, processing, media_type, position,
-             width, height, derived_from, is_current) in media_rows
+             width, height, derived_from, is_current, shot_key) in media_rows
     ]
+    # THE PRODUCT'S IMAGE SEQUENCE (3 Oct 2026), resolved from the product's own
+    # columns as vnyx-api's resolveShotSequence does: its category /
+    # subcategory override, else the tenant default, else the built-in five.
+    sequence = shot_sequence.resolve(
+        overrides=ctx.get("shot_overrides") or [],
+        default_shots=(imagery_settings or {}).get("defaultShots"),
+        is_close_up_enabled=(imagery_settings or {}).get("isCloseUpEnabled", True),
+        category=category, sub_category=sub_category,
+        master_category=master_category, mannequin_type=mannequin,
+    )
     # What is ON the product. The archived originals ride along in `media` for
     # the cut-out pairing (see MEDIA_SQL) and count as nothing here.
     live_rows = [m for m in media if m["isCurrent"]]
@@ -742,6 +777,8 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
         # the build the pictures were made with (`imageSettings.bodyType`).
         "mediaManualOrder": bool(media_manual_order),
         "imageSettings": image_settings if isinstance(image_settings, dict) else {},
+        # Which renders the product gets, how many, and the gallery order.
+        "shotSequence": sequence.as_dict(),
         "createdAt": created_at.isoformat() if created_at else None,
         "updatedAt": updated_at.isoformat() if updated_at else None,
 
@@ -809,7 +846,8 @@ SELECT "productId"::text, "basePrice", "baseCurrency"
 # garment originals flagged `isCurrent = false` (readiness phase 3).
 MEDIA_BATCH_SQL = """
 SELECT "productId"::text, id::text, url, view::text, origin::text, processing::text,
-       "mediaType"::text, position, width, height, "derivedFromId"::text, "isCurrent"
+       "mediaType"::text, position, width, height, "derivedFromId"::text, "isCurrent",
+       "shotKey"
   FROM "ProductMedia"
  WHERE "productId" = ANY(%s::uuid[])
    AND "deletedAt" IS NULL

@@ -309,7 +309,11 @@ def test_the_shipped_default_re_cuts_a_leftover_with_the_fine_tuned_chain():
     fine-tuned parser, which was trained on podiums and stands, so a leftover is
     re-cut with the DEFAULT chain (None) rather than left alone ([])."""
     assert cutout.config(None)["leftover_strategies"] == []
-    assert cutout.config(None)["strategies"][0] == "cloth-seg-ft"
+    # hanger-isnet is listed first but only runs for a photo hung on the wall
+    # (cutout.hanger_route); a podium photo starts at the fine-tuned parser.
+    shipped = cutout.config(None)["strategies"]
+    assert shipped[0] == cutout.HANGER
+    assert [s for s in shipped if s != cutout.HANGER][0] == "cloth-seg-ft"
     assert cutout.rematte_strategies("stand visible at bottom") is None
 
 
@@ -393,6 +397,10 @@ def providers(monkeypatch):
     # finished cut-out and still exercise the chain around it.
     monkeypatch.setattr(cutout, "_apply_mask", lambda src, mask: (mask, None))
     monkeypatch.setattr(cutout, "_is_cutout", lambda data: (True, "transparent (stub)"))
+    # A stubbed paint answer is a synthetic picture, not a cut-out of this
+    # photo: these tests are about the chain's order, and the fidelity check
+    # (`_paint_fidelity`) has its own in tests/test_hanger_cutout.py.
+    monkeypatch.setattr(cutout, "_paint_fidelity", lambda source, out: (1.0, 1.0))
     return {"calls": calls, "answers": answers}
 
 
@@ -568,9 +576,10 @@ def test_when_gemini_cannot_openai_removes_the_background(providers, monkeypatch
     providers["answers"]["openai-paint"] = (cutout_png("none"), None)
     out, err, provider = cutout.remove_background(lit_sweep(), timeout_s=1)
     assert provider == "openai-paint" and out is not None, err
-    # Gemini twice (it answers nothing), then gpt-image; no mask strategy at all.
+    # Gemini once (it answers nothing; `paid_attempts: 1` since 1 Oct 2026 — not
+    # asked again about the same photo), then gpt-image; no mask strategy at all.
     assert providers["calls"] == ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint",
-                                  "gemini-paint", "openai-paint"]
+                                  "openai-paint"]
 
 
 def test_the_fine_tuned_parser_goes_first_and_its_cut_out_is_used(providers, monkeypatch):
@@ -920,9 +929,10 @@ def test_the_endpoint_carries_the_strategies_and_the_previous_cut_out(monkeypatc
 
     seen: dict[str, Any] = {}
 
-    def fake_remove(data, timeout_s=180.0, *, strategies=None, skip=None, previous=None):
-        seen.update({"strategies": strategies, "skip": skip,
-                     "previous": previous, "timeout": timeout_s})
+    def fake_remove(data, timeout_s=180.0, *, strategies=None, skip=None, previous=None,
+                    garment=None, report=None, origin=None):
+        seen.update({"strategies": strategies, "skip": skip, "previous": previous,
+                     "timeout": timeout_s, "garment": garment, "origin": origin})
         return None, "the existing cut-out was KEPT: nothing was as complete", cutout.KEPT_EXISTING
 
     monkeypatch.setattr(cutout, "remove_background", fake_remove)
@@ -936,6 +946,9 @@ def test_the_endpoint_carries_the_strategies_and_the_previous_cut_out(monkeypatc
         # the cut-out on file comes back cropped and centred instead
         # (tests/test_framing.py).
         "frame": False,
+        # What the garment is, and where the photo came from.
+        "garment": "Bottoms Shorts",
+        "origin": "WEB",
     }
     resp = TestClient(app).post("/v1/imagery/remove-background", json=body)
     assert resp.status_code == 200
@@ -946,6 +959,7 @@ def test_the_endpoint_carries_the_strategies_and_the_previous_cut_out(monkeypatc
     assert payload["provider"] == cutout.KEPT_EXISTING
     assert seen["strategies"] == ["gemini-mask", "openai-mask"]
     assert seen["previous"] == composited()
+    assert seen["garment"] == "Bottoms Shorts" and seen["origin"] == "WEB"
 
 
 def test_the_endpoint_still_answers_without_any_of_the_new_fields(monkeypatch):
