@@ -574,6 +574,19 @@ def resolve_taxonomy(p: ProductSnapshot, ev: Evidence, pol: dict[str, Any],
         return []
 
     floor = float(cfg.get("min_confidence") or 0.9)
+    # A DIFFERENT GARMENT TYPE IN THE SAME CATEGORY — denim shorts filed as
+    # `Bottoms > Jeans` (BOA-006863, 1 Oct 2026). One field moves, not a pair,
+    # and leg length is not a hesitant reading, so the single-field floor
+    # applies (`type_min_confidence`). Only when the model's own word for the
+    # garment does not name a third type.
+    from app.imaging.quality_gate import garment_type
+    type_floor = cfg.get("type_min_confidence")
+    if type_floor is not None and same_cat:
+        was = garment_type(p.subcategory, pol)
+        pick = garment_type(subcategory, pol) if subcategory else None
+        seen = garment_type(sug.garment, pol)
+        if was and pick and was != pick and seen in (None, pick):
+            floor = min(floor, float(type_floor))
     confident = sug.confidence >= floor
     reason = (
         f"The photographs show {sug.garment or 'this garment'}"

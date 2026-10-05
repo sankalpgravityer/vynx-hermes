@@ -749,6 +749,19 @@ class CutoutRequest(BaseModel):
     # way (§2.1). Omitted, nothing is compared and nothing is refused.
     previous_base64: str | None = None
     previous_url: str | None = None
+    # CROP AND CENTRE THE RESULT (app/imaging/framing.py). Omitted, policy
+    # decides (`imagery.cutout.framing.enabled`); false keeps the photograph's
+    # own framing.
+    frame: bool | None = None
+    # WHAT THE GARMENT IS — the product's category and subcategory, e.g.
+    # "Bottoms Shorts". Hung bottoms are refined (app/imaging/refine.py: hanger
+    # and clips out, clean edges); anything else, or no hint, is not.
+    garment: str | None = None
+    # WHERE THE PHOTO CAME FROM — the raw ProductMedia's origin (PHOTOBOOTH,
+    # DECISION, WEB, MANUAL). A photo hung on the wall is cut with IS-Net first
+    # (`imagery.cutout.hanger`), keeping the clips; the photobooth's podium and
+    # stand go to the fine-tuned cloth-seg. Omitted, the chain is as before.
+    origin: str | None = None
 
 
 class CutoutResponse(BaseModel):
@@ -764,6 +777,99 @@ class CutoutResponse(BaseModel):
     # between this and `ok: false` with an error, and the reason it is a field
     # of its own rather than a sentence in one.
     kept_existing: bool = False
+    # What framing did: the scale, where the garment was and where it now is.
+    framing: dict | None = None
+    # What the hung-bottoms refinement did to the cut-out returned (clips found,
+    # how much was made up or taken away), or why it was left unrefined. None
+    # when it did not run.
+    refine: dict | None = None
+
+
+def _framed(out: bytes, frame: bool | None,
+            canvas: tuple[int, int] | None = None) -> tuple[bytes, dict | None]:
+    """The cut-out cropped and centred, when the request or policy asks for it."""
+    from app.imaging import framing
+
+    fcfg = framing.config()
+    if not (fcfg.get("enabled") if frame is None else frame):
+        return out, None
+    try:
+        return framing.frame_cutout(out, fcfg, canvas=canvas)
+    except Exception as exc:  # noqa: BLE001 — an unframed cut-out beats none
+        log.warning("framing failed, returning the cut-out unframed: %s", exc)
+        return out, {"framed": False, "note": f"framing failed ({exc.__class__.__name__})"}
+
+
+def _upright_size(raw: bytes) -> tuple[int, int] | None:
+    """The photograph's size as it is SEEN (EXIF orientation applied)."""
+    import io as _io
+
+    from PIL import Image
+
+    from app.imaging import cutout
+
+    try:
+        upright, _o = cutout._upright(raw)
+        return Image.open(_io.BytesIO(upright)).size
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _at_size(out: bytes, size: tuple[int, int] | None) -> bytes:
+    """A cut-out brought to the photograph's resolution.
+
+    Every local strategy already keeps it; Gemini and gpt-image render at
+    their own size (~2K), and vnyx-api would then PAD the smaller picture back
+    out to the source canvas, shrinking the garment again. RGB and alpha are
+    resized apart, so the transparent corners stay (255,255,255,0) rather than
+    premultiplied black. Left alone when the shape differs (a reframed picture
+    is the checks' business, not something to stretch).
+    """
+    import io as _io
+
+    from PIL import Image
+
+    if not size:
+        return out
+    try:
+        img = Image.open(_io.BytesIO(out))
+        icc = img.info.get("icc_profile")
+        img = img.convert("RGBA")
+    except Exception:  # noqa: BLE001 — not ours to judge here; the caller's checks are
+        return out
+    if img.size == tuple(size):
+        return out
+    if abs(img.width / img.height - size[0] / size[1]) / (size[0] / size[1]) > 0.05:
+        return out
+    rgb = img.convert("RGB").resize(size, Image.Resampling.LANCZOS)
+    alpha = img.getchannel("A").resize(size, Image.Resampling.LANCZOS)
+    buf = _io.BytesIO()
+    Image.merge("RGBA", (*rgb.split(), alpha)).save(
+        buf, format="PNG", optimize=True, **({"icc_profile": icc} if icc else {}))
+    return buf.getvalue()
+
+
+def _sized(out: bytes, size: tuple[int, int] | None, frame: bool | None) -> bytes:
+    """`_at_size` only when something needs the photograph's canvas.
+
+    With framing on and `upscale` off (the default since 3 Oct 2026), framing
+    builds the standard canvas from the cut-out's OWN pixels and vnyx-api keeps
+    it — so a paint strategy's ~2K answer is not first blown up to 3000x4000,
+    which only made it softer. Off, or with `upscale`, the old resize stands:
+    vnyx-api would otherwise pad the smaller picture out and shrink the garment.
+    """
+    from app.imaging import framing
+
+    fcfg = framing.config()
+    on = fcfg.get("enabled") if frame is None else frame
+    if on and not fcfg.get("upscale"):
+        return out
+    return _at_size(out, size)
+
+
+# What /remove-background answers when no method produced a good cut-out and
+# the one on file was cropped and centred instead.
+EXISTING_FRAMED = "existing-framed"
 
 
 @app.post("/v1/imagery/remove-background", response_model=CutoutResponse)
@@ -836,16 +942,49 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
         # the KIL-001625 damage back, so the request fails instead.
         previous = fetch(req.previous_url, "previous_url")
 
+    report: dict = {}
     out, err, provider = cutout.remove_background(
         raw, timeout_s=req.timeout_s,
-        strategies=req.strategies, skip=req.skip, previous=previous)
+        strategies=req.strategies, skip=req.skip, previous=previous,
+        garment=req.garment, report=report, origin=req.origin)
+    # AFTER every check and the keep-better comparison: those judge the
+    # segmentation, on the photograph's own frame; framing only moves it.
+    framing_info = None
+    size = _upright_size(raw)
+    if out is not None:
+        out, framing_info = _framed(_sized(out, size, req.frame), req.frame)
+    elif previous is not None:
+        # NO METHOD PRODUCED A GOOD CUT-OUT (v2, v1, Gemini, gpt-image — or
+        # each lost to the one on file). The cut-out on file stays, but it is
+        # cropped and centred like every other: framed onto the photograph's
+        # canvas, and handed back as a replacement for itself. When it cannot
+        # be framed safely (or already is), nothing is returned and nothing is
+        # written, exactly as before.
+        framed_prev, prev_info = _framed(previous, req.frame, canvas=size)
+        if prev_info and prev_info.get("framed"):
+            log.info("bg-removal: no method produced a cut-out; the existing one was cropped "
+                     "and centred instead (%s)", err)
+            return CutoutResponse(
+                ok=True, image_base64=_b64.b64encode(framed_prev).decode(),
+                provider=EXISTING_FRAMED,
+                error=f"no new cut-out was good enough, so the existing one was cropped and "
+                      f"centred: {err}",
+                duration_ms=int((_time.perf_counter() - started) * 1000),
+                framing=prev_info,
+            )
+        framing_info = prev_info
     return CutoutResponse(
         ok=out is not None,
         image_base64=_b64.b64encode(out).decode() if out else None,
         provider=provider,
         error=err,
-        kept_existing=provider == cutout.KEPT_EXISTING,
+        # THE ONE ON FILE STAYS whenever there is one and nothing replaced it —
+        # the last resort, not a failure — so vnyx-api writes nothing and does
+        # not queue the same attempt again.
+        kept_existing=provider == cutout.KEPT_EXISTING or (out is None and previous is not None),
         duration_ms=int((_time.perf_counter() - started) * 1000),
+        framing=framing_info,
+        refine=report.get("refine"),
     )
 
 
@@ -855,9 +994,16 @@ class CutoutUrlRequest(BaseModel):
     image_url: str | None = None
     image_base64: str | None = None
     timeout_s: float = 180.0
+    # Crop and centre (see CutoutRequest.frame); omitted, policy decides.
+    frame: bool | None = None
+    # What the garment is (see CutoutRequest.garment); hung bottoms are refined.
+    garment: str | None = None
+    # Where the photo came from (see CutoutRequest.origin).
+    origin: str | None = None
 
 
-def _cutout_png(raw: bytes, timeout_s: float):
+def _cutout_png(raw: bytes, timeout_s: float, frame: bool | None = None,
+                garment: str | None = None, origin: str | None = None):
     """Cut `raw` with the URL endpoint's chain; the PNG at the photo's resolution."""
     import io as _io
     import os as _os
@@ -878,33 +1024,29 @@ def _cutout_png(raw: bytes, timeout_s: float):
         return JSONResponse(status_code=503, content={
             "ok": False, "error": "the fine-tuned model is not configured on this server "
                                   "(HERMES_CLOTH_SEG_FT_PATH): see docs/DEPLOY-BACKGROUND-REMOVAL.md §11"})
-    try:
-        upright, _orientation = cutout._upright(raw)
-        size = Image.open(_io.BytesIO(upright)).size
-    except Exception:  # noqa: BLE001
+    size = _upright_size(raw)
+    if size is None:
         raise HTTPException(400, "the image could not be decoded")
 
-    out, err, provider = cutout.remove_background(raw, timeout_s=timeout_s, strategies=strategies)
+    report: dict = {}
+    out, err, provider = cutout.remove_background(raw, timeout_s=timeout_s, strategies=strategies,
+                                                  garment=garment, report=report, origin=origin)
     ms = int((_time.perf_counter() - started) * 1000)
     if out is None:
         return JSONResponse(status_code=422, content={
             "ok": False, "error": err, "provider": provider, "duration_ms": ms})
 
-    # THE SAME RESOLUTION AS THE PHOTOGRAPH. Every local strategy already keeps
-    # it; a paid PAINT strategy may render at its own size, so the result is
-    # brought back to the source's (RGB and alpha resized apart, so the corners
-    # stay (255,255,255,0) rather than premultiplied black).
-    img = Image.open(_io.BytesIO(out)).convert("RGBA")
-    if img.size != size:
-        rgb = img.convert("RGB").resize(size, Image.Resampling.LANCZOS)
-        alpha = img.getchannel("A").resize(size, Image.Resampling.LANCZOS)
-        img = Image.merge("RGBA", (*rgb.split(), alpha))
-        buf = _io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
-        out = buf.getvalue()
+    # THE SAME RESOLUTION AS THE PHOTOGRAPH (see _at_size), unless framing makes
+    # the canvas from the cut-out's own pixels (see _sized).
+    out = _sized(out, size, frame)
+    img = Image.open(_io.BytesIO(out))
+    out, framing_info = _framed(out, frame)
     return Response(content=out, media_type="image/png", headers={
         "X-Cutout-Provider": provider,
         "X-Cutout-Width": str(img.width), "X-Cutout-Height": str(img.height),
+        "X-Cutout-Framed": "yes" if (framing_info or {}).get("framed") else "no",
+        "X-Cutout-Scale": str((framing_info or {}).get("scale", 1.0)),
+        "X-Cutout-Refined": "yes" if (report.get("refine") or {}).get("refined") else "no",
         "X-Duration-Ms": str(ms),
     })
 
@@ -941,7 +1083,8 @@ def imagery_cutout(req: CutoutUrlRequest, x_api_key: str | None = Header(default
 
     200  image/png (RGBA; transparent background). Headers: X-Cutout-Provider
          (which strategy made it: cloth-seg-ft, cloth-seg-ft-backup,
-         cloth-seg-ft+agreed, gemini-mask), X-Cutout-Width/Height, X-Duration-Ms.
+         cloth-seg-ft+agreed, gemini-mask), X-Cutout-Width/Height, X-Duration-Ms,
+         X-Cutout-Refined (yes when hung bottoms were refined; pass `garment`).
     422  JSON {ok: false, error, provider}: nothing produced an acceptable cut-out.
     400  the URL could not be fetched, or the bytes are not an image.
     503  the fine-tuned model is not configured on this server.
@@ -962,15 +1105,17 @@ def imagery_cutout(req: CutoutUrlRequest, x_api_key: str | None = Header(default
         raw = _fetch_image(req.image_url)
     else:
         raise HTTPException(400, "pass image_url or image_base64")
-    return _cutout_png(raw, req.timeout_s)
+    return _cutout_png(raw, req.timeout_s, req.frame, req.garment, req.origin)
 
 
 @app.get("/v1/imagery/cutout")
-def imagery_cutout_get(image_url: str, timeout_s: float = 180.0,
+def imagery_cutout_get(image_url: str, timeout_s: float = 180.0, frame: bool | None = None,
+                       garment: str | None = None, origin: str | None = None,
                        x_api_key: str | None = Header(default=None)):
-    """The same, as a GET: /v1/imagery/cutout?image_url=<url-encoded URL>."""
+    """The same, as a GET: /v1/imagery/cutout?image_url=<url-encoded URL>[&frame=false]
+    [&garment=Bottoms%20Shorts][&origin=WEB]."""
     _check_cutout_key(x_api_key)
-    return _cutout_png(_fetch_image(image_url), timeout_s)
+    return _cutout_png(_fetch_image(image_url), timeout_s, frame, garment, origin)
 
 
 @app.post("/v1/imagery/verify", response_model=ImageryVerdict)

@@ -159,6 +159,11 @@ class MediaAsset(BaseModel):
     # at the file: {"transparent": fraction, "rgb": [r, g, b], "coverage":
     # fraction, "stddev": float}. Evidence for IMG.027; never stored.
     border: dict[str, Any] | None = None
+    # `ProductMedia.shotKey`: which shot of the image sequence an AI render is.
+    # Several shots share a view (a close-up and a back close-up are both
+    # AI_CLOSEUP), so only this tells them apart. None on renders older than
+    # shot keys — app/rules/shot_sequence.shot_of reads those from the url.
+    shot_key: str | None = None
 
     @property
     def live(self) -> bool:
@@ -311,6 +316,11 @@ class ProductSnapshot(BaseModel):
     # and the imagery rules fall back to permissive defaults rather than reporting
     # a configuration they cannot see.
     imagery_settings: "ImagerySettings | None" = None
+    # The product's image sequence (3 Oct 2026) — `{source, matchedCategory,
+    # shots, lines}`, the tenant default or the category / subcategory override.
+    # It says which renders the product gets, how many, and the gallery order;
+    # see app/rules/shot_sequence.py. None: the fixed views, as before.
+    shot_sequence: dict[str, Any] | None = None
 
     # sidecars
     confidence: dict[str, float] = Field(default_factory=dict)
@@ -373,6 +383,27 @@ class ProductSnapshot(BaseModel):
             and not m.deleted_at
             and m.url
         ]
+
+    @property
+    def garment_view_urls(self) -> list[str]:
+        """The whole garment, FRONT then BACK — the cut-out when there is one,
+        else the photograph — from the typed media rows. Empty without them.
+
+        For the evidence layer's FILE-THE-GARMENT question (1 Oct 2026). It used
+        to see `images[:n]`, the gallery cache in whatever order it happened to
+        be in; on three Levi's shorts that was close-ups, and the model said so —
+        "leg length is not visible" — then filed them as Jeans from the label's
+        "511 W34 L34". The garment type is a question about the WHOLE garment.
+        """
+        out: list[str] = []
+        for view in ("FRONT", "BACK"):
+            rows = [m for m in self.media
+                    if (m.view or "").upper() == view and m.is_current
+                    and not m.deleted_at and m.url]
+            rows.sort(key=lambda m: 0 if (m.processing or "").upper() == "BG_REMOVED" else 1)
+            if rows:
+                out.append(rows[0].url)
+        return out
 
     def prov(self, field: str) -> Provenance:
         if field in self.locked_fields:
@@ -702,6 +733,15 @@ class AiViewReport(BaseModel):
     # The ¾ and close-up views when they are not in `required`. Reported so the UI
     # can offer to fill them in without calling their absence a defect.
     advisory_missing: list[str] = Field(default_factory=list)
+    # By the image sequence, per shot instance (`full_front#2` is the second
+    # full front). Empty when no sequence was supplied.
+    sequence_source: str | None = None
+    expected_shots: list[str] = Field(default_factory=list)
+    missing_shots: list[str] = Field(default_factory=list)
+    extra_renders: int = 0
+    # Old renders with no shot key all under one view, where the sequence
+    # expects several — IMG.021, a relabel. Only set with a sequence.
+    mislabelled: bool = False
     # Rows, not distinct views. A product with five AI rows across ONE view has
     # its pictures and needs relabelling, not regeneration — see IMG.021.
     row_count: int = 0
@@ -732,8 +772,14 @@ class GenerationPlan(BaseModel):
     """
 
     should_generate: bool = False
-    # AI views to render, as VNYX ProductMediaView names.
+    # AI views to render, as VNYX ProductMediaView names. With an image sequence,
+    # only views the sequence fills with ONE of the classic five shots — the
+    # only ones the view generator can make without making the wrong shot or
+    # replacing a neighbour on the same view. The rest is in `shots`.
     views: list[str] = Field(default_factory=list)
+    # By the image sequence: every missing shot instance (`closeup_back`,
+    # `full_front#2`). What vnyx-api's `--sequence` render makes.
+    shots: list[str] = Field(default_factory=list)
     # Garment originals to matte FIRST. Generating from an un-matted photograph
     # seeds the model with a stockroom wall, so this happens before `views`.
     matte_first: list[SourceImage] = Field(default_factory=list)

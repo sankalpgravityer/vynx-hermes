@@ -31,7 +31,12 @@ from app.rules.imagery import check_imagery, cutout_pairs  # noqa: E402
 from app.services.auto_approval import outcome  # noqa: E402
 from scripts import repair_product as rp  # noqa: E402
 
-POL = policy()
+# FRAMING OFF (imagery.cutout.framing): these tests pin the checks against the
+# PHOTOGRAPH'S own frame — the zoom, the collar, the lit wall, the scale
+# outlier. Crop-and-centre, and what the checks do with it, is
+# tests/test_framing.py.
+POL = copy.deepcopy(policy())
+POL.setdefault("imagery", {}).setdefault("cutout", {})["framing"] = {"enabled": False}
 CFG = cutouts.config(POL)
 
 
@@ -1109,7 +1114,7 @@ def wired(monkeypatch):
 
     approve_outcome: dict[str, Any] = {"outcome": "would_approve", "problems": []}
 
-    def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet, allow_stage=None, publish=True):
+    def fake_approve_check(vnyx_api, dsn, pid, *, apply, skip_bin, quiet, allow_stage=None, publish=True, publish_status=None):
         calls["approve"].append({"apply": apply})
         return dict(approve_outcome)
 

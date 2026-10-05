@@ -42,18 +42,19 @@ def client(monkeypatch, tmp_path):
     return TestClient(app)
 
 
-def body(data: bytes) -> dict:
-    return {"image_base64": base64.b64encode(data).decode()}
+def body(data: bytes, **extra) -> dict:
+    return {"image_base64": base64.b64encode(data).decode(), **extra}
 
 
 def test_returns_a_png_at_the_photos_resolution(client, monkeypatch):
+    """Unframed (`frame: false`): the photo's canvas, exactly."""
     seen = {}
 
     def fake(raw, timeout_s=180.0, strategies=None, **kw):
         seen["strategies"] = strategies
         return png_of((600, 400)), None, "cloth-seg-ft"
     monkeypatch.setattr(cutout, "remove_background", fake)
-    r = client.post("/v1/imagery/cutout", json=body(jpeg()))
+    r = client.post("/v1/imagery/cutout", json=body(jpeg(), frame=False))
     assert r.status_code == 200 and r.headers["content-type"] == "image/png"
     assert Image.open(io.BytesIO(r.content)).size == (600, 400)
     assert r.headers["X-Cutout-Provider"] == "cloth-seg-ft"
@@ -61,10 +62,11 @@ def test_returns_a_png_at_the_photos_resolution(client, monkeypatch):
 
 
 def test_a_differently_sized_result_is_brought_back_to_the_photos_size(client, monkeypatch):
-    """A paid paint strategy can render at its own size; the caller still gets the photo's."""
+    """Unframed: a paid paint strategy can render at its own size; the caller still
+    gets the photo's."""
     monkeypatch.setattr(cutout, "remove_background",
                         lambda raw, **kw: (png_of((1024, 683)), None, "gemini-paint"))
-    r = client.post("/v1/imagery/cutout", json=body(jpeg()))
+    r = client.post("/v1/imagery/cutout", json=body(jpeg(), frame=False))
     img = Image.open(io.BytesIO(r.content))
     assert img.size == (600, 400) and img.mode == "RGBA"
     assert img.getpixel((0, 0))[3] == 0, "the background stays transparent"
@@ -74,9 +76,23 @@ def test_the_resolution_is_the_upright_photos(client, monkeypatch):
     """A decision original: stored landscape, EXIF says rotate — the cut-out is portrait."""
     monkeypatch.setattr(cutout, "remove_background",
                         lambda raw, **kw: (png_of((400, 600)), None, "cloth-seg-ft"))
-    r = client.post("/v1/imagery/cutout", json=body(jpeg((600, 400), exif_orientation=6)))
+    r = client.post("/v1/imagery/cutout", json=body(jpeg((600, 400), exif_orientation=6), frame=False))
     assert r.status_code == 200
     assert Image.open(io.BytesIO(r.content)).size == (400, 600)
+
+
+def test_framed_the_garment_is_not_enlarged_and_keeps_the_photos_ratio(client, monkeypatch):
+    """Framed (the default, 3 Oct 2026): a garment smaller than the standard gets a
+    smaller canvas of the photo's ratio — its pixels are not scaled up."""
+    monkeypatch.setattr(cutout, "remove_background",
+                        lambda raw, **kw: (png_of((600, 400)), None, "cloth-seg-ft"))
+    r = client.post("/v1/imagery/cutout", json=body(jpeg()))
+    img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+    assert r.headers["X-Cutout-Framed"] == "yes" and r.headers["X-Cutout-Scale"] == "1.0"
+    assert abs(img.width / img.height - 600 / 400) < 0.02
+    a = img.getchannel("A")
+    box = a.getbbox()
+    assert (box[2] - box[0], box[3] - box[1]) == (200, 200), "the garment is its photographed size"
 
 
 def test_no_acceptable_cut_out_is_a_422_with_the_reasons(client, monkeypatch):

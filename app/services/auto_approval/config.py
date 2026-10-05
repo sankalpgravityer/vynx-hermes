@@ -39,6 +39,10 @@ class RunSettings:
     gate: bool = True
     price_mode: str = "full"          # full | window_only | rounding_only | off
     publish_on_approve: bool = True
+    # The Brain's `publishActiveOnApprove`: the agent's approvals go to Shopify
+    # as ACTIVE (live) instead of draft, and the product's status follows what
+    # Shopify reports. Off — the default — sends them as a draft, status Draft.
+    publish_active: bool = False
     sync_changes: bool = False
 
     @property
@@ -112,6 +116,7 @@ def settings_from_snapshot(snapshot: Any, fallback_max_attempts: int = 3) -> Run
         gate=bool(chain.get("gate", True)),
         price_mode=price_mode,
         publish_on_approve=bool(chain.get("publishOnApprove", True)),
+        publish_active=bool(chain.get("publishActive", False)),
         sync_changes=bool(chain.get("syncChanges", False)),
     )
 

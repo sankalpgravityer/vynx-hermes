@@ -257,6 +257,8 @@ def test_a_subcategory_the_new_branch_never_offered_is_named_by_the_title():
         "reason": "TAX.003",
         "detail": ("'Blazers' is not offered under 'Women > Jackets'; the title names it, "
                    "and 'Sports Jackets' is the only option on this branch that it matches"),
+        # Marked as title evidence, so the photographs can overrule its TYPE.
+        "source": "title",
     }]
 
 

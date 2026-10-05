@@ -140,6 +140,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import product_audit  # noqa: E402
 from app.config import policy, settings  # noqa: E402
 from app.llm import cache as vision_cache  # noqa: E402
+from app.rules import shot_sequence  # noqa: E402
 
 # Where the TypeScript half lives. Every write this script causes happens in
 # there, because that is where R2, the ProductMedia invariants, the price mirror
@@ -270,6 +271,9 @@ def vnyx_api_url() -> str | None:
 # means there was nobody to ask because the steps are spawned locally.
 _LOCAL_TRANSPORT = "*local*"
 _REMOTE_OPTIONS: set[str] | None = None
+# Whether the step runner can run a step in the background and be polled (the
+# ping's `asyncSteps`). None = not asked; False = asked, and it cannot.
+_REMOTE_ASYNC: bool | None = None
 
 
 def remote_options() -> set[str]:
@@ -294,7 +298,7 @@ def remote_options() -> set[str]:
     Never raises: a ping that fails answers "nothing", which is the same
     conservative branch as an old server.
     """
-    global _REMOTE_OPTIONS
+    global _REMOTE_OPTIONS, _REMOTE_ASYNC
     if _REMOTE_OPTIONS is not None:
         return _REMOTE_OPTIONS
 
@@ -319,9 +323,22 @@ def remote_options() -> set[str]:
         )
         body = r.json() if r.status_code == 200 else {}
         _REMOTE_OPTIONS = {str(o) for o in (body.get("options") or [])}
+        _REMOTE_ASYNC = body.get("asyncSteps") is True
     except Exception:  # noqa: BLE001 — a probe that cannot run is not a failure
         _REMOTE_OPTIONS = set()
+        _REMOTE_ASYNC = False
     return _REMOTE_OPTIONS
+
+
+def remote_async() -> bool:
+    """Can the step runner run a step in the background and be polled?
+
+    Only on POSITIVE evidence — the ping said `asyncSteps: true`. Anything else
+    (an older vnyx-api, a ping that failed, the local transport) is the
+    synchronous call, exactly as before.
+    """
+    remote_options()
+    return _REMOTE_ASYNC is True
 
 
 def remote_supports(*options: str) -> bool:
@@ -386,6 +403,11 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
     # modes follow remote_supports the same way.
     if "--no-publish" in args:
         options["noPublish"] = True
+    # The agent's Shopify status on approval (the Brain's
+    # publishActiveOnApprove); approve_check sends it only to a server that
+    # lists it. A closed enum on the server, like every other option.
+    if "--publish-status" in args:
+        options["publishStatus"] = args[args.index("--publish-status") + 1]
     if "--rounding-only" in args:
         options["roundingOnly"] = True
     if "--skip-rounding" in args:
@@ -440,6 +462,18 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
         ]
         key = "matteViews" if script == "backfill-bg-removal.ts" else "views"
         options[key] = picked
+    # THE PRODUCT'S IMAGE SEQUENCE (3 Oct 2026): the render makes the shots its
+    # sequence asks for (`--shots` narrows them). Sent only to a vnyx-api whose
+    # /ping lists `sequence` (_sequence_render); both are closed on the server.
+    if "--sequence" in args:
+        options["sequence"] = True
+    # The `sync` step's push of a LIVE product (resync-listings.ts
+    # --include-synced); without it only failed pushes are re-driven.
+    if "--include-synced" in args:
+        options["includeSynced"] = True
+    if "--shots" in args:
+        options["shots"] = [s.strip().lower()
+                            for s in args[args.index("--shots") + 1].split(",") if s.strip()]
     # The copy step's two halves (readiness phase 5). Neither flag means both.
     if "--title" in args:
         options["title"] = True
@@ -467,6 +501,9 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
         "options": options,
     }
 
+    if remote_async():
+        return _run_remote_async(base, secret, script, payload, timeout_s=timeout_s, quiet=quiet)
+
     try:
         # A little longer than the step's own budget, so the server's timeout
         # fires first and we get its output rather than a bare read timeout.
@@ -484,7 +521,12 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
             f"{script}: vnyx-api returned {resp.status_code} "
             f"{resp.text[:300]}")
 
-    body = resp.json()
+    return _step_result(resp.json(), script, timeout_s=timeout_s, quiet=quiet)
+
+
+def _step_result(body: dict[str, Any], script: str, *, timeout_s: int,
+                 quiet: bool) -> tuple[bool, str, dict[str, Any] | None]:
+    """A finished step's response body -> (ok, output, results). Shared by both calls."""
     out = str(body.get("output") or "")
     if not quiet:
         for line in out.splitlines():
@@ -493,6 +535,75 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
     if body.get("timedOut"):
         raise StepFailed(f"{script} timed out after {timeout_s}s")
     return bool(body.get("ok")), out, body.get("results")
+
+
+# How often a background step is asked "done yet?", and how many consecutive
+# failed polls (network blips, a 502/504 from the proxy) are tolerated before
+# the step is given up on. Each poll is a sub-second request.
+STEP_POLL_S = float(os.getenv("AUTO_APPROVAL_STEP_POLL_S", "5"))
+STEP_POLL_MAX_ERRORS = 12
+
+
+def _run_remote_async(base: str, secret: str, script: str, payload: dict[str, Any], *,
+                      timeout_s: int, quiet: bool) -> tuple[bool, str, dict[str, Any] | None]:
+    """Start the step in the background and poll it to completion.
+
+    WHY (30 Sep 2026). The step used to be one request held open until the
+    script finished, and the proxy in front of vnyx-api closes any request at
+    ~60 s with a 504 error page — so a matte that asks two fine-tuned
+    segmenters (~50-80 s), a regeneration round, or a render (up to 30 min)
+    failed while the script often ran on with nobody listening. Here no request
+    lasts longer than a second or two, whatever the step takes.
+    """
+    import time as _time
+
+    import httpx
+
+    headers = {"x-internal-secret": secret}
+    try:
+        resp = httpx.post(f"{base}/internal/auto-approval/step", json={**payload, "async": True},
+                          headers=headers, timeout=httpx.Timeout(30, connect=15))
+    except httpx.HTTPError as exc:
+        raise StepFailed(f"{script}: cannot reach vnyx-api ({exc})") from None
+    if resp.status_code not in (200, 202):
+        raise StepFailed(f"{script}: vnyx-api returned {resp.status_code} {resp.text[:300]}")
+    job = (resp.json() or {}).get("jobId")
+    if not job:
+        raise StepFailed(f"{script}: vnyx-api started no job ({resp.text[:200]})")
+
+    # The server kills the script at its own timeout; allow for that plus slack,
+    # so a step the server timed out is reported with the server's output.
+    deadline = _time.monotonic() + timeout_s + 120
+    errors = 0
+    while True:
+        _time.sleep(STEP_POLL_S)
+        try:
+            r = httpx.get(f"{base}/internal/auto-approval/step/{job}", headers=headers,
+                          timeout=httpx.Timeout(30, connect=15))
+        except httpx.HTTPError as exc:
+            errors += 1
+            if errors >= STEP_POLL_MAX_ERRORS:
+                raise StepFailed(f"{script}: lost contact with vnyx-api while the step ran "
+                                 f"(job {job}: {exc})") from None
+            continue
+        if r.status_code == 404:
+            raise StepFailed(f"{script}: the step's job {job} is gone — vnyx-api restarted "
+                             f"while it ran, or it expired")
+        if r.status_code != 200:
+            errors += 1
+            if errors >= STEP_POLL_MAX_ERRORS:
+                raise StepFailed(f"{script}: polling job {job} failed: "
+                                 f"{r.status_code} {r.text[:200]}")
+            continue
+        errors = 0
+        body = r.json() or {}
+        state = body.get("state")
+        if state == "done":
+            return _step_result(body, script, timeout_s=timeout_s, quiet=quiet)
+        if state == "error":
+            raise StepFailed(f"{script}: {body.get('error') or 'the step failed'}")
+        if _time.monotonic() > deadline:
+            raise StepFailed(f"{script}: still running after {timeout_s + 120}s (job {job})")
 
 
 def run_step(vnyx_api: Path, script: str, args: list[str], *,
@@ -615,6 +726,21 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
     garment_photos = [m for m in garments
                       if not any(k in str(m.get("url") or "").lower() for k in markers)]
 
+    # THE PRODUCT'S IMAGE SEQUENCE (3 Oct 2026). How many renders it gets, and
+    # which, is the sequence's — the tenant default or its category's override —
+    # counted per shot (BOAS: six with the full front twice; its shoes: three
+    # close-ups and nothing on the torso). Without one, the fixed five views.
+    seq = _sequence_plan(record, render_rows)
+    if seq is not None:
+        renders_present = len(seq.present)
+        renders_expected = len(seq.expected)
+        renders_missing = len(seq.missing)
+        mislabelled = shot_sequence.looks_mislabelled(seq, render_rows)
+    else:
+        renders_present, renders_expected = len(renders), 5
+        renders_missing = 5 - len(renders)
+        mislabelled = len(renders) < len(render_rows)
+
     summary = (record.get("summary") or "").strip()
     return {
         "loaded": loaded,
@@ -635,9 +761,16 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
         "master": record.get("masterCategory"),
         "mannequin": record.get("mannequinType"),
         "size": record.get("size") or record.get("internationalSize"),
-        "renders": len(renders),
+        "renders": renders_present,
         "render_rows": len(render_rows),
-        "renders_missing": 5 - len(renders),
+        "renders_missing": renders_missing,
+        "renders_expected": renders_expected,
+        # The sequence's missing shot instances (`full_front#2`), its name, and
+        # the renders outside it (reported, never deleted).
+        "missing_shots": [i.label for i in seq.missing] if seq else [],
+        "sequence": seq.resolved.describe() if seq else None,
+        "renders_extra": len(seq.extra) if seq else 0,
+        "mislabelled": mislabelled,
         # Read before and after the chain by the canary in repair(): a flip to
         # GENERATING that the render step did not cause means a repair write is
         # triggering paid regeneration.
@@ -653,6 +786,40 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
             ) if not value
         ],
     }
+
+
+def _sequence_plan(record: dict[str, Any], render_rows: list[dict[str, Any]]) -> Any:
+    """The product's live renders against its image sequence, or None (no sequence
+    on the record, or `imagery.sequence.enabled` off)."""
+    if not (((policy().get("imagery") or {}).get("sequence") or {}).get("enabled", True)):
+        return None
+    resolved = shot_sequence.from_payload(record.get("shotSequence"))
+    return shot_sequence.plan(resolved, render_rows) if resolved else None
+
+
+def _sequence_views(state: dict[str, Any]) -> list[str] | None:
+    """The views the product's sequence renders onto, in sequence order."""
+    loaded = state.get("loaded") or {}
+    resolved = shot_sequence.from_payload((loaded.get("record") or {}).get("shotSequence"))
+    if resolved is None:
+        return None
+    out: list[str] = []
+    for inst in resolved.expanded:
+        if inst.view not in out:
+            out.append(inst.view)
+    return out
+
+
+def _renders_of(state: dict[str, Any]) -> str:
+    """`5/6`: renders on the product against what its sequence asks for."""
+    return f'{state.get("renders", 0)}/{state.get("renders_expected") or 5}'
+
+
+def _sequence_render(state: dict[str, Any]) -> bool:
+    """Render by the product's sequence (vnyx-api `--sequence`)? Only with a sequence
+    on the record and a vnyx-api that takes the option — an older one gets the
+    fixed-view render, as before."""
+    return bool(state.get("sequence")) and remote_supports("sequence")
 
 
 def _generation_in_flight(state: dict[str, Any]) -> bool:
@@ -847,7 +1014,7 @@ def run_fixture(path: Path, *,
         would.append("care label")
     if gate["repair_plan"]:
         would.append("reconcile")
-    if state["renders_missing"]:
+    if state["renders_missing"] > 0:
         would.append("render")
 
     return {
@@ -862,8 +1029,9 @@ def run_fixture(path: Path, *,
         "price": gate.get("price"),
         "master": master_decision,
         "would_run": would,
-        "state": {k: state[k] for k in ("description_chars", "care_label", "unmatted",
-                                        "renders", "attributes_missing")},
+        "state": {k: state.get(k) for k in ("description_chars", "care_label", "unmatted",
+                                            "renders", "renders_expected", "missing_shots",
+                                            "attributes_missing")},
         "dumped": data.get("_fixture") or {},
     }
 
@@ -907,7 +1075,7 @@ def run_fixtures(paths: list[Path], *, out: str | None = None) -> int:
               f'{(r["title"] or "")[:60]}')
         print(paint(f'        {r["tenant"]} {DOT} {r["stage"]} {DOT} '
                     f'{st["description_chars"]} chars {DOT} care label {st["care_label"]} '
-                    f'{DOT} {st["unmatted"]} unmatted {DOT} {st["renders"]}/5 renders {DOT} '
+                    f'{DOT} {st["unmatted"]} unmatted {DOT} {_renders_of(st)} renders {DOT} '
                     f'missing {", ".join(st["attributes_missing"]) or "nothing"}', DIM))
         verdict = (paint("verified", GREEN) if r["verified"]
                    else paint(f'{len(r["blocking"])} blocking', RED))
@@ -961,8 +1129,16 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
                   apply: bool, skip_bin: bool,
                   quiet: bool,
                   allow_stage: list[str] | None = None,
-                  publish: bool = True) -> dict[str, Any]:
+                  publish: bool = True,
+                  publish_status: str | None = None) -> dict[str, Any]:
     """Run approve-products.ts and read back its structured verdict.
+
+    `publish_status` ('active' | 'draft') is the Auto Approval agent's Shopify
+    status for this approval — the runner passes it, a person at the CLI never
+    does, so a manual approval is exactly what it always was. vnyx-api writes
+    the product Draft (Archived stays Archived) and sets it to what Shopify
+    reports once the push lands. A server too old to take it approves the old
+    way, and the verdict says so (`publishStatusSkipped`).
 
     Shelled out rather than reimplemented for the reason in the module
     docstring: the pre-flight is only half of it, and the other half —
@@ -985,6 +1161,12 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
         args.append("--apply")
     if not publish:
         args.append("--no-publish")
+    status_skipped = False
+    if apply and publish and publish_status in ("active", "draft"):
+        if remote_supports("publishStatus"):
+            args.extend(["--publish-status", publish_status])
+        else:
+            status_skipped = True
     if skip_bin:
         args.append("--skip-bin")
     if allow_stage:
@@ -1003,7 +1185,10 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
     rows = payload.get("results") or []
     if not rows:
         raise StepFailed("approve-products.ts returned no verdict")
-    return rows[0]
+    verdict = rows[0]
+    if status_skipped:
+        verdict = {**verdict, "publishStatusSkipped": publish_status}
+    return verdict
 
 
 def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
@@ -1033,6 +1218,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            #                 after a run that changed it. Never creates one.
            price_mode: str | None = None,
            publish: bool = True,
+           # 'active' | 'draft': the Shopify status the AGENT's approval
+           # publishes with (the Brain's publishActiveOnApprove). None — every
+           # manual/CLI run — approves exactly as it always has.
+           publish_status: str | None = None,
            sync_changes: bool = False,
            ) -> dict[str, Any]:
     # SILENT SHADOWS THE BUILTIN, deliberately and only inside this function.
@@ -1068,8 +1257,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         f'  description {state["description_chars"]} chars {DOT} '
         f'care label {state["care_label"]} {DOT} '
         f'{state["unmatted"]} view(s) unmatted {DOT} '
-        f'{state["renders"]}/5 renders {DOT} '
-        f'missing {", ".join(state["attributes_missing"]) or "nothing"}', DIM))
+        f'{_renders_of(state)} renders'
+        + (f' ({state["sequence"]})' if state.get("sequence") else '')
+        + f' {DOT} missing {", ".join(state["attributes_missing"]) or "nothing"}', DIM))
 
     def step(name: str, why: str, run) -> None:
         if why:
@@ -1448,7 +1638,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             raise StepFailed("relabel returned non-zero")
         return "recovered the true view from the filenames"
 
-    mislabelled = state["renders"] < state["render_rows"]
+    # Per shot when the product has a sequence (needs_from): three close-ups on a
+    # three-close-up sequence are not mislabelled; five old AI_FRONT rows are.
+    mislabelled = state.get("mislabelled", state["renders"] < state["render_rows"])
     step("relabel",
          "" if mislabelled else "every render is filed under its own view",
          _relabel)
@@ -1457,8 +1649,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # counts are re-read rather than reused. Skipping this re-read would leave
     # render regenerating five views the relabel had just recovered.
     if mislabelled and apply:
-        state = {**state, **{k: needs(dsn, product_id)[k]
-                             for k in ("renders", "renders_missing")}}
+        fresh = needs(dsn, product_id)
+        state = {**state, **{k: fresh[k] for k in (
+            "renders", "renders_missing", "renders_expected", "missing_shots", "mislabelled")
+            if k in fresh}}
 
     # ---- 2. extract -------------------------------------------------------
     #
@@ -1767,12 +1961,21 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     def _render() -> str:
         render_report["attempted"] = True
+        # BY THE SEQUENCE (3 Oct 2026): vnyx-api makes exactly the missing shot
+        # instances of the product's sequence — a back close-up, a second full
+        # front — on the gallery's own model, and nothing the sequence does not
+        # ask for. Without it, the fixed views Hermes' verify plan names.
+        by_seq = _sequence_render(state)
+        render_report["sequence"] = state.get("sequence") if by_seq else None
         ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
-                           [*common, *live], timeout_s=1800, quiet=quiet)
+                           [*common, *live, *(["--sequence"] if by_seq else [])],
+                           timeout_s=1800, quiet=quiet)
         _read_render(out, render_report)
         if not ok:
             raise StepFailed("imagery backfill returned non-zero")
-        note = f'{state["renders_missing"]} view(s)'
+        note = (f'{state["renders_missing"]} of {state.get("renders_expected")} from '
+                f'{state["sequence"]} ({", ".join(state.get("missing_shots") or [])})'
+                if by_seq else f'{state["renders_missing"]} view(s)')
         if render_report["failed"]:
             note += f' — could not produce {", ".join(render_report["failed"])}'
             if render_report["refused"]:
@@ -1784,8 +1987,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     is_kids = _rd.is_kids(state.get("master"), state.get("mannequin"), policy())
     if skip_render:
         render_why = "--no-render"
-    elif not state["renders_missing"]:
-        render_why = "all five views already exist"
+    elif state["renders_missing"] <= 0:
+        render_why = (f'every render {state["sequence"]} asks for exists ({_renders_of(state)})'
+                      if state.get("sequence") else "all five views already exist")
     elif is_kids and _rd.config(policy()).get("kids_renders") == "hold":
         # Decision 4 is `generate`; this branch exists so a tenant can turn it
         # off without a code change, and says so.
@@ -2142,10 +2346,22 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         all_views = list((pol.get("imagery") or {}).get("all_views")
                          or ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK", "AI_CLOSEUP"])
         wanted = {v for _, _, _, vs in askers for v in vs}
-        views = [v for v in all_views if v in wanted] + sorted(v for v in wanted if v not in all_views)
+        outside: list[str] = []
+        seq_views = _sequence_views(state) if _sequence_render(state) else None
+        if seq_views is not None:
+            # ONLY THE SEQUENCE'S SHOTS are re-rendered: a refused view's every
+            # instance in the sequence (both close-ups on a close-up and a back
+            # close-up), and nothing for a refused render outside it.
+            outside = sorted(v for v in wanted if v not in seq_views)
+            all_views = seq_views
+            views = [v for v in seq_views if v in wanted]
+        else:
+            views = [v for v in all_views if v in wanted] + sorted(v for v in wanted if v not in all_views)
         return {
             "askers": [a for a, _, _, _ in askers],
             "views": views,
+            "outside": outside,
+            "sequence": seq_views is not None,
             "all_views": all_views,
             "code": next((c for a, c, _, _ in askers if a == "gate"), None)
                     or next((c for _, c, _, _ in askers), None),
@@ -2194,8 +2410,11 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         views = plan["views"]
         regeneration["views"] = regeneration["views"] + [v for v in views if v not in regeneration["views"]]
         regen_report["views"] = regen_report["views"] + [v for v in views if v not in regen_report["views"]]
+        # By the sequence: the named views' instances are re-made (`--replace`),
+        # each retiring only the render it pairs with.
+        seq_args = ["--sequence", "--replace"] if plan.get("sequence") else []
         ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
-                              [*common, *live, "--views", ",".join(views)],
+                              [*common, *live, "--views", ",".join(views), *seq_args],
                               timeout_s=1800, quiet=quiet)
         _read_render(out, regen_report)
         if not ok:
@@ -2269,6 +2488,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         regen_why = "--no-render"
     elif budget < 1:
         regen_why = "readiness.max_regenerations_per_run is 0"
+    elif not regen_plan["views"] and regen_plan.get("outside"):
+        regen_why = (f'the refused render(s) {", ".join(regen_plan["outside"])} are not in '
+                     f'{state.get("sequence")} — nothing of the sequence to re-render')
     elif not regen_plan["views"]:
         regen_why = "nothing to regenerate for this verdict"
     elif _generation_in_flight(state):
@@ -2471,7 +2693,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                                 apply=apply and approve and not blocked,
                                 skip_bin=skip_bin,
                                 quiet=quiet, allow_stage=allow_stage,
-                                publish=publish)
+                                publish=publish, publish_status=publish_status)
         if blocked:
             gate_problems = [f"{label}: {r}" for label, v in refusing for r in v.reasons]
             # A real refusal names its code; only when EVERY refusing verdict is
@@ -2494,8 +2716,21 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         outcome = verdict.get("outcome", "?")
         problems = verdict.get("problems") or []
         if outcome == "approved":
-            pushed = ("Shopify upsert enqueued" if verdict.get("published", True)
-                      else "NOT published — the Brain has the Shopify push off")
+            ps = verdict.get("publishStatus")
+            if not verdict.get("published", True):
+                pushed = "NOT published — the Brain has the Shopify push off"
+            elif ps == "active":
+                pushed = ("Shopify upsert enqueued as ACTIVE — the status turns Active "
+                          "once Shopify has it live")
+            elif ps == "draft":
+                pushed = "Shopify upsert enqueued as a DRAFT — status Draft"
+            elif ps == "archived":
+                pushed = "Archived on Shopify — kept Archived, synced only"
+            elif verdict.get("publishStatusSkipped"):
+                pushed = ("Shopify upsert enqueued the old way — this vnyx-api cannot "
+                          "take publishStatus yet")
+            else:
+                pushed = "Shopify upsert enqueued"
             return (f'APPROVED — {verdict.get("stageBefore")} '
                     f'{ARROW} {verdict.get("stageAfter")}, {pushed}')
         if (outcome == "would_approve" and apply and approve and not publish
@@ -2529,14 +2764,33 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     sync_report: dict[str, Any] = {"ran": False, "why": None}
 
     def _sync() -> str:
-        ok, _, _ = run_step(vnyx_api, "resync-listings.ts",
-                            ["--product", product_id, *live],
-                            timeout_s=120, quiet=quiet)
+        # `--include-synced` (4 Oct 2026): without it resync-listings.ts only
+        # re-drives FAILED pushes, so a live product — whose last push did
+        # succeed — matched nothing, nothing was queued, and this said
+        # "re-pushed" anyway (BOA-005474, BOA-006161: last synced Aug / Sep).
+        if not remote_supports("includeSynced"):
+            return ("NOT pushed — this vnyx-api cannot re-push a listing whose last sync "
+                    "succeeded (its step runner has no `includeSynced`); deploy vnyx-api")
+        ok, out, _ = run_step(vnyx_api, "resync-listings.ts",
+                              ["--product", product_id, "--include-synced", *live],
+                              timeout_s=120, quiet=quiet)
         if not ok:
             raise StepFailed("resync-listings.ts returned non-zero")
-        sync_report["ran"] = bool(apply)
-        return ("re-pushed to Shopify — the storefront gets this run's repairs"
-                if apply else "would re-push to Shopify")
+        if not apply:
+            return "would re-push to Shopify"
+        # WHAT THE SCRIPT DID, not what it was asked: its summary says how many
+        # pushes it queued, and each skip says why (no connected account, the
+        # approval gate). The push itself is the backend's Shopify worker's.
+        m = re.search(r"queued\s*:\s*(\d+)", out or "")
+        queued = int(m.group(1)) if m else 0
+        sync_report["ran"] = queued > 0
+        sync_report["queued"] = queued
+        if queued:
+            return ("queued the Shopify push — the backend's Shopify worker sends this run's "
+                    "repairs to the storefront")
+        why = [ln.split("skipped —", 1)[1].strip() for ln in (out or "").splitlines()
+               if "skipped —" in ln]
+        return "NOT pushed — " + ("; ".join(why) or "the resync queued nothing")
 
     # "Did this run change the product" from the ROW, not the step notes: every
     # write lands through updateProduct or the media cache rebuild, and both
@@ -2544,10 +2798,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # (reconcile runs on every product).
     wrote = bool(apply) and sync_changes and (
         needs(dsn, product_id)["loaded"]["record"].get("updatedAt") != started_updated_at)
-    if not sync_changes:
-        sync_why = "off in the Brain (syncChangesToShopify)"
-    elif verdict.get("outcome") == "approved":
+    # "Just approved" FIRST: the approval has already pushed this product, so
+    # the re-sync is not needed whatever the switch says — and naming the
+    # switch instead read as though the product had not gone to Shopify.
+    if verdict.get("outcome") == "approved":
         sync_why = "just approved — the approval pushed it"
+    elif not sync_changes:
+        sync_why = "off in the Brain (syncChangesToShopify)"
     elif not wrote:
         sync_why = "nothing was repaired this run"
     elif not shopify_product_id(dsn, product_id):
@@ -2700,7 +2957,7 @@ def report(r: dict[str, Any]) -> None:
     line("description", f'{b["description_chars"]} chars',
          f'{a["description_chars"]} chars')
     line("unmatted", b["unmatted"], a["unmatted"])
-    line("renders", f'{b["renders"]}/5', f'{a["renders"]}/5')
+    line("renders", _renders_of(b), _renders_of(a))
     line("missing attrs", ", ".join(b["attributes_missing"]) or "none",
          ", ".join(a["attributes_missing"]) or "none")
     print(f'    {"issues left":14} {r["issues"]}'
@@ -2994,8 +3251,8 @@ def write_sheet(results: list[dict[str, Any]], out: Path, *,
             (f'{b["description_chars"]} {ARROW} {a["description_chars"]}'
              if b["description_chars"] != a["description_chars"]
              else str(a["description_chars"])),
-            (f'{b["renders"]} {ARROW} {a["renders"]}/5'
-             if b["renders"] != a["renders"] else f'{a["renders"]}/5'),
+            (f'{b["renders"]} {ARROW} {_renders_of(a)}'
+             if b["renders"] != a["renders"] else _renders_of(a)),
             (f'{b["unmatted"]} {ARROW} {a["unmatted"]}'
              if b["unmatted"] != a["unmatted"] else str(a["unmatted"])),
             ", ".join(filled) or "—",

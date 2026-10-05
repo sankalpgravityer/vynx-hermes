@@ -7,6 +7,7 @@ The pumps it dispatches are separate tasks that queue behind whatever is running
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any
 
@@ -64,15 +65,52 @@ def preflight_result() -> dict[str, Any]:
     return _preflight_cache
 
 
+def _vnyx_snapshot(tenant_id: str) -> dict[str, Any] | None:
+    """The run snapshot vnyx-api builds — WITH the Brain compiled — or None.
+
+    WHY (4 Oct 2026). The Brain's checks compile in vnyx-api (checks.ts) into
+    the chain switches (syncChanges, matte, gate, priceMode, publish…), a policy
+    overlay and merged severity overrides. A snapshot built here had none of
+    that, so every run Hermes opened — the sweep's scheduled and arrival runs,
+    run_from_sheet.py — ran on the defaults: BOAS's re-run skipped the Shopify
+    sync as "off in the Brain" while the tenant's checks say
+    syncChangesToShopify. vnyx-api's GET /internal/auto-approval/snapshot gives
+    the same snapshot a run opened from the UI gets.
+
+    None (no URL or secret, an older vnyx-api, a network error) leaves the
+    local build below in charge, exactly as before, with a warning.
+    """
+    base = (os.getenv("VNYX_API_URL") or "").rstrip("/")
+    secret = os.getenv("AUTO_APPROVAL_INTERNAL_SECRET", "")
+    if not base or not secret:
+        return None
+    import httpx
+
+    try:
+        r = httpx.get(f"{base}/internal/auto-approval/snapshot/{tenant_id}",
+                      headers={"x-internal-secret": secret}, timeout=20)
+    except httpx.HTTPError as exc:
+        log.warning("run snapshot: vnyx-api unreachable (%s) — this run uses the "
+                    "Brain's defaults, not the tenant's checks", exc)
+        return None
+    if r.status_code != 200:
+        log.warning("run snapshot: vnyx-api answered %s (%s) — this run uses the Brain's "
+                    "defaults, not the tenant's checks", r.status_code, r.text[:200])
+        return None
+    snap = (r.json() or {}).get("snapshot")
+    return snap if isinstance(snap, dict) else None
+
+
 def _create_scheduled_run(
     tenant_id: str, cfg_row: dict[str, Any], source: str = "SCHEDULED"
 ) -> str:
     """Open a run with a frozen snapshot.
 
-    The snapshot is built HERE rather than fetched from vnyx-api because the
-    worker is the thing that opens the run — there is no HTTP request to hang it
-    off. It mirrors config.ts::snapshotConfig's shape; the Hermes-side fields it
-    cannot know (policy mtime) are read from the local policy file.
+    The snapshot is vnyx-api's when it can give one (`_vnyx_snapshot`: the
+    Brain compiled, as a UI-opened run has it). Otherwise it is built HERE, as it
+    always was: it mirrors config.ts::snapshotConfig's shape, the Hermes-side
+    fields it cannot know (policy mtime) are read from the local policy file —
+    and the Brain's checks are NOT compiled into it.
 
     `source` is a parameter because the arrival catch-up below needs an
     ON_ARRIVAL run, and its products must land in the SAME run the arrival hook
@@ -80,6 +118,18 @@ def _create_scheduled_run(
     Runs tab for no reason the user could see.
     """
     from app.config import policy, settings as hermes_settings
+
+    remote = _vnyx_snapshot(tenant_id)
+    if remote is not None:
+        row = db.write_returning(
+            """
+            INSERT INTO "AutoApprovalRun" ("tenantId", source, "configSnapshot")
+            VALUES (%(t)s::uuid, %(src)s::"AutoApprovalRunSource", %(s)s::jsonb)
+            RETURNING id
+            """,
+            {"t": tenant_id, "src": source, "s": Jsonb({**remote, "openedBy": "hermes-sweep"})},
+        )
+        return str(row["id"])
 
     try:
         mtime = hermes_settings().policy_path.stat().st_mtime

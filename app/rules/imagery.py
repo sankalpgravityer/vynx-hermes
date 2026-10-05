@@ -48,6 +48,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.imaging import cutouts as cutout_checks
+from app.rules import shot_sequence
 from app.models import (
     AiViewReport, Finding, GenerationPlan, MediaAsset, ProductSnapshot, Severity,
     SourceImage,
@@ -278,11 +279,65 @@ def required_views(p: ProductSnapshot, pol: dict[str, Any]) -> list[str]:
     return req
 
 
+def sequence_of(p: ProductSnapshot, pol: dict[str, Any] | None) -> shot_sequence.Resolved | None:
+    """The product's image sequence, when one was supplied and policy uses it.
+
+    vnyx-api sends it on the imagery endpoints (`product.shotSequence`), and the
+    chain's loader resolves it (product_audit.build). None means the fixed
+    views below, exactly as before sequences were read.
+    """
+    if not ((_cfg(pol or {}).get("sequence") or {}).get("enabled", True)):
+        return None
+    return shot_sequence.from_payload(p.shot_sequence)
+
+
+def sequence_plan(p: ProductSnapshot, pol: dict[str, Any] | None) -> shot_sequence.Plan | None:
+    """The product's live renders against its sequence, per shot instance."""
+    resolved = sequence_of(p, pol)
+    return shot_sequence.plan(resolved, ai_renders(p)) if resolved else None
+
+
+def generator_views(sp: shot_sequence.Plan, present_views: set[str]) -> list[str]:
+    """Views Hermes' VIEW generator may fill for this sequence.
+
+    It renders the view's classic shot (AI_CLOSEUP -> a front close-up), and the
+    repair that stores it retires every render already on that view. So a view
+    qualifies only when nothing is on it yet AND its classic shot is one of the
+    sequence's missing instances. A back close-up, a macro or a second full front
+    is the sequence render's work (vnyx-api `--sequence`), never this one's."""
+    wanted = {(i.view, i.shot) for i in sp.missing}
+    order = ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK", "AI_CLOSEUP"]
+    return [v for v in order
+            if v not in present_views
+            and (v, shot_sequence.LEGACY_VIEW_TO_SHOT[v]) in wanted]
+
+
 def view_report(p: ProductSnapshot, pol: dict[str, Any]) -> AiViewReport:
     rows = ai_renders(p)
     present = sorted({m.view for m in rows})
     req = required_views(p, pol)
     cfg = _cfg(pol)
+
+    # BY THE IMAGE SEQUENCE (3 Oct 2026). Required is policy's required views
+    # the sequence ASKS FOR — a shoes sequence of three close-ups is not missing
+    # an AI_BACK. Every missing shot instance is counted; the view lists hold
+    # only what the view generator can make (see generator_views).
+    sp = sequence_plan(p, pol)
+    if sp is not None:
+        req = [v for v in req if v in sp.expected_views]
+        safe = generator_views(sp, set(present))
+        return AiViewReport(
+            required=req,
+            present=present,
+            missing=[v for v in req if v not in present],
+            advisory_missing=[v for v in safe if v not in req],
+            sequence_source=sp.resolved.describe(),
+            expected_shots=[i.label for i in sp.expected],
+            missing_shots=[i.label for i in sp.missing],
+            extra_renders=len(sp.extra),
+            mislabelled=shot_sequence.looks_mislabelled(sp, rows),
+            row_count=len(rows),
+        )
 
     # A tenant with `isCloseUpEnabled = false` does not want close-ups, and the
     # analyze worker honours that (`wantCloseUp` in banana-nano.ts) — so it is
@@ -318,7 +373,12 @@ def is_mislabelled(report: AiViewReport, pol: dict[str, Any]) -> bool:
     regenerating them would spend ~2,000 Nano Banana calls reproducing pictures
     the product already has. The row count is what distinguishes this from a
     product that genuinely only ever got its front view.
+
+    With an image sequence it is decided per shot (shot_sequence.looks_mislabelled):
+    three close-ups on a sequence of three close-ups are not mislabelled.
     """
+    if report.sequence_source is not None:
+        return report.mislabelled
     expected = len(_cfg(pol).get("all_views") or []) or 5
     return report.row_count >= expected and len(report.present) == 1
 
@@ -398,16 +458,36 @@ def generation_plan(
             ),
         )
 
-    views = list(report.missing)
+    # With an image sequence, `views` is only what the VIEW generator can make
+    # safely (generator_views) and `shots` is every missing instance — the
+    # sequence render's list (vnyx-api backfill-imagery.ts --sequence).
+    shots: list[str] = list(report.missing_shots)
+    sp = sequence_plan(p, pol) if report.sequence_source is not None else None
+    if sp is not None:
+        safe = set(generator_views(sp, set(report.present)))
+        views = [v for v in report.missing if v in safe]
+    else:
+        views = list(report.missing)
     if include_advisory:
         views += [v for v in report.advisory_missing if v not in views]
 
     if not views and not matte:
+        if shots:
+            return GenerationPlan(
+                should_generate=False,
+                shots=shots,
+                reason=(
+                    f"missing {', '.join(shots)} from {report.sequence_source} — "
+                    "the sequence render (backfill-imagery.ts --sequence) makes them"
+                ),
+            )
         return GenerationPlan(
             should_generate=False,
             reason=(
-                f"every required view is present ({', '.join(report.present) or 'none required'}) "
-                "and every garment original already has a cut-out"
+                (f"every render {report.sequence_source} asks for is present "
+                 f"({len(report.expected_shots)})" if report.sequence_source else
+                 f"every required view is present ({', '.join(report.present) or 'none required'})")
+                + " and every garment original already has a cut-out"
             ),
         )
 
@@ -419,19 +499,23 @@ def generation_plan(
         return GenerationPlan(
             should_generate=True,
             views=[],
+            shots=shots,
             matte_first=matte,
             reason=(
                 f"every required view is present, but {len(matte)} garment "
                 f"original(s) still need background removal"
+                + (f"; missing {', '.join(shots)} from {report.sequence_source}" if shots else "")
             ),
         )
 
     return GenerationPlan(
         should_generate=True,
         views=views,
+        shots=shots,
         matte_first=matte,
         reason=(
             f"missing {', '.join(views)}"
+            + (f" (of {', '.join(shots)} from {report.sequence_source})" if shots else "")
             + (f"; {len(matte)} original(s) need matting first" if matte else "")
         ),
     )
@@ -508,7 +592,18 @@ def gallery_label(m: MediaAsset) -> str:
 
 
 def gallery_order(p: ProductSnapshot, pol: dict[str, Any] | None) -> list[MediaAsset]:
-    """The live images in the catalog order."""
+    """The live images in the catalog order.
+
+    With an image sequence it is THAT order (3 Oct 2026): vnyx-api's
+    rebuildMediaCache applies the tenant's / category's sequence — originals,
+    renders and labels where it puts them, a disabled slot's images left out —
+    so comparing the cache with the fixed order below called every such gallery
+    out of order, and the rebuild the `order` step ran wrote the same order back.
+    """
+    resolved = sequence_of(p, pol)
+    if resolved is not None:
+        origins = [str(o).upper() for o in (gallery_config(pol).get("origin_order") or [])] or None
+        return shot_sequence.display_order(live_media(p), resolved.lines, origins)
     return sorted(live_media(p), key=lambda m: gallery_key(m, pol))
 
 
@@ -633,7 +728,24 @@ def check_imagery(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
                 detail={"missing": report.missing, "present": report.present},
             ))
 
-        if report.advisory_missing and report.row_count > 0:
+        if report.sequence_source is not None:
+            # By the image sequence: every instance it asks for that is not on
+            # the product (beyond a required view IMG.002 already names).
+            beyond = [s for s in report.missing_shots
+                      if shot_sequence.SHOT_CATALOG[s.split("#")[0]][0] not in report.missing]
+            if beyond and report.row_count > 0:
+                out.append(Finding(
+                    rule_id="IMG.005", severity=Severity.LOW, fields=["images"],
+                    message=(
+                        f"{', '.join(beyond)} not generated — {report.sequence_source} asks "
+                        f"for {len(report.expected_shots)} render(s) "
+                        f"({', '.join(report.expected_shots)})."
+                    ),
+                    detail={"missing_shots": beyond, "expected_shots": report.expected_shots,
+                            "sequence": report.sequence_source,
+                            "advisory_missing": report.advisory_missing},
+                ))
+        elif report.advisory_missing and report.row_count > 0:
             out.append(Finding(
                 rule_id="IMG.005", severity=Severity.LOW, fields=["images"],
                 message=(

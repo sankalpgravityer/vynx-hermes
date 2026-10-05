@@ -309,7 +309,11 @@ def test_the_shipped_default_re_cuts_a_leftover_with_the_fine_tuned_chain():
     fine-tuned parser, which was trained on podiums and stands, so a leftover is
     re-cut with the DEFAULT chain (None) rather than left alone ([])."""
     assert cutout.config(None)["leftover_strategies"] == []
-    assert cutout.config(None)["strategies"][0] == "cloth-seg-ft"
+    # hanger-isnet is listed first but only runs for a photo hung on the wall
+    # (cutout.hanger_route); a podium photo starts at the fine-tuned parser.
+    shipped = cutout.config(None)["strategies"]
+    assert shipped[0] == cutout.HANGER
+    assert [s for s in shipped if s != cutout.HANGER][0] == "cloth-seg-ft"
     assert cutout.rematte_strategies("stand visible at bottom") is None
 
 
@@ -363,6 +367,7 @@ def providers(monkeypatch):
         "gemini-mask": (None, "stubbed"),
         "openai-mask": (None, "stubbed"),
         "gemini-paint": (None, "stubbed"),
+        "openai-paint": (None, "stubbed"),
     }
 
     def fake_cloth(data):
@@ -374,18 +379,28 @@ def providers(monkeypatch):
         calls.append(name)
         return answers[name]
 
-    def fake_openai(data, timeout_s, prompt):
-        calls.append("openai-mask")
-        return answers["openai-mask"]
+    def fake_openai(data, timeout_s, prompt, transparent=False):
+        name = "openai-paint" if transparent else "openai-mask"
+        calls.append(name)
+        return answers[name]
 
     monkeypatch.setattr(cutout, "_cloth_seg", fake_cloth)
     monkeypatch.setattr(cutout, "_gemini", fake_gemini)
     monkeypatch.setattr(cutout, "_openai", fake_openai)
+    # NOT THIS MACHINE'S MODELS. A .env naming the fine-tuned parsers (as a dev
+    # box running the agent does) would otherwise put the real ONNX files in the
+    # chain; tests that want them set the paths themselves.
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", "")
+    monkeypatch.setattr(cutout, "_CLOTH_FT_BACKUP_PATH", "")
     # The mask strategies return a SILHOUETTE; _apply_mask is what turns one
     # into a cut-out of the original bytes. Stubbed so a test can hand back a
     # finished cut-out and still exercise the chain around it.
     monkeypatch.setattr(cutout, "_apply_mask", lambda src, mask: (mask, None))
     monkeypatch.setattr(cutout, "_is_cutout", lambda data: (True, "transparent (stub)"))
+    # A stubbed paint answer is a synthetic picture, not a cut-out of this
+    # photo: these tests are about the chain's order, and the fidelity check
+    # (`_paint_fidelity`) has its own in tests/test_hanger_cutout.py.
+    monkeypatch.setattr(cutout, "_paint_fidelity", lambda source, out: (1.0, 1.0))
     return {"calls": calls, "answers": answers}
 
 
@@ -515,6 +530,9 @@ def test_every_strategy_is_handed_the_upright_photograph(monkeypatch):
         return None, "stubbed"
 
     monkeypatch.setattr(cutout, "_cloth_seg", fake_cloth)
+    # The stock chain, whatever this machine's .env names (see `providers`).
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", "")
+    monkeypatch.setattr(cutout, "_CLOTH_FT_BACKUP_PATH", "")
     cutout.remove_background(sideways_jpeg(6), timeout_s=1)
     assert seen == [(300, 400)]
 
@@ -537,15 +555,31 @@ def test_without_the_model_files_the_policy_chain_is_the_free_stock_parser(provi
 
 
 def test_with_the_model_files_the_policy_chain_is_v2_v1_then_gemini(providers, monkeypatch, tmp_path):
-    """What auto-approval's matte uses once the models are installed."""
+    """What auto-approval's matte uses once the models are installed (30 Sep
+    2026): v2, v1, then Gemini's background removal."""
     model = tmp_path / "cloth_seg_ft_v2.onnx"
     model.write_bytes(b"x")
     monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", str(model))
     _two_parsers(monkeypatch, providers["calls"], cutout_png("one"), cutout_png("broken"))
-    providers["answers"]["gemini-mask"] = (cutout_png("none"), None)
+    providers["answers"]["gemini-paint"] = (cutout_png("none"), None)
     out, err, provider = cutout.remove_background(lit_sweep(), timeout_s=1)
-    assert provider == "gemini-mask" and out is not None, err
-    assert providers["calls"][:3] == ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-mask"]
+    assert provider == "gemini-paint" and out is not None, err
+    assert providers["calls"][:3] == ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint"]
+
+
+def test_when_gemini_cannot_openai_removes_the_background(providers, monkeypatch, tmp_path):
+    """The fourth method: gpt-image, asked for a transparent background."""
+    model = tmp_path / "cloth_seg_ft_v2.onnx"
+    model.write_bytes(b"x")
+    monkeypatch.setattr(cutout, "_CLOTH_FT_PATH", str(model))
+    _two_parsers(monkeypatch, providers["calls"], cutout_png("one"), cutout_png("broken"))
+    providers["answers"]["openai-paint"] = (cutout_png("none"), None)
+    out, err, provider = cutout.remove_background(lit_sweep(), timeout_s=1)
+    assert provider == "openai-paint" and out is not None, err
+    # Gemini once (it answers nothing; `paid_attempts: 1` since 1 Oct 2026 — not
+    # asked again about the same photo), then gpt-image; no mask strategy at all.
+    assert providers["calls"] == ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint",
+                                  "openai-paint"]
 
 
 def test_the_fine_tuned_parser_goes_first_and_its_cut_out_is_used(providers, monkeypatch):
@@ -764,14 +798,32 @@ def test_a_mild_zoom_does_not_let_a_real_loss_through():
     assert ok is False and "KEPT" in why, why
 
 
+def _veto_on(monkeypatch):
+    """The keep-better veto is OFF by default since 30 Sep 2026
+    (`imagery.cutout.keep_better_veto`); these tests pin it for when it is on."""
+    real = cutout.config
+    monkeypatch.setattr(cutout, "config", lambda *a, **k: {**real(*a, **k), "keep_better_veto": True})
+
+
+def test_by_default_the_cut_out_on_file_does_not_veto_a_new_one(providers):
+    """30 Sep 2026: a new cut-out is judged on its own checks; the one on file
+    is only the last resort (the endpoint crops and centres it)."""
+    providers["answers"]["cloth-seg"] = (cutout_png("none"), None)
+    out, err, provider = cutout.remove_background(
+        lit_sweep(), timeout_s=1, previous=composited(), strategies=["cloth-seg"])
+    assert out is not None and provider == "cloth-seg", err
+
+
 def test_when_both_fine_tuned_cut_outs_lose_only_to_the_one_on_file_gemini_is_not_asked(
         providers, monkeypatch):
     """BOA-006356: after v2 and v1 each lost to the incumbent on completeness,
     Gemini was asked twice, returned photographs, and the call ran past the
     proxy timeout. The incumbent stands, and nothing is paid for."""
     good = cutout_png("none")
+    _veto_on(monkeypatch)
     _two_parsers(monkeypatch, providers["calls"], good, good)
-    monkeypatch.setattr(cutout, "garment_kept", lambda prev, out, cfg=None: (False, "33% less garment"))
+    monkeypatch.setattr(cutout, "garment_kept",
+                        lambda prev, out, cfg=None, **kw: (False, "33% less garment"))
     out, err, provider = cutout.remove_background(
         lit_sweep(), timeout_s=1, strategies=CHAIN, previous=cutout_png("none"))
     assert out is None and provider == cutout.KEPT_EXISTING
@@ -843,13 +895,14 @@ def test_a_candidate_whose_garment_cannot_be_derived_does_not_get_to_replace_one
     assert ok is False and "KEPT" in why
 
 
-def test_the_chain_refuses_to_replace_and_says_the_original_was_kept(providers):
+def test_the_chain_refuses_to_replace_and_says_the_original_was_kept(providers, monkeypatch):
     """§2.1: the refusal is a precondition, and it reads as one.
 
     Not `provider: none` — nothing failed. The caller must be able to tell "no
     cut-out could be made" from "the one on file is better", because only the
     first is worth queueing the product for again.
     """
+    _veto_on(monkeypatch)
     providers["answers"]["cloth-seg"] = (transparent("back"), None)
     out, err, provider = cutout.remove_background(
         lit_sweep(), timeout_s=1, previous=composited())
@@ -876,9 +929,10 @@ def test_the_endpoint_carries_the_strategies_and_the_previous_cut_out(monkeypatc
 
     seen: dict[str, Any] = {}
 
-    def fake_remove(data, timeout_s=180.0, *, strategies=None, skip=None, previous=None):
-        seen.update({"strategies": strategies, "skip": skip,
-                     "previous": previous, "timeout": timeout_s})
+    def fake_remove(data, timeout_s=180.0, *, strategies=None, skip=None, previous=None,
+                    garment=None, report=None, origin=None):
+        seen.update({"strategies": strategies, "skip": skip, "previous": previous,
+                     "timeout": timeout_s, "garment": garment, "origin": origin})
         return None, "the existing cut-out was KEPT: nothing was as complete", cutout.KEPT_EXISTING
 
     monkeypatch.setattr(cutout, "remove_background", fake_remove)
@@ -888,6 +942,13 @@ def test_the_endpoint_carries_the_strategies_and_the_previous_cut_out(monkeypatc
         "strategies": ["gemini-mask", "openai-mask"],
         "skip": [],
         "timeout_s": 5,
+        # Framing off: this pins the kept-existing contract itself. With it on,
+        # the cut-out on file comes back cropped and centred instead
+        # (tests/test_framing.py).
+        "frame": False,
+        # What the garment is, and where the photo came from.
+        "garment": "Bottoms Shorts",
+        "origin": "WEB",
     }
     resp = TestClient(app).post("/v1/imagery/remove-background", json=body)
     assert resp.status_code == 200
@@ -898,6 +959,7 @@ def test_the_endpoint_carries_the_strategies_and_the_previous_cut_out(monkeypatc
     assert payload["provider"] == cutout.KEPT_EXISTING
     assert seen["strategies"] == ["gemini-mask", "openai-mask"]
     assert seen["previous"] == composited()
+    assert seen["garment"] == "Bottoms Shorts" and seen["origin"] == "WEB"
 
 
 def test_the_endpoint_still_answers_without_any_of_the_new_fields(monkeypatch):

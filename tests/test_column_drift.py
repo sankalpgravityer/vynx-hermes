@@ -654,6 +654,8 @@ def test_the_title_names_the_subcategory():
     assert plan == [{
         "kind": "set_column", "field": "subCategory", "value": "Sweatshirts",
         "reason": "DATA.010", "detail": plan[0]["detail"],
+        # Marked as title evidence, so the photographs can overrule its TYPE.
+        "source": "title",
     }]
 
 

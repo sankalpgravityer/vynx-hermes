@@ -296,6 +296,8 @@ def to_snapshot(
                 height=int(m["height"]) if m.get("height") else None,
                 derived_from_id=_str(_first(m, "derivedFromId", "derived_from_id")),
                 border=m.get("border") if isinstance(m.get("border"), dict) else None,
+                # Which shot of the image sequence a render is (3 Oct 2026).
+                shot_key=_str(_first(m, "shotKey", "shot_key")),
             )
             for m in (raw.get("media") or raw.get("productMedia") or [])
             if isinstance(m, dict) and _first(m, "url")
@@ -320,6 +322,12 @@ def to_snapshot(
             ImagerySettings.model_validate(imagery_settings)
             if imagery_settings else None
         ),
+        # The product's image sequence, resolved by whoever loaded it — vnyx-api
+        # on the imagery endpoints, product_audit on the chain. Absent: the
+        # imagery rules count against their fixed views, as before.
+        shot_sequence=(_first(raw, "shotSequence", "shot_sequence")
+                       if isinstance(_first(raw, "shotSequence", "shot_sequence"), dict)
+                       else None),
 
         confidence=confidence,
         provenance=provenance,

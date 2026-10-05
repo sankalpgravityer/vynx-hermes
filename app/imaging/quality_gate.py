@@ -296,6 +296,34 @@ def garment_family(text: Any, pol: dict[str, Any] | None) -> str | None:
     return hits.pop() if len(hits) == 1 else None
 
 
+def garment_type(text: Any, pol: dict[str, Any] | None) -> str | None:
+    """The garment TYPE within its family (policy `garment_types`) — shorts,
+    skirts, dungarees, full_length — for a garment word or a category /
+    subcategory name. Category and subcategory decisions only.
+
+    The family is resolved first (garment_family) and a type only counts inside
+    its own family, so "short sleeve shirt" — two families — is no type at all.
+    Types are tried in policy order and the first hit wins, so "jean shorts" and
+    "cargo shorts" are shorts. None when nothing matches: this decides nothing
+    on a guess.
+    """
+    if not text:
+        return None
+    family = garment_family(text, pol)
+    if family is None:
+        return None
+    words = {w.rstrip("s") for w in re.findall(r"[a-z\-]+", str(text).lower())}
+    words |= {w.replace("-", "") for w in words}
+    for entry in ((pol or {}).get("garment_types") or []):
+        if str(entry.get("family") or "") != family:
+            continue
+        for tok in entry.get("words") or []:
+            t = str(tok).lower().rstrip("s")
+            if t in words or t.replace("-", "") in words:
+                return str(entry.get("type") or "") or None
+    return None
+
+
 def _adjacent(a: str, b: str, pol: dict[str, Any] | None) -> bool:
     pairs = ((pol or {}).get("garment_families") or {}).get("adjacent") or []
     return any({a, b} == {str(x) for x in pair} for pair in pairs if len(pair) == 2)
@@ -547,6 +575,20 @@ def decide(raw: dict[str, Any], *, product_gender: str | None,
             return verdict("review", "CATEGORY_IMAGE_MISMATCH",
                            [f"the render shows {garment} ({fam_seen}) but the "
                             f"product is filed under '{filed_under}' ({fam_filed})"])
+        # …AND THE TYPE WITHIN THE FAMILY (1 Oct 2026). Shorts, jeans and
+        # trousers are all `bottoms`, so the family test passed three Levi's
+        # shorts filed as Jeans / Trousers while this very read said "shorts".
+        # Same `review` outcome: the record is what is wrong, not the render.
+        if fam_seen and fam_seen == fam_filed:
+            type_seen = garment_type(garment, pol)
+            type_filed = garment_type(filed_under, pol)
+            sure = confidence is None or confidence >= float(
+                cfg.get("type_min_confidence") or 0.6)
+            if type_seen and type_filed and type_seen != type_filed and sure:
+                return verdict("review", "CATEGORY_IMAGE_MISMATCH",
+                               [f"the render shows {garment} ({type_seen.replace('_', ' ')}) "
+                                f"but the product is filed under '{filed_under}' "
+                                f"({type_filed.replace('_', ' ')})"])
 
     if raw.get("lead_ok") is False:
         soft.append("BAD LEAD — not a usable primary image")

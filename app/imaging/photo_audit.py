@@ -431,6 +431,25 @@ _BODY_SAID_RE = re.compile(
     r"missing|dissolv\w*|melt\w*|smear\w*|deformed|distorted)\b")
 
 
+_CLIP_RE = re.compile(r"\b(?:hangers?\s+)?(?:clips?|pegs?)\b")
+
+
+def _only_clips(part: str) -> bool:
+    """Does this leftover name the hanger's clips and nothing else? "hanger clips",
+    "metal clips", "pegs" — yes; "hanger and clips", "clip and stand" — no, the
+    hanger or the stand is named in its own right."""
+    low = str(part or "").lower()
+    if not _CLIP_RE.search(low):
+        return False
+    return not _LEFTOVER_RE.search(_CLIP_RE.sub(" ", low))
+
+
+def _without_clip_clauses(issue: str) -> str:
+    """`issue` without the clauses that only complain about the clips."""
+    kept = [c.strip() for c in re.split(r"[;,]", issue) if c.strip() and not _only_clips(c)]
+    return "; ".join(kept)
+
+
 def _without_leftovers(issue: str) -> str:
     """`issue` with the clauses that are about a leftover struck out.
 
@@ -496,6 +515,12 @@ _DEFAULTS: dict[str, Any] = {
         # `readiness.cutouts.hold` is soft, a hold once it is block); `hold` is
         # a person's IMAGE_DEFECT; `soft` records it and nothing follows.
         "cutout_defects": "rematte",
+        # THE HANGER'S CLIPS ARE NOT A LEFTOVER (1 Oct 2026). A garment hung on
+        # the wall is cut with its clips on, by design (imagery.cutout.hanger):
+        # painting them out is what took cloth from the waistband. Counted as a
+        # leftover, every such cut-out would be re-cut on every run and come
+        # back with its clips again. A hanger, a hook or a stand still counts.
+        "clips_are_leftovers": False,
     },
     "model": None,
 }
@@ -847,12 +872,15 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
             # older schema has no `leftovers` key at all and is judged exactly
             # as it was before.
             has_leftovers = is_cutout and isinstance(entry.get("leftovers"), list)
+            clips_ok = is_cutout and not gal_cfg.get("clips_are_leftovers", False)
             clear_left: list[str] = []
             if has_leftovers:
                 for row in entry["leftovers"]:
                     if not isinstance(row, dict):
                         continue
                     part = str(row.get("part") or "").strip()
+                    if clips_ok and _only_clips(part):
+                        continue          # kept on purpose: see `clips_are_leftovers`
                     if part and str(row.get("extent") or "").strip().lower() == "clear" \
                             and part not in clear_left:
                         clear_left.append(part)
@@ -888,6 +916,10 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
             # "hanger visible" is the model contradicting its own answer.
             if has_leftovers and not clear_left and issue:
                 issue = _without_leftovers(issue)
+            elif clips_ok and issue:
+                # "hanger clips visible" in the free text, with or without a
+                # measurement saying so: not a defect either.
+                issue = _without_clip_clauses(issue)
             if not missing and not clear_left and not scene_bad and not body_bad and not frame_bad:
                 if entry.get("ok") is not False:
                     continue
