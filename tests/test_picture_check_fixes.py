@@ -309,11 +309,12 @@ def test_the_shipped_default_re_cuts_a_leftover_with_the_fine_tuned_chain():
     fine-tuned parser, which was trained on podiums and stands, so a leftover is
     re-cut with the DEFAULT chain (None) rather than left alone ([])."""
     assert cutout.config(None)["leftover_strategies"] == []
-    # hanger-isnet is listed first but only runs for a photo hung on the wall
-    # (cutout.hanger_route); a podium photo starts at the fine-tuned parser.
+    # object-isnet and hanger-isnet are listed first but only run on their own route —
+    # a shoe or a bag (cutout.object_route), a photo hung on the wall
+    # (cutout.hanger_route); a podium photo of a garment starts at the fine-tuned parser.
     shipped = cutout.config(None)["strategies"]
-    assert shipped[0] == cutout.HANGER
-    assert [s for s in shipped if s != cutout.HANGER][0] == "cloth-seg-ft"
+    assert shipped[:2] == [cutout.OBJECT, cutout.HANGER]
+    assert [s for s in shipped if s not in (cutout.OBJECT, cutout.HANGER)][0] == "cloth-seg-ft"
     assert cutout.rematte_strategies("stand visible at bottom") is None
 
 
