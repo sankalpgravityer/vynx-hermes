@@ -574,6 +574,10 @@ def _cloth_session_for(model: str) -> Any:
     """A cached rembg cloth session for a model NAME or an .onnx PATH."""
     if model not in _cloth_sessions:
         started = time.perf_counter()
+        # No ONNX Runtime memory arena (app/imaging/ort_memory.py): it kept each session's
+        # peak buffers for good, and the server ran out of memory (6 Oct 2026).
+        from app.imaging.ort_memory import session_options
+
         if model.lower().endswith(".onnx"):
             # rembg loads the graph from whatever `download_models` returns;
             # pointing it at our file keeps every other step — preprocessing,
@@ -585,11 +589,11 @@ def _cloth_session_for(model: str) -> Any:
                 def download_models(cls, *args, **kwargs):
                     return model
 
-            _cloth_sessions[model] = _FromFile("u2net_cloth_seg", None)
+            _cloth_sessions[model] = _FromFile("u2net_cloth_seg", session_options())
         else:
             from rembg import new_session
 
-            _cloth_sessions[model] = new_session(model)
+            _cloth_sessions[model] = new_session(model, sess_opts=session_options())
         log.info("cloth-seg model %s loaded in %.1fs", model, time.perf_counter() - started)
     return _cloth_sessions[model]
 
@@ -1870,13 +1874,89 @@ def _intersect_alpha(mask_png: bytes, cloth_png: bytes) -> tuple[bytes | None, s
 # because a caller may now ask for a SUBSET of them by name (`strategies` /
 # `skip`) and the endpoint has to be able to say which names exist without
 # reaching into the chain below.
-STRATEGY_NAMES = ("hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg", "gemini-mask",
-                  "openai-mask", "gemini-paint", "openai-paint")
+STRATEGY_NAMES = ("object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg",
+                  "gemini-mask", "openai-mask", "gemini-paint", "openai-paint")
 # The strategy for photographs HUNG ON THE WALL (app/imaging/hanger_cutout.py): IS-Net
 # keeps the whole garment, clips included, and only the thin hanger parts are
 # painted out. Runs first, and only when the caller says where the photo came from
 # and policy routes that origin here (`imagery.cutout.hanger.origins`).
 HANGER = "hanger-isnet"
+# The strategy for SHOES AND BAGS (app/imaging/object_cutout.py, 6 Oct 2026): IS-Net cuts
+# the whole product out — a pair of shoes on a table, a bag on a wall hook — where the
+# garment parsers, which have no class for either, return fragments or nothing. Runs
+# first, and only when the product's category names a family policy routes here
+# (`imagery.cutout.object.families`); its cut-outs, and every other strategy's for
+# these products, are judged by object_cutout.checks instead of the garment checks.
+OBJECT = "object-isnet"
+
+
+def object_config(pol: dict[str, Any] | None = None) -> dict[str, Any]:
+    """`imagery.cutout.object` with defaults filled in."""
+    out: dict[str, Any] = {"enabled": True, "families": ["footwear", "bags"], "origins": [],
+                           "model": "isnet-general-use", "then": ["gemini-paint", "openai-paint"],
+                           "min_kept": 0.003, "max_kept": 0.70, "max_edge": 0.002,
+                           "edge_frac": 0.005, "tear_coloured": 0.9}
+    block = (((pol if pol is not None else policy()).get("imagery") or {})
+             .get("cutout") or {}).get("object")
+    if block is False:
+        out["enabled"] = False
+    elif isinstance(block, dict):
+        out.update({k: v for k, v in block.items() if v is not None})
+    return out
+
+
+def object_route(garment: str | None, origin: str | None, ocfg: dict[str, Any]) -> str | None:
+    """The product family ("footwear", "bags") whose cut-out is the object strategy's, or
+    None. Decided by the CATEGORY the caller sends as `garment`; `origins`, when policy
+    names any, limits it to photos from those."""
+    if not ocfg.get("enabled"):
+        return None
+    origins = {str(o).upper() for o in ocfg.get("origins") or []}
+    if origins and str(origin or "").upper() not in origins:
+        return None
+    from app.imaging import object_cutout
+
+    return object_cutout.family_of(garment, [str(f) for f in ocfg.get("families") or []])
+
+
+# What the paid strategies are told the product is, for a shoe or a bag: their prompts
+# were written for garments ("isolate ONLY the garment"), and a hand holding the boots or
+# the hook a bag hangs from is exactly what they must be told is not the product.
+_PRODUCT_NOUN = {"footwear": "footwear: the shoes (a pair, or a single shoe)", "bags": "a bag"}
+
+
+def _product_prompt(prompt: str, family: str | None) -> str:
+    if not family:
+        return prompt
+    head = (f"The product in this photograph is {_PRODUCT_NOUN.get(family, 'the item for sale')}. "
+            "Keep the WHOLE product — laces, straps, handles, buckles and any tag attached to it — "
+            "and nothing else: the hook or hanger it hangs from, the table or stand it rests on and "
+            "any hand or person holding it are NOT part of it.\n\n")
+    return head + re.sub(r"\bgarment\b", "product", prompt)
+
+
+def _object_isnet(data: bytes, ocfg: dict[str, Any]) -> tuple[bytes | None, str | None]:
+    """The shoe / bag cut-out (object_cutout.cutout). Never raises."""
+    from PIL import Image
+    import numpy as np
+
+    try:
+        from app.imaging import object_cutout as oc
+
+        rgb = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+        alpha, rep = oc.cutout(rgb, oc.Config(model=str(ocfg.get("model") or "isnet-general-use")))
+    except Exception as exc:  # noqa: BLE001 — the next strategy runs
+        return None, f"object cut-out failed ({exc.__class__.__name__}: {exc})"
+    if rep.notes:
+        return None, "; ".join(rep.notes)
+    log.info("bg-removal %s: %d piece(s), %d wire(s), %d edge strip(s), %d speck(s) removed, "
+             "crop pass missed %.2f%% (kept), %.1fs", OBJECT, rep.pieces, rep.wire_lines_removed,
+             rep.edge_strands_removed, rep.specks_removed, 100 * rep.crop_missed, rep.seconds)
+    rgba = np.dstack([rgb, (np.clip(alpha, 0, 1) * 255).round().astype(np.uint8)])
+    rgba[rgba[..., 3] == 0] = (255, 255, 255, 0)
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    return buf.getvalue(), None
 
 
 def hanger_config(pol: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2139,6 +2219,40 @@ def remove_background(
     report: dict[str, Any] | None = None,
     origin: str | None = None,
 ) -> tuple[bytes | None, str | None, str]:
+    """`_remove_background`, holding one of `max_concurrent` cut-out slots.
+
+    6 Oct 2026: the server ran out of memory and the kernel killed Hermes at 7.7 GB —
+    vnyx-api sends a product's photos at once and each full-size cut-out adds ~0.8 GB
+    (app/imaging/ort_memory.py). The rest wait; one that waits past `max_wait_s` is
+    refused as busy (provider "none"), which vnyx-api reads as this photo not cut this
+    time — never a server killed with every request in it."""
+    from app.imaging import ort_memory
+
+    cfg = config()
+    cap = cfg.get("max_concurrent")
+    cap = 2 if cap is None else int(cap)
+    wait = float(cfg.get("max_wait_s") or 300)
+    try:
+        with ort_memory.slot(cap, wait) as waited:
+            if waited >= 1:
+                log.info("bg-removal: waited %.1fs for one of %d cut-out slots", waited, cap)
+            return _remove_background(data, timeout_s, strategies=strategies, skip=skip,
+                                      previous=previous, garment=garment, report=report,
+                                      origin=origin)
+    except ort_memory.Busy as exc:
+        log.warning("bg-removal refused: Hermes is busy — %s", exc)
+        return None, f"Hermes is busy: {exc}", "none"
+
+
+def _remove_background(
+    data: bytes, timeout_s: float = 180.0, *,
+    strategies: list[str] | None = None,
+    skip: list[str] | None = None,
+    previous: bytes | None = None,
+    garment: str | None = None,
+    report: dict[str, Any] | None = None,
+    origin: str | None = None,
+) -> tuple[bytes | None, str | None, str]:
     """A cut-out, or an honest failure. Returns (png, error, provider).
 
     Never raises. A caller that cannot get a cut-out needs to record that the
@@ -2213,8 +2327,17 @@ def remove_background(
     # them (two vendors, two attempts), and a hung one must not starve the rest.
     paid_t = min(float(timeout_s), float(cfg.get("paid_timeout_s") or 120))
     hcfg = hanger_config()
-    on_hanger = hanger_route(origin, hcfg)
-    if origin:
+    ocfg = object_config()
+    # A SHOE OR A BAG (the category the caller sends as `garment`): the object strategy
+    # first, then the paid ones `object.then` names, and nothing in between — the garment
+    # parsers have no class for either and are never asked. Ahead of the hanger route: a
+    # bag on a wall hook is a WEB photo, but there is no hanger bar to find.
+    family = object_route(garment, origin, ocfg)
+    on_hanger = hanger_route(origin, hcfg) and not family
+    if family:
+        log.info("bg-removal: %r is %s — the object cut-out first, judged by the object checks",
+                 garment, family)
+    elif origin:
         log.info("bg-removal: origin %s — %s", origin,
                  "hung on the wall: IS-Net first" if on_hanger else "garment parser first")
     # The fine-tuned parse, made once: the hanger strategy compares against it and
@@ -2226,7 +2349,13 @@ def remove_background(
             ft_memo["v2"] = _cloth_seg_ft(data)
         return ft_memo["v2"]
 
+    paint_prompt = _product_prompt(PROMPT, family)
+    mask_prompt = _product_prompt(MASK_PROMPT, family)
+    openai_prompt = _product_prompt(OPENAI_PROMPT, family)
     chain = (
+        # A SHOE OR A BAG: IS-Net, the whole product. Dropped from the chain below
+        # unless `family`.
+        (OBJECT, "direct", lambda: _object_isnet(data, ocfg)),
         # A PHOTO HUNG ON THE WALL: IS-Net keeps the whole garment, clips and all,
         # and only the bar, hook and wire are painted out. Dropped from the chain
         # below unless `on_hanger`.
@@ -2249,11 +2378,11 @@ def remove_background(
         # network, no bill and no variance. One attempt, because it is
         # deterministic — a second would return the identical bytes.
         ("cloth-seg", "direct", lambda: _cloth_seg(data)),
-        ("gemini-mask", "mask", lambda: _gemini(data, paid_t, MASK_PROMPT)),
-        ("openai-mask", "mask", lambda: _openai(data, paid_t, MASK_PROMPT)),
-        ("gemini-paint", "paint", lambda: _gemini(data, paid_t, PROMPT)),
+        ("gemini-mask", "mask", lambda: _gemini(data, paid_t, mask_prompt)),
+        ("openai-mask", "mask", lambda: _openai(data, paid_t, mask_prompt)),
+        ("gemini-paint", "paint", lambda: _gemini(data, paid_t, paint_prompt)),
         # gpt-image's own background removal, on a transparent background.
-        ("openai-paint", "paint", lambda: _openai(data, paid_t, OPENAI_PROMPT, transparent=True)),
+        ("openai-paint", "paint", lambda: _openai(data, paid_t, openai_prompt, transparent=True)),
     )
 
     # THE POLICY'S CHAIN WHEN THE CALLER NAMES NONE. `strategies` is still the
@@ -2273,7 +2402,8 @@ def remove_background(
         if ft_named and not _ft_available():
             log.warning("bg-removal: the policy names the fine-tuned cloth-seg but no model file is "
                         "configured here (HERMES_CLOTH_SEG_FT_PATH); using the stock cloth-seg alone")
-            strategies = ([HANGER] if HANGER in strategies else []) + ["cloth-seg"]
+            strategies = ([OBJECT] if OBJECT in strategies else []) + \
+                ([HANGER] if HANGER in strategies else []) + ["cloth-seg"]
 
     wanted = {str(s) for s in strategies} if strategies else None
     banned = {str(s) for s in (skip or [])}
@@ -2284,7 +2414,17 @@ def remove_background(
         # the caller asked a different segmenter for.
         return None, f"no background-removal strategy is named {', '.join(unknown)}", "none"
     chain = tuple(s for s in chain if (wanted is None or s[0] in wanted) and s[0] not in banned
-                  and (s[0] != HANGER or on_hanger))
+                  and (s[0] != HANGER or on_hanger) and (s[0] != OBJECT or family))
+    if family:
+        # THE OBJECT CHAIN: the object strategy, then `object.then` in that order —
+        # whatever of them the caller allows. A caller that allowed none of them (an
+        # explicit `strategies` naming only cloth-seg, say) keeps the chain it asked for;
+        # the object checks below still judge it.
+        then = [str(n) for n in ocfg.get("then") or []]
+        mine = [s for s in chain if s[0] == OBJECT] + \
+            sorted((s for s in chain if s[0] in then), key=lambda s: then.index(s[0]))
+        if mine:
+            chain = tuple(mine)
     if on_hanger:
         # A HUNG PHOTO IS-NET COULD NOT CUT goes to the paid background removal
         # next (`hanger.then`), and only then to v2 and v1, which keep the bar and
@@ -2302,7 +2442,8 @@ def remove_background(
     # chain but has not been banned: a caller that named the mask strategies
     # wants the podium gone and the garment parser's opinion about what is
     # cloth kept. Computed once, however many mask candidates are tried.
-    intersect = bool(cfg.get("intersect_cloth", True)) and \
+    # Never for a shoe or a bag: cloth-seg's opinion of what is cloth would cut them away.
+    intersect = bool(cfg.get("intersect_cloth", True)) and not family and \
         "cloth-seg" not in {s[0] for s in chain} and "cloth-seg" not in banned
     cloth: dict[str, Any] = {}
     # What the fine-tuned parsers produced this call, and which of those the
@@ -2421,7 +2562,7 @@ def remove_background(
             # edges. Only on the photograph's own pixels and frame, so never on a
             # repainted picture; a refinement that fails or would do harm leaves
             # this candidate as the parser made it.
-            if refine_on and kind in ("direct", "mask") and name != HANGER:
+            if refine_on and not family and kind in ("direct", "mask") and name != HANGER:
                 better, rinfo = _refine.refine(data, out, rcfg)
                 refined[name] = rinfo
                 if better is not None:
@@ -2462,9 +2603,24 @@ def remove_background(
                 attempts.append(f"{label}: background still present ({why})")
                 continue
 
+            # A SHOE OR A BAG IS JUDGED AS AN OBJECT (object_cutout.checks): the
+            # backdrop checks below read grey and white leather on a grey table as
+            # the backdrop, and the tear check the wall seen through a bag's handle
+            # as a tear — 10 of 12 clean shoe cut-outs and 5 of 6 bags refused.
+            if family:
+                from app.imaging import object_cutout
+
+                good, obj_why = object_cutout.checks(data, out, ocfg, cfg)
+                if not good:
+                    log.info("bg-removal %s refused as a %s cut-out in %.1fs: %s",
+                             label, family, took, obj_why)
+                    attempts.append(f"{label}: {obj_why}")
+                    continue
+                why = f"{why}; {obj_why}"
+
             # The border says something was removed; this says whether what
             # remains is only the product. See _kept_backdrop.
-            clean, backdrop_why = _kept_backdrop(data, out, cfg)
+            clean, backdrop_why = (True, "") if family else _kept_backdrop(data, out, cfg)
             if not clean:
                 log.info("bg-removal %s kept part of the set in %.1fs: %s",
                          label, took, backdrop_why)
@@ -2476,7 +2632,7 @@ def remove_background(
             # HOLES TORN IN THE GARMENT (see _torn_garment). Not added to
             # `ft_refused`: two parsers agreeing on a torn outline is no reason
             # to accept it, so this goes on to the next strategy (v1, Gemini).
-            torn, torn_why = _torn_garment(data, out, cfg)
+            torn, torn_why = (False, "") if family else _torn_garment(data, out, cfg)
             if torn:
                 log.info("bg-removal %s tore the garment in %.1fs: %s", label, took, torn_why)
                 attempts.append(f"{label}: {torn_why}")

@@ -110,7 +110,10 @@ class Report:
 class Segmenter:
     def __init__(self, model: str):
         from rembg import new_session
-        self.session = new_session(model)
+        # HERMES: no ONNX Runtime memory arena (app/imaging/ort_memory.py) — it kept every
+        # session's peak buffers for good, and the server ran out of memory.
+        from app.imaging.ort_memory import session_options
+        self.session = new_session(model, sess_opts=session_options())
 
     def _mask(self, rgb):
         from PIL import Image

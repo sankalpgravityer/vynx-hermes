@@ -647,7 +647,11 @@ imagery:
     # 1 Oct 2026 — HUNG ON THE WALL, IS-NET FIRST (`hanger-isnet`, block `hanger`
     # below). Runs only when vnyx-api says the photo's origin is one `hanger.origins`
     # names; the photobooth and decision panel skip it and start at v2.
-    strategies: ["hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    #
+    # 6 Oct 2026 — SHOES AND BAGS, IS-NET AS AN OBJECT (`object-isnet`, block `object`
+    # below). Runs only when the product's category is footwear or a bag, and then the
+    # chain is object-isnet → gemini-paint → openai-paint: v2 and v1 are never asked.
+    strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
     # When both fine-tuned parsers ("cloth-seg-ft" = v2, "cloth-seg-ft-backup"
     # = v1) are refused by the leftover check but their garments agree at
     # least this well, the v2 cut-out is accepted: the check misreads white and
@@ -656,7 +660,53 @@ imagery:
     # The chain POST /v1/imagery/cutout (image URL in, PNG out) uses. Separate
     # from `strategies`, so it changes nothing for vnyx-api's calls. The two
     # paid ones (each tried twice) run only when v2 and v1 are both refused.
-    url_strategies: ["hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    url_strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    # SHOES AND BAGS (6 Oct 2026; app/imaging/object_cutout.py, the `object-isnet`
+    # strategy). v2 and v1 are CLOTHING parsers with no class for a shoe or a bag: on 18
+    # shoe and bag photos (BOAS, Klekt) they found "no garment" or kept fragments of 11 of
+    # 12 shoes, and passed two bags with half a handle cut off. SegFormer's clothes parser
+    # (which has shoe and bag labels) is a HUMAN parser and shredded every shoe with no
+    # person in the frame. IS-Net — the hanger strategy's model, already on the server —
+    # cuts the whole product: both shoes, laces and straps, the table gone. Full frame to
+    # find it, a crop pass for resolution (it only adds), the wall wire, far specks and
+    # straight strips running to the frame's edge (a table's lit edge) dropped.
+    #
+    # `families`: what the category (vnyx-api's `garment`, "Category Subcategory") must
+    # name, as whole words — "footwear" (shoes, trainers, boots, heels ...) and "bags"
+    # (bags, backpacks, totes, purses, clutches, wallets). Not "boot" in BOOTCUT.
+    # `origins`: [] = photos of every origin; name some to limit it.
+    # `then`: the paid strategies after it, in order. v2 and v1 are not in this chain.
+    #
+    # THE OBJECT CHECKS replace the garment checks for these products, for every
+    # strategy's cut-out: the backdrop checks read grey and white leather on the grey
+    # table as "the backdrop colour" (10 of 12 clean shoe cut-outs refused) and the tear
+    # check read the wall seen through a bag's handle as a tear (5 of 6 bags). Instead:
+    # `min_kept` / `max_kept` of the frame (an empty cut-out passed every garment check);
+    # nothing within `edge_frac` of the frame's edge beyond `max_edge` of that band (a
+    # table top, the wall, a person's arm — KLE-002830, boots held up by a person); and
+    # each gap in the product read as a whole — a tear when at least `tear_coloured` of
+    # it is the product's colour in the photo, an opening (a handle, a heel's arch, the
+    # space between two shoes) otherwise. 0.9: at 0.5, shaded table beside a dark sole
+    # (0.53-0.89) refused 7 of 70 clean held-out cut-outs. `object: false` turns it off.
+    object:
+      enabled: true
+      families: ["footwear", "bags"]
+      origins: []
+      model: "isnet-general-use"
+      then: ["gemini-paint", "openai-paint"]
+      min_kept: 0.003
+      max_kept: 0.70
+      edge_frac: 0.005
+      max_edge: 0.002
+      tear_coloured: 0.9
+    # HOW MANY CUT-OUTS RUN AT ONCE (6 Oct 2026; app/imaging/ort_memory.py). The kernel
+    # killed Hermes at 7.7 GB on the 7.8 GB server: vnyx-api sends a product's photos in
+    # parallel, nothing limited them, and each full-size cut-out adds ~0.8 GB. The rest
+    # wait for a slot; one that waits longer than `max_wait_s` is refused as busy (the
+    # photo is not cut this run) — below vnyx-api's own 420 s timeout, so a refusal is
+    # said rather than left to time out. 0 = no cap.
+    max_concurrent: 2
+    max_wait_s: 300
     # PHOTOS HUNG ON THE WALL (1 Oct 2026; app/imaging/hanger_cutout.py, the
     # `hanger-isnet` strategy). IS-Net finds the whole garment, clips included;
     # only THIN parts at the top — the bar, the hook, the wall wire — are masked,
