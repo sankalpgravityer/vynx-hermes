@@ -253,12 +253,15 @@ def _paid(monkeypatch, calls, gemini=(None, "no image"), openai=(None, "no image
     monkeypatch.setattr(cutout, "_openai", lambda *a, **k: (calls.append("openai"), openai)[1])
 
 
+REFUSED = "needs review: hanger mask covers a lot of garment"
+
+
 def test_a_hung_photo_isnet_cannot_cut_goes_to_gemini_once_before_v2(chain, monkeypatch):
-    """No bar found (or any refusal): Gemini, once, and only then v2, which keeps the
-    bar and clips on these photos."""
+    """A bar was found but IS-Net's cut was refused: Gemini, once, and only then v2,
+    which keeps the bar and clips on these photos."""
     calls = chain["calls"]
     monkeypatch.setattr(cutout, "_hanger_isnet",
-                        lambda data, hcfg, **kw: (calls.append("hanger"), (None, "no hanger bar found"))[1])
+                        lambda data, hcfg, **kw: (calls.append("hanger"), (None, REFUSED))[1])
     _paid(monkeypatch, calls)
     out, err, provider = cutout.remove_background(
         chain["raw"], strategies=[cutout.HANGER, "cloth-seg-ft", "gemini-paint", "openai-paint"],
@@ -271,13 +274,39 @@ def test_gpt_image_comes_after_the_parsers_on_the_hanger_route(chain, monkeypatc
     """It redrew every hung garment it was given (12 of 12, 1 Oct 2026)."""
     calls = chain["calls"]
     monkeypatch.setattr(cutout, "_hanger_isnet",
-                        lambda data, hcfg, **kw: (calls.append("hanger"), (None, "no hanger bar found"))[1])
+                        lambda data, hcfg, **kw: (calls.append("hanger"), (None, REFUSED))[1])
     monkeypatch.setattr(cutout, "_cloth_seg_ft", lambda data: (calls.append("v2"), (None, "x"))[1])
     _paid(monkeypatch, calls)
     cutout.remove_background(
         chain["raw"], strategies=[cutout.HANGER, "cloth-seg-ft", "gemini-paint", "openai-paint"],
         origin="WEB")
     assert calls == ["hanger", "gemini", "v2", "openai"], calls
+
+
+def test_no_hanger_bar_sends_the_parsers_before_any_paid_method(chain, monkeypatch):
+    """MID-000442 / MID-000445 (7 Oct 2026): WEB photos taken in the booth. No bar, so
+    not a hung photo: v2 is asked before Gemini, which kept the whole mannequin stand."""
+    calls = chain["calls"]
+    monkeypatch.setattr(cutout, "_hanger_isnet",
+                        lambda data, hcfg, **kw: (calls.append("hanger"), (None, "no hanger bar found in the photo"))[1])
+    _paid(monkeypatch, calls)
+    out, err, provider = cutout.remove_background(
+        chain["raw"], strategies=[cutout.HANGER, "cloth-seg-ft", "gemini-paint", "openai-paint"],
+        origin="WEB")
+    assert calls == ["hanger", "v2"], calls
+    assert provider == "cloth-seg-ft"
+
+
+def test_no_hanger_bar_keeps_the_paid_methods_in_their_order(chain, monkeypatch):
+    calls = chain["calls"]
+    monkeypatch.setattr(cutout, "_hanger_isnet",
+                        lambda data, hcfg, **kw: (calls.append("hanger"), (None, "no hanger bar found in the photo"))[1])
+    monkeypatch.setattr(cutout, "_cloth_seg_ft", lambda data: (calls.append("v2"), (None, "x"))[1])
+    _paid(monkeypatch, calls)
+    cutout.remove_background(
+        chain["raw"], strategies=[cutout.HANGER, "cloth-seg-ft", "gemini-paint", "openai-paint"],
+        origin="WEB")
+    assert calls == ["hanger", "v2", "gemini", "openai"], calls
 
 
 # --- a painted cut-out must be the photo's own garment ---------------------------------
@@ -370,3 +399,47 @@ def test_the_strategy_refuses_when_the_mask_covers_much_garment(monkeypatch):
     monkeypatch.setattr(hc, "cutout", flagged)
     out, err = cutout._hanger_isnet(_jpeg(raw), HCFG)
     assert out is None and "covers a lot of garment" in err
+
+
+def test_a_painted_answer_is_stored_at_the_photographs_own_resolution(monkeypatch):
+    """7 Oct 2026, "why is my quality degraded": gemini-paint returned the model's ~1 MP
+    render and it was stored as the product's picture (674x899 beside a 3000x4000 photo).
+    Once a paint passes the framing and fidelity checks, its silhouette is applied to the
+    ORIGINAL pixels, like a mask strategy."""
+    raw, g = _textured()                                    # 800x600 photograph
+    src = _jpeg(raw)
+    small = Image.fromarray(np.dstack([raw, np.where(g, 255, 0).astype(np.uint8)]),
+                            "RGBA").resize((300, 400), Image.Resampling.LANCZOS)
+    b = io.BytesIO()
+    small.save(b, "PNG")
+    monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (b.getvalue(), None))
+    monkeypatch.setattr(cutout, "_is_cutout", lambda out: (True, "ok"))
+    monkeypatch.setattr(cutout, "_kept_backdrop", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
+    out, err, provider = cutout.remove_background(src, strategies=["gemini-paint"])
+    assert provider == "gemini-paint" and out is not None, err
+    im = Image.open(io.BytesIO(out))
+    assert im.size == (600, 800)                            # the photo's size, not the model's
+    arr = np.asarray(im.getchannel("A"))
+    assert (arr[300:500, 250:350] == 255).all()
+    rgb_out = np.asarray(im.convert("RGB"))
+    rgb_src = np.asarray(Image.open(io.BytesIO(src)).convert("RGB"))
+    assert (rgb_out[300:500, 250:350] == rgb_src[300:500, 250:350]).all()
+
+
+def test_the_painted_pixels_stay_when_policy_says_so(monkeypatch):
+    raw, g = _textured()
+    src = _jpeg(raw)
+    small = Image.fromarray(np.dstack([raw, np.where(g, 255, 0).astype(np.uint8)]),
+                            "RGBA").resize((300, 400), Image.Resampling.LANCZOS)
+    b = io.BytesIO()
+    small.save(b, "PNG")
+    monkeypatch.setattr(cutout, "config",
+                        lambda pol=None: {**cutout.DEFAULTS, "paint_keep_resolution": False,
+                                          "max_concurrent": 0})
+    monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (b.getvalue(), None))
+    monkeypatch.setattr(cutout, "_is_cutout", lambda out: (True, "ok"))
+    monkeypatch.setattr(cutout, "_kept_backdrop", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
+    out, err, provider = cutout.remove_background(src, strategies=["gemini-paint"])
+    assert out is not None and Image.open(io.BytesIO(out)).size == (300, 400)

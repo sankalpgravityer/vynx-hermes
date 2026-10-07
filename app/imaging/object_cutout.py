@@ -61,6 +61,13 @@ def family_of(garment: str | None, families: list[str] | None = None) -> str | N
 class Config:
     model: str = "isnet-general-use"
     min_piece_share: float = 0.05   # a solid piece this share of the largest is the product
+    # ONE PIECE ONLY (6 Oct 2026): a GARMENT is a single object, where shoes come in
+    # pairs. On MID-000053's FRONT the escalation's whole-product cut kept a corner of
+    # the studio screen as a second piece — dark, so no backdrop check saw it — and a
+    # detached fragment floated beside the tank top on the live listing. The garment
+    # path (cutout._object_isnet with no shoe/bag family) sets this; the shoe route
+    # keeps the pair.
+    single_piece: bool = False
     solid_px: int = 25              # opening that tells a solid piece from a strand (full res)
     crop_pad_frac: float = 0.08     # context round the product for the crop pass
     edge_frac: float = 0.005        # the frame-edge band, as a share of the long side
@@ -90,7 +97,11 @@ def _pieces(a: np.ndarray, cfg: Config) -> tuple[np.ndarray, int]:
     if n <= 1:
         return np.zeros(a.shape, bool), 0
     areas = stats[1:, cv2.CC_STAT_AREA]
-    big = [i + 1 for i, s in enumerate(areas) if s >= cfg.min_piece_share * areas.max()]
+    if cfg.single_piece:
+        # A garment: the largest piece and what hangs off it, nothing else.
+        big = [int(np.argmax(areas)) + 1]
+    else:
+        big = [i + 1 for i, s in enumerate(areas) if s >= cfg.min_piece_share * areas.max()]
     body = np.isin(lbl, big)
     _n2, lbl2 = cv2.connectedComponents(hard, connectivity=8)
     attached = np.unique(lbl2[body])

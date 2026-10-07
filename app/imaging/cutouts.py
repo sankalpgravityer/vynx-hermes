@@ -112,6 +112,10 @@ DEFAULTS: dict[str, Any] = {
     # The cut-out's aspect ratio may differ from the original's by this
     # fraction. A same-ratio downscale passes; a crop to the garment does not.
     "canvas_tolerance": 0.02,
+    # resolution_problem's fallback when the two cannot be lined up (7 Oct 2026):
+    # a canvas under 1/this of the photograph's long side is too small to hold the
+    # garment at its resolution. 0 = no fallback.
+    "resolution_canvas_max": 3.0,
     # A cut-out whose garment touches this many of its four edges (outermost
     # pixel line) was cut to its bounding box — the zoom defect.
     "crop_edges_touched": 4,
@@ -1263,6 +1267,66 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
     return out
 
 
+def resolution_problem(m: dict[str, Any], cutout_dims: tuple[int, int],
+                       original_dims: tuple[int, int],
+                       cfg: dict[str, Any]) -> str | None:
+    """A sentence when the cut-out keeps the garment at a fraction of the
+    photograph's resolution — fixable: a re-cut takes the original's pixels.
+
+    7 Oct 2026, "why is my quality degraded": a 674x899 cut-out sat beside its
+    3000x4000 booth photo — the old providers returned the MODEL'S render size,
+    and nothing ever measured it. The canvas alone cannot be compared (Hermes'
+    standard framing crops the canvas to the garment on purpose), so the
+    GARMENT is: `garment_hole` registers the photograph to the cut-out, and its
+    `registered.scale` is the cut-out's garment over the photograph's on the
+    working grid. The photograph's long side over (scale x the cut-out's long
+    side) is then how many photograph pixels each cut-out pixel stands for —
+    1.0 for Hermes' framed cut-outs whatever their canvas, 3-4.5 for the old
+    render-size ones. No registration was needed (the two line up as they are)
+    means scale 1; registration attempted and FAILED means the two could not be
+    lined up, and nothing is said on a measurement that did not happen."""
+    limit = float(cfg.get("resolution_max") or 0)
+    if limit <= 0 or not original_dims or not all(original_dims) or not all(cutout_dims):
+        return None
+    reg = (m or {}).get("registered") or {}
+    scale = float(reg.get("scale") or 0) or None
+    if scale is None:
+        # No registration happened. Scale 1 is only true when the two COVER THE SAME
+        # FRAME as they are — `aligned`, the geometric overlap at the same
+        # coordinates, which no amount of resampling blur can take hostage the way
+        # the pixel correlation can. A cut-out that does not line up and was not
+        # registered has an unknown garment scale...
+        if (m or {}).get("aligned") is not True:
+            # ...EXCEPT THAT THE CANVAS ALONE CAN ANSWER IT FROM BELOW (7 Oct 2026).
+            # A cut-out whose whole canvas is under 1/`resolution_canvas_max` of the
+            # photograph's long side cannot hold the garment at the photograph's
+            # resolution — that would need a garment under a fifth of the photo's
+            # height. Silence here sent 66 old 896x1195 cut-outs (MID-000438, 473,
+            # 475, 479, ...) to "frame only" on one day: cropped, centred, smaller
+            # still (699x933 against 3000x4000), and the resolution check fired only
+            # after the framing, when nothing re-cut them. Hermes' own full-size
+            # cut-outs sit at 1-2x (the framing crops the canvas); every such old one
+            # at 3.3-6.2x.
+            canvas_max = float(cfg.get("resolution_canvas_max") or 0)
+            if canvas_max <= 0:
+                return None
+            factor = max(original_dims) / max(1.0, float(max(cutout_dims)))
+            if factor <= canvas_max:
+                return None
+            return (f"resolution: the cut-out is {cutout_dims[0]}x{cutout_dims[1]} against the "
+                    f"photograph's {original_dims[0]}x{original_dims[1]} — 1/{factor:.1f} of its size, "
+                    f"too small to hold the garment at the photograph's resolution. Re-cut it at "
+                    f"full size.")
+        scale = 1.0
+    factor = max(original_dims) / max(1.0, scale * max(cutout_dims))
+    if factor <= limit:
+        return None
+    return (f"resolution: the cut-out keeps the garment at 1/{factor:.1f} of the "
+            f"photograph's resolution ({cutout_dims[0]}x{cutout_dims[1]} against "
+            f"{original_dims[0]}x{original_dims[1]}) — the photograph has the pixels. "
+            f"Re-cut it at full size.")
+
+
 def frame_problem(m: dict[str, Any] | None, cfg: dict[str, Any], *,
                   derived: bool) -> tuple[str | None, bool]:
     """A sentence when the cut-out is not the photograph's FRAMING, and whether
@@ -1533,6 +1597,19 @@ class CutoutVerdict:
         return self.action == "bad" and self.hold == "block"
 
     @property
+    def frame_only_views(self) -> list[str]:
+        """The bad views whose EVERY problem is the framing standard (`standard_problem`:
+        not cropped and centred) — the cut-out itself is right, so the cut-out on file is
+        cropped and centred again instead of being segmented again (6 Oct 2026: on a
+        Midtex part-1 run that re-cut was most of a 120-200 s matte step, per product)."""
+        out = []
+        for view in self.bad_views:
+            rows = [c for c in self.checks if str(c.get("view") or "?") == view and c.get("problems")]
+            if rows and all(c.get("frame_only") and len(c["problems"]) == 1 for c in rows):
+                out.append(view)
+        return out
+
+    @property
     def soft(self) -> list[str]:
         return list(self.reasons) if self.action == "bad" and self.hold != "block" else []
 
@@ -1698,6 +1775,15 @@ def judge(p: Any, pol: dict[str, Any] | None, *,
                         check["problems"].append(why)
                     elif why:
                         check["flaws"].append(why.replace("{view}", view))
+                # THE PHOTOGRAPH'S RESOLUTION IS THE CUT-OUT'S TO KEEP (7 Oct
+                # 2026, resolution_problem): the old providers wrote the model's
+                # render size and nothing measured it. Fixable — the re-cut takes
+                # the original's pixels.
+                if original_dims:
+                    why = resolution_problem(measured_garment, (cut.width, cut.height),
+                                             original_dims, cfg)
+                    if why and why not in check["problems"]:
+                        check["problems"].append(why)
         elif raw is not None and gc_on:
             check["garment_note"] = "photograph could not be downloaded — garment not compared"
 
@@ -1707,6 +1793,9 @@ def judge(p: Any, pol: dict[str, Any] | None, *,
             why = standard_problem(border.get("box"), check.get("garment"), cfg["framing"])
             if why:
                 check["problems"].append(why)
+                # Nothing else is wrong with this cut-out: cropping and centring
+                # the one on file fixes it (CutoutVerdict.frame_only_views).
+                check["frame_only"] = True
 
         checks.append(check)
 

@@ -438,15 +438,16 @@ def test_a_broken_face_re_renders_only_the_lead(wired):
 
 
 def test_refused_every_round_holds_with_the_last_verdict_and_stops_at_the_budget(wired):
-    """regen_rounds: 3 (29 Sep 2026). Refused on every look: three paid
-    re-renders, then the product holds — never a fourth."""
+    """regen_rounds (3 from 29 Sep, 10 from 7 Oct 2026). Refused on every look: that
+    many paid re-renders, then the product holds — never one more."""
+    n = int(POL["readiness"]["regen_rounds"])
     wired["verdicts"][:] = [BUILD_BAD, BUILD_BAD]
     r = _repair(apply=True, approve=True)
-    assert len(wired["calls"]["imagery"]) == 3                # the budget, and not one more
+    assert len(wired["calls"]["imagery"]) == n                # the budget, and not one more
     note = step(r, "regen")["note"]
-    assert "REFUSED AGAIN" in note and "round 3:" in note
-    assert "the budget is spent (3 regenerations)" in note
-    assert [x["round"] for x in r["regeneration"]["rounds"]] == [1, 2, 3]
+    assert "REFUSED AGAIN" in note and f"round {n}:" in note
+    assert f"the budget is spent ({n} regenerations)" in note
+    assert [x["round"] for x in r["regeneration"]["rounds"]] == list(range(1, n + 1))
     assert r["approval"]["outcome"] == "gate_blocked"
     assert r["approval"]["gate_code"] == "BODY_SIZE_MISMATCH"
     assert wired["calls"]["approve"] == [{"apply": False}]
@@ -601,11 +602,12 @@ def test_boa_006400_the_second_look_names_another_render_and_round_2_fixes_it(wi
 
 
 def test_a_render_defect_refused_every_round_holds_under_its_own_code(wired, monkeypatch):
+    n = int(POL["readiness"]["regen_rounds"])
     _photo_sequence(monkeypatch, PHOTO_BAD, PHOTO_BAD)
     r = _repair(apply=True, approve=True)
-    assert len(wired["calls"]["imagery"]) == 3                # the budget, and not one more
+    assert len(wired["calls"]["imagery"]) == n                # the budget, and not one more
     note = step(r, "regen")["note"]
-    assert "photo audit REFUSED AGAIN" in note and "the budget is spent (3 regenerations)" in note
+    assert "photo audit REFUSED AGAIN" in note and f"the budget is spent ({n} regenerations)" in note
     assert r["approval"]["outcome"] == "gate_blocked" and r["approval"]["gate_code"] == "RENDER_DEFECT"
     assert wired["calls"]["approve"] == [{"apply": False}]
     assert classify(r).outcome == "RENDER_DEFECT"

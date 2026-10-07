@@ -516,7 +516,29 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     #
     # Only when the repairs are allowed to write. A shadow pass must not archive
     # a product; it records what it would have done and stops there.
+    #
+    # HELD IN REVIEW, NOT REJECTED (7 Oct 2026, the user's call): the product stays
+    # in the Review tab, HELD_FOR_HUMAN with the reason, for a person to add the
+    # label photograph and run it again. `readiness.no_care_label: reject` restores
+    # the old move to the Rejected tab.
     if rs.apply and not settled and not _has_care_label(product_id):
+        from app import readiness
+        from app.config import policy
+
+        if str(readiness.config(policy()).get("no_care_label") or "hold").lower() != "reject":
+            events.emit(tenant_id, "warn",
+                        f"{row['productSku']} — {_NO_LABEL}, held in Review for a person",
+                        run_id=row["runId"], run_product_id=row["id"],
+                        product_id=product_id)
+            _finish(
+                row,
+                Verdict("HELD_FOR_HUMAN", "NO_CARE_LABEL",
+                        f"{_NO_LABEL} — add the care-label photograph and run it again",
+                        False, False),
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                expect_status=expect_status,
+            )
+            return
         events.emit(tenant_id, "warn",
                     f"{row['productSku']} — {_NO_LABEL}, rejecting",
                     run_id=row["runId"], run_product_id=row["id"],

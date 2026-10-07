@@ -4,6 +4,8 @@ answer, `judge()` against a fake evidence object.
 """
 from __future__ import annotations
 
+import pytest
+
 from app.imaging import photo_audit as pa
 
 POL = {"llm": {"model_fast": "test-model"}, "photo_audit": {}}
@@ -526,6 +528,14 @@ def test_footwear_and_accessories_are_framed_around_the_product_and_exempt():
         assert v.action == "ok" and v.bad_views == []
 
 
+def test_the_shipped_policy_re_renders_a_render_framed_wrongly():
+    """7 Oct 2026: MID-000445's AI_BACK_34 ended mid-shin and, framing being soft, the
+    regen step left it. The user wants it re-rendered."""
+    from app.config import policy as shipped
+
+    assert pa.config(shipped())["gallery"]["framing"] == "defect"
+
+
 def test_framing_can_be_recorded_without_re_rendering_anything():
     soft = {**POL, "photo_audit": {"gallery": {"framing": "soft"}}}
     v = _decide(_raw_framing("lower_leg"), media=MEDIA_FIVE, pol=soft)
@@ -721,3 +731,59 @@ def test_judge_answers_from_the_cache_on_the_same_pictures(monkeypatch, tmp_path
     assert ev.calls == 1
     assert first.code == "GRADE_SUSPECT" and second.action == "ok" and second.cached
     assert pa.summary(second).endswith("(cached)")
+
+
+# 6 Oct 2026: the hanger, its hook and the decision panel's clamp are ACCEPTED on a
+# cut-out (the operator's call, `hangers_are_leftovers: false`); the mannequin form,
+# a stand, a hand and a block of studio still count.
+POL_HANGERS_OK = {**POL, "photo_audit": {"gallery": {"hangers_are_leftovers": False}}}
+
+
+@pytest.mark.parametrize("part", ["hanger", "hook", "hanger hook", "wooden hanger",
+                                  "black hanger fragments", "hanger clips", "clamp"])
+def test_a_hanger_left_on_a_cutout_is_accepted_when_policy_says_so(part):
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": False, "issue": f"{part} visible", "missing_parts": [],
+                        "leftovers": [{"part": part, "extent": "clear"}]}
+    v = _decide(raw, pol=POL_HANGERS_OK)
+    assert v.soft == [] and v.reasons == [] and pa.rematte_views(v, POL_HANGERS_OK) == []
+
+
+@pytest.mark.parametrize("part", ["mannequin", "stand", "podium", "hand", "background",
+                                  "hanger and stand"])
+def test_anything_but_the_hanger_still_counts(part):
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": True, "issue": "", "missing_parts": [],
+                        "leftovers": [{"part": part, "extent": "clear"}]}
+    v = _decide(raw, pol=POL_HANGERS_OK)
+    assert v.bad_cutouts == ["FRONT"], part
+
+
+def test_a_hanger_beside_a_real_complaint_leaves_the_complaint():
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": False, "issue": "hook at collar; collar cut away",
+                        "missing_parts": [], "leftovers": [{"part": "hook", "extent": "clear"}]}
+    assert _decide(raw, pol=POL_HANGERS_OK).soft == ["CUTOUT DEFECT — FRONT cut-out: collar cut away"]
+
+
+def test_the_shipped_policy_accepts_the_hanger_and_names_the_mannequin_below_the_hem():
+    from app.config import policy
+
+    assert pa.config(policy())["gallery"]["hangers_are_leftovers"] is False
+    assert "below the hem" in pa.SYSTEM and "background" in str(pa.SCHEMA)
+
+
+def test_the_mannequins_neck_stub_at_the_collar_is_accepted_but_the_form_is_not():
+    """7 Oct 2026, the operator's call: cutting the form's neck out of the collar opening
+    makes the collar look torn, so the stub is kept — like the hanger. The bust below the
+    hem or beside the garment still counts."""
+    raw = _raw()
+    raw["images"][0] = {"index": 1, "ok": False, "issue": "mannequin neck visible at collar",
+                        "missing_parts": [],
+                        "leftovers": [{"part": "mannequin neck", "extent": "clear"}]}
+    v = _decide(raw, pol=POL_HANGERS_OK)
+    assert v.soft == [] and v.reasons == [] and v.bad_cutouts == []
+    raw["images"][0] = {"index": 1, "ok": True, "issue": "", "missing_parts": [],
+                        "leftovers": [{"part": "mannequin form", "extent": "clear"}]}
+    assert _decide(raw, pol=POL_HANGERS_OK).bad_cutouts == ["FRONT"]
+    assert "neck opening is kept on purpose" in pa.SYSTEM.lower() or "collar opening is kept" in pa.SYSTEM.lower() or "kept on purpose" in pa.SYSTEM
