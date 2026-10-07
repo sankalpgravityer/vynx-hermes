@@ -168,6 +168,7 @@ def test_the_shipped_policy_turns_it_on_for_the_booth():
     cfg = neckline.config()
     assert cfg["enabled"] and cfg["fill_origins"] == ["PHOTOBOOTH"]
     assert cfg["clear_origins"] == ["DECISION"]
+    assert cfg["mannequin_origins"] == ["WEB", "MANUAL"]
 
 
 @pytest.mark.parametrize("origin", ["WEB", "MANUAL", None])
@@ -179,7 +180,53 @@ def test_a_wall_photos_neckline_is_never_cleared(origin):
     png = _png(rgb, cut)
     out, rep = neckline.finish(_jpeg(rgb), png, origin=origin,
                                garment="T-Shirts & Polos Sports T-shirt", cfg=CFG)
-    assert out == png and rep["done"] is None and "not finished" in rep["skip"]
+    assert out == png and rep["done"] is None
+    # WEB and MANUAL look for a mannequin first (7 Oct 2026); there is none here.
+    assert ("no mannequin" in rep["skip"]) if origin else ("not finished" in rep["skip"])
+
+
+# --- WEB photos taken in the booth: the form goes back only when it is there ----
+#
+# MID-000480 (7 Oct 2026): a Midtex WEB photo shot on the booth's mannequin showed the
+# same hollow above the collar as MID-000351's photobooth one. The user's rule: put the
+# mannequin's neck back only when a mannequin appears in the photo.
+
+def test_a_web_photo_on_a_mannequin_gets_the_form_back():
+    rgb, body, hole = booth()
+    out, rep = neckline.finish(_jpeg(rgb), _png(rgb, body), origin="WEB",
+                               garment="T-Shirts & Polos Sports T-shirt", cfg=CFG)
+    assert rep["done"] == "form", rep
+    assert rep["mannequin"]["fill"] >= 0.35 and rep["mannequin"]["columns"] >= 0.25
+    a = np.asarray(Image.open(io.BytesIO(out)).getchannel("A")) >= 128
+    assert a[hole & (np.arange(H)[:, None] > 196)].mean() > 0.97
+    assert not a[60:180, 260:340].any()                        # cut flat at the collar
+
+
+def test_a_web_photo_hung_on_the_wall_is_left_open():
+    """The wall above the collar, and a hanger's thin hook: no neck, nothing put back."""
+    rgb = np.full((H, W, 3), (232, 230, 226), np.uint8)
+    body, hole = tee()
+    rgb[60:200, 297:303] = (90, 90, 95)                        # the hook
+    rgb[hole] = (232, 230, 226)                                # the wall through the opening
+    rgb[body] = TEAL
+    png = _png(rgb, body)
+    out, rep = neckline.finish(_jpeg(rgb), png, origin="WEB",
+                               garment="T-Shirts & Polos Sports T-shirt", cfg=CFG)
+    assert out == png and rep["done"] is None and "no mannequin" in rep["skip"]
+    assert rep["mannequin"]["columns"] < 0.25
+
+
+def test_a_garment_filling_the_frame_cannot_show_a_neck():
+    """OTR-000002: the sweater reaches the top of the photo — no room above the collar."""
+    rgb, body, hole = booth()
+    up = 170
+    rgb = np.roll(rgb, -up, axis=0)
+    body, hole = np.roll(body, -up, axis=0), np.roll(hole, -up, axis=0)
+    png = _png(rgb, body)
+    out, rep = neckline.finish(_jpeg(rgb), png, origin="WEB",
+                               garment="T-Shirts & Polos Sports T-shirt", cfg=CFG)
+    assert out == png and "no mannequin" in rep["skip"]
+    assert "no room" in rep["mannequin"]["note"]
 
 
 def test_the_chain_finishes_the_neck_only_after_the_checks_accept(monkeypatch):

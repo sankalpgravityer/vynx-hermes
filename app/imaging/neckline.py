@@ -49,6 +49,21 @@ DEFAULTS: dict[str, Any] = {
     # clearing cut it ragged and chopped the front collar's tips flat. The user's rule:
     # never tear the cloth to take a hanger out; a hanger piece may stay.
     "clear_origins": ["DECISION"],
+    # PUT BACK ONLY WHEN A MANNEQUIN IS IN THE PHOTO (7 Oct 2026, MID-000480): Midtex
+    # photos filed WEB are often taken in the booth, and their cut-outs showed the same
+    # hollow above the collar as MID-000351's. On these origins the form goes back
+    # into the opening only when `_mannequin_neck` sees the form's neck rising above
+    # the collar; a photo hung on the wall is left as it is. Measured on 11 mannequin
+    # photos and 5 wall photos with a neck: share of the band's centre that is not the
+    # background beside it 0.45-0.87 vs 0.09-0.15; columns solid top to bottom
+    # 0.34-0.48 vs 0.01.
+    "mannequin_origins": ["WEB", "MANUAL"],
+    "mannequin_band": [0.02, 0.12],   # above the tips' line, of the garment's height
+    "mannequin_centre": 0.35,         # half-width of the centre, of the tips' span
+    "mannequin_side": [0.35, 0.75],   # the background beside it, of the tips' span
+    "mannequin_min_fill": 0.35,
+    "mannequin_min_columns": 0.25,
+    "mannequin_noise": 15,            # Lab distance (OpenCV scale) over the background
     "work_px": 1024,
     "min_depth": 0.02,       # of the garment's height
     "max_depth": 0.22,
@@ -170,6 +185,57 @@ def _enclosed(barrier_full: Any, line: tuple[float, float, float, float], seed: 
     return out
 
 
+def _mannequin_neck(lab: Any, alpha: Any, line: tuple[float, float, float, float], gh: float,
+                    cfg: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Does the form's NECK rise above the collar? (seen, the measurements)
+
+    In a band above the collar tips' line (`mannequin_band` of the garment's height),
+    the centre between the tips (`mannequin_centre` of their span either side of the
+    middle) is compared with the background beside it at the same height
+    (`mannequin_side`). A mannequin's neck is a solid column there; a photo hung on
+    the wall shows the wall and a hanger's thin hook. Seen when at least
+    `mannequin_min_fill` of the centre differs from the background (median over the
+    band's rows) AND at least `mannequin_min_columns` of its columns differ top to
+    bottom (a hanger's crossbar fills a few rows, never whole columns).
+
+    Nothing is seen when the band or the background beside it falls outside the
+    photograph — a garment filling the frame (OTR-000002) cannot show a neck."""
+    import numpy as np
+
+    H, W = alpha.shape
+    xl, yl, xr, yr = line
+    span = max(1.0, xr - xl)
+    top = min(yl, yr)
+    b0, b1 = (float(v) for v in cfg["mannequin_band"])
+    y0, y1 = int(round(top - b1 * gh)), int(round(top - b0 * gh))
+    s0, s1 = (float(v) for v in cfg["mannequin_side"])
+    left_x0, right_x1 = xl - s1 * span, xr + s1 * span
+    evidence: dict[str, Any] = {}
+    if y0 < 0 or y1 - y0 < 4 or left_x0 < 0 or right_x1 > W:
+        evidence["note"] = "no room above the collar to look for a neck"
+        return False, evidence
+    band = lab[y0:y1]
+    garm = alpha[y0:y1] >= 128
+    xs = np.arange(W)
+    cx = (xl + xr) / 2
+    centre = np.abs(xs - cx) <= float(cfg["mannequin_centre"]) * span
+    side = (((xs >= left_x0) & (xs <= xl - s0 * span))
+            | ((xs >= xr + s0 * span) & (xs <= right_x1)))
+    side_px = band[:, side][~garm[:, side]]
+    if side_px.shape[0] < 50:
+        evidence["note"] = "no background beside the neck"
+        return False, evidence
+    bg = np.median(side_px, axis=0)
+    d = np.sqrt(((band - bg) ** 2).sum(-1))
+    noise = float(np.percentile(np.sqrt(((side_px - bg) ** 2).sum(-1)), 90))
+    fg = (d > max(float(cfg["mannequin_noise"]), 1.2 * noise))[:, centre]
+    fill = float(np.median(fg.mean(axis=1)))
+    columns = float((fg.mean(axis=0) >= 0.8).mean())
+    evidence.update(fill=round(fill, 2), columns=round(columns, 2), noise=round(noise, 1))
+    return (fill >= float(cfg["mannequin_min_fill"])
+            and columns >= float(cfg["mannequin_min_columns"])), evidence
+
+
 def finish(source: bytes, png: bytes, *, origin: str | None, garment: str | None,
            cfg: dict[str, Any] | None = None) -> tuple[bytes, dict[str, Any]]:
     """`png` with its neck opening finished, and what was done. Unchanged on any doubt."""
@@ -183,7 +249,8 @@ def finish(source: bytes, png: bytes, *, origin: str | None, garment: str | None
     if not applies_to(garment):
         return png, {**report, "skip": f"not a top ({garment!r})"}
     origin_u = str(origin or "").upper()
-    if origin_u not in {str(o).upper() for o in (cfg.get("fill_origins") or []) + (cfg.get("clear_origins") or [])}:
+    finishing = (cfg.get("fill_origins") or []) + (cfg.get("clear_origins") or []) + (cfg.get("mannequin_origins") or [])
+    if origin_u not in {str(o).upper() for o in finishing}:
         return png, {**report, "skip": f"not finished on {origin or 'an unknown origin'}"}
     try:
         import cv2
@@ -249,7 +316,13 @@ def finish(source: bytes, png: bytes, *, origin: str | None, garment: str | None
         box = (box[0], box[1], box[2], int(min(H, yd_full + 0.06 * gh_full)))
         seed = (xd_full, int(round((np.interp(xd_full, [xl, xr], [yl, yr]) + yd_full) / 2)))
         thick = max(3, int(2 / k))
-        if origin_u in fill_origins:
+        mannequin_origins = {str(o).upper() for o in cfg.get("mannequin_origins") or []}
+        if origin_u not in fill_origins and origin_u in mannequin_origins:
+            seen, evidence = _mannequin_neck(lab, alpha, (xl, yl, xr, yr), gh_full, cfg)
+            report["mannequin"] = evidence
+            if not seen:
+                return png, {**report, "skip": "no mannequin in the photo — the opening is left as it is"}
+        if origin_u in fill_origins or origin_u in mannequin_origins:
             # THE FORM: the whole opening, from the photograph's own pixels. Below the
             # tips' line and inside the collar is the form by construction — the garment
             # is dressed on it — and its shadowed side is the curtain's very grey

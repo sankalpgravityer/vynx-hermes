@@ -856,10 +856,23 @@ imagery:
     # Only a real neck: a central dip `min_depth`-`max_depth` of the garment's height,
     # `min_width`-`max_width` of its width, both tips standing above it. Never bottoms,
     # shoes or bags. `neckline: false` turns it off.
+    # `mannequin_origins` (7 Oct 2026, MID-000480): Midtex photos filed WEB are often
+    #                 taken in the booth, and their cut-outs showed the same hollow
+    #                 above the collar ("the cloth looks broken"). On these origins the
+    #                 form is put back exactly as on the photobooth, but ONLY when a
+    #                 mannequin is in the photo (the user's rule): its neck must rise
+    #                 above the collar as a solid column against the background beside
+    #                 it — `mannequin_min_fill` of the centre and `mannequin_min_columns`
+    #                 of its columns. 11 mannequin photos: 0.45-0.87 / 0.34-0.48; 5 wall
+    #                 photos with a neck: 0.09-0.15 / 0.01. A garment filling the frame
+    #                 (no room above the collar) is never filled.
     neckline:
       enabled: true
       fill_origins: ["PHOTOBOOTH"]
       clear_origins: ["DECISION"]
+      mannequin_origins: ["WEB", "MANUAL"]
+      mannequin_min_fill: 0.35
+      mannequin_min_columns: 0.25
       min_depth: 0.02
       max_depth: 0.22
       min_width: 0.10
