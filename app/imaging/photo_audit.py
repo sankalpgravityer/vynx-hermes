@@ -149,10 +149,14 @@ SCHEMA: dict[str, Any] = {
                         "description": (
                             "For a GARMENT PHOTOGRAPH with the background removed only: "
                             "each thing in the picture that is NOT the garment — a "
-                            "hanger, a hanger hook, a stand or podium, a mannequin part, "
-                            "a hand, a clip — with how much of it is visible. Empty when "
-                            "there is nothing but garment; always empty for a render or "
-                            "an unprocessed photograph."
+                            "hanger, a hanger hook, a stand or podium, a mannequin part "
+                            "(the white form showing below the hem or beside the "
+                            "garment; the stub of its neck INSIDE the collar opening is "
+                            "kept on purpose and is not one), a hand, a clip, a patch of "
+                            "the studio (wall, floor, a light, backdrop frame) left "
+                            "beside the garment — with how much of it is visible. Empty "
+                            "when there is nothing but garment; always empty for a "
+                            "render or an unprocessed photograph."
                         ),
                         "items": {
                             "type": "object",
@@ -160,7 +164,8 @@ SCHEMA: dict[str, Any] = {
                                 "part": {
                                     "type": "string",
                                     "description": "What it is, in one or two words: 'hanger', "
-                                                   "'hook', 'stand', 'podium', 'hand', 'clip'.",
+                                                   "'hook', 'stand', 'podium', 'mannequin', "
+                                                   "'hand', 'clip', 'background'.",
                                 },
                                 "extent": {
                                     "type": "string",
@@ -170,9 +175,13 @@ SCHEMA: dict[str, Any] = {
                                         "at all. slight = a trace you would have to look for: "
                                         "the tip of a hanger hook above the collar, a sliver "
                                         "at an edge, a shadow that might be one. clear = "
-                                        "plainly and wholly there: a whole hanger in frame, a "
-                                        "podium or stand the garment is standing on, a hand "
-                                        "holding it up. When you are unsure, answer slight."
+                                        "plainly there: a whole hanger in frame, a podium or "
+                                        "stand the garment is standing on, a hand holding it "
+                                        "up, the white mannequin form showing BELOW THE HEM, "
+                                        "a block of the studio (wall, floor, equipment) left "
+                                        "beside the garment — any such piece you can see "
+                                        "without zooming in. When you are unsure, answer "
+                                        "slight."
                                     ),
                                 },
                             },
@@ -356,11 +365,17 @@ SYSTEM = (
     # read. The threshold is set where the real case sits: MID-000521's four
     # cut-outs stand on a podium (§1.1), and nobody would call that slight.
     "Anything left in a cut-out that is not the garment — a hanger, a hanger "
-    "hook, a stand or podium, a mannequin part, a hand, a clip — goes in "
-    "`leftovers` with HOW MUCH of it you can see. The tip of a hanger hook "
-    "showing above the collar, a sliver at an edge, or a shadow you think might "
-    "be one, is `slight`. A WHOLE HANGER in the frame, a podium or stand the "
-    "garment is standing on, or a hand holding the garment up, is `clear`. "
+    "hook, a stand or podium, a mannequin part, a hand, a clip, a patch of the "
+    "studio — goes in `leftovers` with HOW MUCH of it you can see. The tip of a "
+    "hanger hook showing above the collar, a sliver at an edge, or a shadow you "
+    "think might be one, is `slight`. A WHOLE HANGER in the frame, a podium or "
+    "stand the garment is standing on, a hand holding the garment up, the white "
+    "mannequin form showing below the hem, or a block of wall, floor or studio "
+    "equipment left beside the garment, is `clear`. A gap between a sleeve and "
+    "the body, or the neck opening, that shows the plain backdrop is correct and "
+    "is not a leftover. The STUB OF THE MANNEQUIN'S NECK inside the collar "
+    "opening is kept on purpose — cutting it out makes the collar look torn — "
+    "and is NOT a leftover; the form showing anywhere else still is. "
     "ONLY `clear` is a defect. When the most you can see is `slight`, record it "
     "in `leftovers` and do NOT mention it in `issue` — answer ok = true unless "
     "something else is wrong with the picture. When you are unsure how much is "
@@ -432,6 +447,15 @@ _BODY_SAID_RE = re.compile(
 
 
 _CLIP_RE = re.compile(r"\b(?:hangers?\s+)?(?:clips?|pegs?)\b")
+# The hanger itself, its hook and its bar — and the clips (6 Oct 2026, see
+# `hangers_are_leftovers`). Since 7 Oct the mannequin's NECK counts too: the stub
+# inside the collar opening is kept on purpose (the operator's call — cutting it
+# out makes the collar look torn). "mannequin"/"form" alone still counts: that is
+# the bust below the hem.
+_HANGER_RE = re.compile(r"\b(?:(?:wooden|plastic|metal|wire|black|white)\s+)?"
+                        r"(?:hangers?(?:\s+(?:hooks?|bars?|clips?|clamps?|fragments?|pieces?|bits?))?"
+                        r"|hooks?|clips?|pegs?|clamps?"
+                        r"|(?:mannequin'?s?|form'?s?)\s+neck(?:\s+stubs?)?|neck\s+stubs?)\b")
 
 
 def _only_clips(part: str) -> bool:
@@ -444,9 +468,21 @@ def _only_clips(part: str) -> bool:
     return not _LEFTOVER_RE.search(_CLIP_RE.sub(" ", low))
 
 
-def _without_clip_clauses(issue: str) -> str:
-    """`issue` without the clauses that only complain about the clips."""
-    kept = [c.strip() for c in re.split(r"[;,]", issue) if c.strip() and not _only_clips(c)]
+def _only_hanger(part: str) -> bool:
+    """Does this leftover name the hanger — hanger, hook, bar, clips — and nothing
+    else? "hanger hook", "wooden hanger", "black hanger fragments" — yes; "hanger
+    and stand", "mannequin neck" — no."""
+    low = str(part or "").lower()
+    if not _HANGER_RE.search(low):
+        return False
+    return not _LEFTOVER_RE.search(_HANGER_RE.sub(" ", low))
+
+
+def _without_clip_clauses(issue: str, only: Any = None) -> str:
+    """`issue` without the clauses that only complain about the clips (or, with
+    `only=_only_hanger`, about the hanger)."""
+    test = only or _only_clips
+    kept = [c.strip() for c in re.split(r"[;,]", issue) if c.strip() and not test(c)]
     return "; ".join(kept)
 
 
@@ -521,6 +557,11 @@ _DEFAULTS: dict[str, Any] = {
         # leftover, every such cut-out would be re-cut on every run and come
         # back with its clips again. A hanger, a hook or a stand still counts.
         "clips_are_leftovers": False,
+        # THE HANGER ITSELF (6 Oct 2026, the operator's call): a hanger, its hook
+        # or the decision panel's clamp left at the collar of a cut-out is
+        # accepted, like the clips. A stand, a podium, the mannequin form, a hand
+        # or a patch of the studio still counts. true counts the hanger again.
+        "hangers_are_leftovers": True,
     },
     "model": None,
 }
@@ -873,6 +914,7 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
             # as it was before.
             has_leftovers = is_cutout and isinstance(entry.get("leftovers"), list)
             clips_ok = is_cutout and not gal_cfg.get("clips_are_leftovers", False)
+            hangers_ok = is_cutout and not gal_cfg.get("hangers_are_leftovers", True)
             clear_left: list[str] = []
             if has_leftovers:
                 for row in entry["leftovers"]:
@@ -881,6 +923,8 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
                     part = str(row.get("part") or "").strip()
                     if clips_ok and _only_clips(part):
                         continue          # kept on purpose: see `clips_are_leftovers`
+                    if hangers_ok and _only_hanger(part):
+                        continue          # accepted: see `hangers_are_leftovers`
                     if part and str(row.get("extent") or "").strip().lower() == "clear" \
                             and part not in clear_left:
                         clear_left.append(part)
@@ -920,6 +964,10 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
                 # "hanger clips visible" in the free text, with or without a
                 # measurement saying so: not a defect either.
                 issue = _without_clip_clauses(issue)
+            if hangers_ok and issue:
+                # "hanger visible" / "hook at the collar" in the free text: accepted
+                # with the hanger itself (see `hangers_are_leftovers`).
+                issue = _without_clip_clauses(issue, only=_only_hanger)
             if not missing and not clear_left and not scene_bad and not body_bad and not frame_bad:
                 if entry.get("ok") is not False:
                     continue

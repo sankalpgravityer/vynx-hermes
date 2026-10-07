@@ -152,7 +152,10 @@ def test_when_both_parsers_tear_it_the_raw_photo_goes_to_gemini(monkeypatch):
     monkeypatch.setattr(cutout, "_openai", lambda *a, **k: pytest.fail("gpt-image is not asked"))
     out, err, provider = cutout.remove_background(raw, strategies=FOUR)
     assert asked and asked[0] == cutout.PROMPT          # the background-removal prompt, not a mask
-    assert provider == "gemini-paint" and out == gemini_cut
+    assert provider == "gemini-paint" and out is not None
+    # 7 Oct 2026: the paint's silhouette on the PHOTOGRAPH's own pixels, never the
+    # model's render stored verbatim (_paint_as_mask) — same size, same garment.
+    assert Image.open(io.BytesIO(out)).size == Image.open(io.BytesIO(gemini_cut)).size
 
 
 def test_then_openai_when_gemini_cannot(monkeypatch):
@@ -166,7 +169,8 @@ def test_then_openai_when_gemini_cannot(monkeypatch):
         return openai_cut, None
     monkeypatch.setattr(cutout, "_openai", openai)
     out, err, provider = cutout.remove_background(raw, strategies=FOUR)
-    assert provider == "openai-paint" and out == openai_cut
+    assert provider == "openai-paint" and out is not None
+    assert Image.open(io.BytesIO(out)).size == Image.open(io.BytesIO(openai_cut)).size
     assert seen == {"prompt": cutout.OPENAI_PROMPT, "transparent": True}
 
 

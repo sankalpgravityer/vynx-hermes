@@ -334,21 +334,23 @@ def ids(p: ProductSnapshot, pol: dict[str, Any] = POL) -> dict[str, Any]:
     return {f.rule_id: f for f in check_imagery(p, pol)}
 
 
-def test_img026_reads_stored_dimensions_and_is_soft_by_default():
+def test_img026_reads_stored_dimensions_and_blocks_under_the_shipped_hold():
+    """BLOCK since 6 Oct 2026: a cut-out defect the run cannot repair holds for a
+    human — MID-000053 was approved and synced with one while this was soft."""
     raw = asset("FRONT", "RAW", id="r1", current=False, width=3000, height=4000)
     cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", width=1000, height=1000)
     found = ids(snap([cut, raw]))
     assert "IMG.026" in found
-    assert found["IMG.026"].severity.value == "low"
+    assert found["IMG.026"].severity.value == "high"
     assert found["IMG.026"].detail["original_canvas"] == [3000, 4000]
 
 
-def test_img026_blocks_once_the_hold_is_switched_to_block():
+def test_img026_is_a_flag_when_the_hold_is_switched_back_to_soft():
     pol = copy.deepcopy(POL)
-    pol["readiness"]["cutouts"]["hold"] = "block"
+    pol["readiness"]["cutouts"]["hold"] = "soft"
     raw = asset("FRONT", "RAW", id="r1", current=False, width=3000, height=4000)
     cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", width=1000, height=1000)
-    assert ids(snap([cut, raw]), pol)["IMG.026"].severity.value == "high"
+    assert ids(snap([cut, raw]), pol)["IMG.026"].severity.value == "low"
 
 
 def test_img026_is_silent_without_dimensions_or_for_a_same_ratio_downscale():
@@ -578,6 +580,9 @@ def test_judge_no_longer_holds_a_product_on_the_overlap_alone():
     no_pm = _copy.deepcopy(POL)
     gc = ((no_pm.setdefault("readiness", {}).setdefault("cutouts", {})).setdefault("garment_check", {}))
     gc["pixel_match_min"] = 0                            # the overlap alone, as this test pins
+    # 896x1195 against 3000x4000 is also an old render-size cut-out, which the
+    # canvas fallback (7 Oct 2026) rightly re-cuts; this test is about the overlap.
+    no_pm["readiness"]["cutouts"]["resolution_canvas_max"] = 0
     c, r = zoomed_pair()
     fetch, read_dims = fake_io({"https://r2/cut.png": c, "https://r2/raw.jpg": r})
     v = cutouts.judge(snap([cut, raw]), no_pm, fetch=fetch, read_dims=read_dims)
@@ -633,7 +638,10 @@ def test_judge_names_the_zoomed_view_and_writes_the_evidence_back():
     p = snap([cut, raw, back, back_raw])
     v = cutouts.judge(p, POL, fetch=fetch, read_dims=read_dims)
     assert v.action == "bad" and v.bad_views == ["FRONT"] and v.code == "CUTOUT_UNFIXABLE"
-    assert v.hold == "soft" and not v.blocks and v.soft == v.reasons
+    # BLOCK since 6 Oct 2026 (the shipped policy): a cut-out defect the run cannot
+    # repair holds for a human — MID-000053 was approved and synced with one while
+    # this was soft.
+    assert v.hold == "block" and v.blocks and v.soft == []
     assert any(r.startswith("FRONT: canvas:") for r in v.reasons)
     assert any(r.startswith("FRONT: frame:") for r in v.reasons)
     assert not any(r.startswith("BACK:") for r in v.reasons)
@@ -1383,3 +1391,226 @@ def test_run_remote_sends_replace_as_a_typed_option(monkeypatch):
                   timeout_s=10, quiet=True)
     assert sent["step"] == "matte" and sent["apply"] is True
     assert sent["options"] == {"bgProvider": "hermes", "replace": True}
+
+
+# --- 6 Oct 2026: framing is not a re-cut; a re-cut after the matte uses other methods ---
+#
+# Midtex part 1: almost every product's matte step re-cut its cut-outs only because
+# they were not cropped and centred to the standard ("fills only 54% of the frame"),
+# running v2, v1 and — when a check refused — Gemini and gpt-image per view, 120-200 s
+# a product. And a cut-out the photo audit still called defective after that was never
+# re-cut ("the same segmenter would return the same cut"), so MID-000170's block of
+# studio and MID-000057's mannequin below the hem stayed.
+
+FRAMING = ("framing: the garment fills only 54% of the frame against the standard 70% — "
+           "not cropped and centred like the rest of the catalogue. Re-cut it and frame it.")
+NECK = ("neckline: 0.8% of the garment was cut away at the collar — garment colour in the "
+        "photograph, nothing in the cut-out")
+
+
+def _verdict(problems_by_view: dict[str, list[str]], frame_only: set[str]) -> Any:
+    checks = [{"view": v, "problems": list(ps), "measured": True,
+               **({"frame_only": True} if v in frame_only else {})}
+              for v, ps in problems_by_view.items()]
+    return cutouts.CutoutVerdict(
+        "bad", "soft", code="CUTOUT_UNFIXABLE", bad_views=list(problems_by_view),
+        reasons=[f"{v}: {p}" for v, ps in problems_by_view.items() for p in ps], checks=checks)
+
+
+def test_frame_only_views_are_the_ones_whose_only_problem_is_the_framing():
+    v = _verdict({"FRONT": [FRAMING], "BACK": [NECK]}, frame_only={"FRONT"})
+    assert v.frame_only_views == ["FRONT"]
+    # A second problem on the same row (an outlier added later) is not framing only.
+    v.checks[0]["problems"].append("scale: zoomed")
+    assert v.frame_only_views == []
+
+
+def test_a_cutout_only_off_its_framing_is_framed_not_cut_again(wired):
+    wired["verdicts"][:] = [_verdict({"FRONT": [FRAMING]}, {"FRONT"}), OK]
+    r = _repair(apply=True)
+    args = wired["calls"]["matte_args"]
+    assert len(args) == 1
+    a = args[0]
+    assert a[a.index("--bg-strategies") + 1] == "frame-only"
+    assert a[a.index("--views") + 1] == "FRONT" and "--keep-better" in a
+    assert "framed FRONT without cutting again" in matte_step(r)["note"]
+
+
+def test_framing_and_a_real_defect_take_one_call_each(wired):
+    wired["verdicts"][:] = [_verdict({"FRONT": [FRAMING], "BACK": [NECK]}, {"FRONT"}), OK]
+    _repair(apply=True)
+    framed, recut = wired["calls"]["matte_args"]
+    assert framed[framed.index("--views") + 1] == "FRONT" and "frame-only" in framed
+    assert recut[recut.index("--views") + 1] == "BACK" and "--bg-strategies" not in recut
+
+
+def test_a_cutout_hermes_could_not_frame_is_re_cut_after_all(wired, monkeypatch):
+    wired["verdicts"][:] = [_verdict({"FRONT": [FRAMING]}, {"FRONT"}), OK]
+    real = rp.run_step
+
+    def run_step(vnyx_api, script, args, **kw):
+        if script == "backfill-bg-removal.ts" and "frame-only" in args:
+            wired["calls"]["matte_args"].append(list(args))
+            return True, "  cut-outs written : 0\n  failed : 1", None
+        return real(vnyx_api, script, args, **kw)
+
+    monkeypatch.setattr(rp, "run_step", run_step)
+    _repair(apply=True)
+    framed, recut = wired["calls"]["matte_args"]
+    assert "frame-only" in framed and "--bg-strategies" not in recut
+    assert recut[recut.index("--views") + 1] == "FRONT"
+
+
+def test_a_vnyx_api_without_bg_strategies_re_cuts_as_before(wired, monkeypatch):
+    monkeypatch.setattr(rp, "remote_supports", lambda *names: "bgStrategies" not in names)
+    wired["verdicts"][:] = [_verdict({"FRONT": [FRAMING]}, {"FRONT"}), OK]
+    _repair(apply=True)
+    (a,) = wired["calls"]["matte_args"]
+    assert "--bg-strategies" not in a and a[a.index("--views") + 1] == "FRONT"
+
+
+def test_still_defective_after_the_matte_is_re_cut_with_the_paid_methods(wired, monkeypatch):
+    """The matte step re-cut FRONT with the default chain; the audit still sees the
+    mannequin below the hem. The rematte step used to skip it."""
+    wired["verdicts"][:] = [BAD, OK]
+    flagged = GateVerdict("ok", soft=["CUTOUT DEFECT — FRONT cut-out: mannequin visible"],
+                          bad_cutouts=["FRONT"])
+    looks = iter([flagged, GateVerdict("ok")])
+    monkeypatch.setattr(pa, "judge", lambda media, **kw: next(looks))
+    r = _repair(apply=True)
+    recut = wired["calls"]["matte_args"][-1]
+    assert len(wired["calls"]["matte_args"]) == 2             # the matte, then the re-cut
+    assert recut[recut.index("--bg-strategies") + 1] == "object-isnet,gemini-paint,openai-paint"
+    assert recut[recut.index("--views") + 1] == "FRONT"
+    step = next(s for s in r["steps"] if s["step"] == "rematte")
+    assert step["ran"], step
+
+
+def test_a_defect_on_a_cutout_this_run_did_not_touch_keeps_the_chains_own_answer(wired, monkeypatch):
+    """Next run: the matte step re-cut nothing, so the current default chain has NOT
+    answered about this cut-out — an older version of it made the cut, and the current
+    one gets its shot before anything is paid for (rematte_strategies decides, as it
+    always did)."""
+    wired["verdicts"][:] = [OK, OK]
+    flagged = GateVerdict("ok", soft=["CUTOUT DEFECT — BACK cut-out: collar missing"],
+                          bad_cutouts=["BACK"])
+    looks = iter([flagged, GateVerdict("ok")])
+    monkeypatch.setattr(pa, "judge", lambda media, **kw: next(looks))
+    _repair(apply=True)
+    (recut,) = wired["calls"]["matte_args"]
+    assert "--bg-strategies" not in recut
+    assert recut[recut.index("--views") + 1] == "BACK"
+
+
+def test_still_wrong_after_the_default_chain_goes_to_the_paid_methods(wired):
+    """MID-000053 FRONT, 6 Oct 2026: the re-matte returned the identical 'neckline cut
+    away' and the step stopped at STILL WRONG. The default chain answering the same way
+    twice is now the signal to escalate once — IS-Net's whole-product cut first (free),
+    then the paid methods."""
+    wired["verdicts"][:] = [BAD, BAD, OK]
+    r = _repair(apply=True)
+    first, second = wired["calls"]["matte_args"]
+    assert "--bg-strategies" not in first
+    assert second[second.index("--bg-strategies") + 1] == "object-isnet,gemini-paint,openai-paint"
+    assert second[second.index("--views") + 1] == "FRONT"
+    note = matte_step(r)["note"]
+    assert "went to object-isnet, gemini-paint, openai-paint" in note and "STILL WRONG" not in note
+    assert r["cutouts"]["after"]["action"] == "ok"
+
+
+def test_the_paid_methods_are_asked_once_and_still_wrong_is_the_verdict(wired):
+    wired["verdicts"][:] = [BAD, BAD, BAD]
+    r = _repair(apply=True)
+    assert len(wired["calls"]["matte_args"]) == 2        # default, then paid — never a third
+    assert "STILL WRONG" in matte_step(r)["note"]
+
+
+def test_an_unfixable_view_is_not_paid_for(wired):
+    still = cutouts.CutoutVerdict("bad", "soft", code="CUTOUT_UNFIXABLE",
+                                  reasons=["FRONT: the form's neck shows where the collar's inside should be"],
+                                  bad_views=["FRONT"], unfixable_views=["FRONT"])
+    wired["verdicts"][:] = [BAD, still]
+    _repair(apply=True)
+    assert len(wired["calls"]["matte_args"]) == 1        # no escalation call
+
+
+def test_the_rematte_step_does_not_pay_twice_for_the_escalated_views(wired, monkeypatch):
+    wired["verdicts"][:] = [BAD, BAD, BAD]
+    flagged = GateVerdict("ok", soft=["CUTOUT DEFECT — FRONT cut-out: strap missing"],
+                          bad_cutouts=["FRONT"])
+    monkeypatch.setattr(pa, "judge", lambda media, **kw: flagged)
+    r = _repair(apply=True)
+    assert len(wired["calls"]["matte_args"]) == 2        # matte + escalation; rematte skipped
+    step = next(s for s in r["steps"] if s["step"] == "rematte")
+    assert step["ran"] is False and "this run already" in step["why"]
+
+
+# --- the photograph's resolution is the cut-out's to keep (7 Oct 2026) ------------------
+
+def _detailed(w: int, h: int) -> Image.Image:
+    """composite() with stripes on the garment, so the pixel match has texture to
+    correlate — a flat ellipse correlates with nothing."""
+    img = composite(w, h)
+    d = ImageDraw.Draw(img)
+    for k in range(10):
+        y = h // 5 + (k + 1) * (3 * h // 5) // 11
+        d.line([(int(w * 0.3), y), (int(w * 0.7), y)],
+               fill=(40 + 25 * (k % 3), 10, 10), width=max(2, h // 60))
+    return img
+
+
+def test_a_cutout_far_below_the_photographs_resolution_is_re_cut():
+    """A 674x899 cut-out beside its 3000x4000 booth photo: the old providers wrote the
+    MODEL'S render size, and the canvas ratio test is blind to a same-ratio downscale
+    by design. Measured on the garment, fixable — the re-cut takes the original."""
+    raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg",
+                width=1200, height=1600)
+    cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png")
+    fetch, read_dims = fake_io({"https://r2/cut.png": encode(_detailed(300, 400)),
+                                "https://r2/raw.jpg": encode(_detailed(1200, 1600))})
+    v = cutouts.judge(snap([cut, raw]), POL, fetch=fetch, read_dims=read_dims)
+    assert v.action == "bad" and v.bad_views == ["FRONT"]
+    assert any("resolution:" in r and "Re-cut" in r for r in v.reasons), v.reasons
+    assert v.unfixable_views == []
+
+
+def test_the_same_picture_at_the_photographs_size_passes_the_resolution_check():
+    raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg",
+                width=1200, height=1600)
+    cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png")
+    fetch, read_dims = fake_io({"https://r2/cut.png": encode(_detailed(1200, 1600)),
+                                "https://r2/raw.jpg": encode(_detailed(1200, 1600))})
+    v = cutouts.judge(snap([cut, raw]), POL, fetch=fetch, read_dims=read_dims)
+    assert not any("resolution:" in r for r in v.reasons), v.reasons
+
+
+# THE CANVAS ANSWERS FROM BELOW when the two cannot be lined up (7 Oct 2026): 66 old
+# 896x1195 cut-outs went to "frame only" in one day, the resolution check silent
+# because nothing registered — cropped smaller still, 699x933 against 3000x4000.
+
+_CFG = {"resolution_max": 1.6, "resolution_canvas_max": 3.0}
+_UNLINED = {"aligned": False, "registered": None}
+
+
+def test_an_old_render_size_cut_out_is_too_small_even_unregistered():
+    for dims in ((896, 1195), (699, 933), (612, 816)):
+        why = cutouts.resolution_problem(_UNLINED, dims, (3000, 4000), _CFG)
+        assert why and why.startswith("resolution:") and "Re-cut it at full size" in why
+    # A landscape decision photo: its long side is the measure.
+    assert cutouts.resolution_problem(_UNLINED, (896, 1195), (4000, 3000), _CFG)
+
+
+def test_a_framed_full_size_cut_out_is_not_flagged_by_its_canvas():
+    """Hermes' framing crops the canvas to the garment: 2346x3128 against 3000x4000 is
+    the photograph's pixels, 1:1."""
+    for dims in ((2346, 3128), (1953, 2604), (1500, 2000)):
+        assert cutouts.resolution_problem(_UNLINED, dims, (3000, 4000), _CFG) is None
+
+
+def test_the_canvas_fallback_can_be_switched_off():
+    assert cutouts.resolution_problem(_UNLINED, (896, 1195), (3000, 4000),
+                                      {"resolution_max": 1.6, "resolution_canvas_max": 0}) is None
+
+
+def test_the_shipped_policy_has_the_canvas_fallback():
+    assert cutouts.config(POL)["resolution_canvas_max"] == 3.0

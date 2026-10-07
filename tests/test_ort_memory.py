@@ -99,3 +99,13 @@ def test_a_busy_hermes_says_so_instead_of_cutting(monkeypatch):
 def test_the_shipped_policy_caps_at_two():
     cfg = cutout.config()
     assert cfg["max_concurrent"] == 2 and 0 < cfg["max_wait_s"] < 420
+
+
+def test_frame_only_cuts_nothing_and_takes_no_slot(monkeypatch):
+    """6 Oct 2026: `frame-only` — the cut-out on file is cropped and centred by the
+    endpoint (main.EXISTING_FRAMED); nothing is segmented, so nothing queues."""
+    ran = []
+    monkeypatch.setattr(cutout, "_remove_background", lambda *a, **k: ran.append(1))
+    monkeypatch.setattr(ort_memory, "slot", lambda *a, **k: (_ for _ in ()).throw(AssertionError("slot")))
+    out, err, provider = cutout.remove_background(b"raw", strategies=["frame-only"])
+    assert out is None and provider == "none" and err.startswith("frame-only") and not ran

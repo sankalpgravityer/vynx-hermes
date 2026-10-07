@@ -402,6 +402,9 @@ def providers(monkeypatch):
     # photo: these tests are about the chain's order, and the fidelity check
     # (`_paint_fidelity`) has its own in tests/test_hanger_cutout.py.
     monkeypatch.setattr(cutout, "_paint_fidelity", lambda source, out: (1.0, 1.0))
+    # The stubbed `_apply_mask` hands a paint answer back as a full-frame mask, which the
+    # stand check (`_kept_stand`, tested in test_cloth_edges) reads as reaching the floor.
+    monkeypatch.setattr(cutout, "_kept_stand", lambda out, cfg=None: (False, ""))
     return {"calls": calls, "answers": answers}
 
 

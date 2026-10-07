@@ -267,14 +267,15 @@ def test_an_object_cut_out_the_checks_refuse_moves_on(chain, monkeypatch):
 
 
 def test_a_garment_still_takes_its_own_route(chain, monkeypatch):
-    """Shorts hung on the wall: the hanger strategy, then the parsers, as before — and the
-    object strategy is never asked."""
+    """Shorts hung on the wall: the hanger strategy, then the parsers — and the object
+    strategy is never asked. (No bar found here, so the parsers come before Gemini:
+    7 Oct 2026, MID-000442.)"""
     monkeypatch.setattr(cutout, "_kept_backdrop", lambda *a, **k: (True, "ok"))
     monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
     out, err, provider = cutout.remove_background(
         chain["raw"], strategies=STRATS, garment="Bottoms Shorts", origin="WEB")
     assert "object" not in chain["calls"]
-    assert chain["calls"][:2] == ["hanger", "gemini"] and provider == "cloth-seg-ft"
+    assert chain["calls"][:2] == ["hanger", "v2"] and provider == "cloth-seg-ft"
 
 
 def test_no_category_means_the_chain_as_before(chain, monkeypatch):
@@ -282,3 +283,110 @@ def test_no_category_means_the_chain_as_before(chain, monkeypatch):
     monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
     out, err, provider = cutout.remove_background(chain["raw"], strategies=STRATS, origin="PHOTOBOOTH")
     assert chain["calls"] == ["v2"] and provider == "cloth-seg-ft"
+
+
+def test_the_object_cut_runs_for_a_garment_when_named_without_a_parser(chain, monkeypatch):
+    """The escalation's ask (6 Oct 2026): MID-000053's BACK — the parsers tore the dark
+    layer behind the racerback on every re-cut; IS-Net cut the product whole. Named
+    WITHOUT any parser, the object cut runs for a garment too, judged by the garment
+    checks (not the object checks)."""
+    monkeypatch.setattr(cutout, "_kept_backdrop", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
+    judged = []
+    monkeypatch.setattr(oc, "checks", lambda *a, **k: (judged.append(1), (True, "fine"))[1])
+    out, err, provider = cutout.remove_background(
+        chain["raw"], strategies=[cutout.OBJECT, "gemini-paint", "openai-paint"],
+        garment="T-Shirts & Tops Tops", origin="DECISION")
+    assert provider == cutout.OBJECT and out is not None, err
+    assert chain["calls"] == ["object"]
+    assert judged == []                      # the garment checks judged it, not the object checks
+
+
+def test_a_list_that_still_names_a_parser_keeps_the_family_gate(chain, monkeypatch):
+    """url_strategies and the policy default name the parsers: there the object cut is
+    the shoes-and-bags route and never runs for a garment."""
+    monkeypatch.setattr(cutout, "_kept_backdrop", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
+    out, err, provider = cutout.remove_background(
+        chain["raw"], strategies=STRATS, garment="T-Shirts & Tops Tops", origin="PHOTOBOOTH")
+    assert "object" not in chain["calls"] and provider == "cloth-seg-ft"
+
+
+# --- stray pieces on the garment path (6 Oct 2026) -------------------------------------
+#
+# MID-000053 FRONT: Gemini's keyed answer left a corner of the studio screen opaque at
+# the frame's foot. Dark, so the backdrop-COLOUR checks all passed it, and a fragment
+# floated beside the tank top on the live listing.
+
+def _garment_scene():
+    rgb = np.full((800, 600, 3), 240, np.uint8)
+    m = np.zeros((800, 600), bool)
+    m[150:600, 180:420] = True
+    rgb[m] = (120, 30, 60)
+    return rgb, m
+
+
+def test_a_small_piece_far_from_the_garment_is_dropped():
+    rgb, m = _garment_scene()
+    frag = np.zeros_like(m)
+    frag[740:790, 20:90] = True                       # the studio screen's corner
+    rgb[frag] = (40, 35, 50)
+    png, n = cutout._drop_stray_pieces(_png(rgb, m | frag))
+    assert n == 1
+    a = np.asarray(Image.open(io.BytesIO(png)).getchannel("A"))
+    assert not (a[740:790, 20:90] >= 128).any()
+    assert (a[150:600, 180:420] >= 128).all()
+
+
+def test_a_near_piece_and_a_sets_second_garment_both_stay():
+    rgb, m = _garment_scene()
+    button = np.zeros_like(m)
+    button[610:625, 290:305] = True                   # detached by the parser, but close
+    half = np.zeros_like(m)
+    half[650:790, 180:420] = True                     # a set's second piece: large
+    rgb[button | half] = (120, 30, 60)
+    png, n = cutout._drop_stray_pieces(_png(rgb, m | button | half))
+    assert n == 0 and png is not None
+
+
+def test_the_cleaner_runs_on_the_garment_chain_not_the_object_route(chain, monkeypatch):
+    seen = []
+    monkeypatch.setattr(cutout, "_kept_backdrop", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
+    monkeypatch.setattr(cutout, "_drop_stray_pieces",
+                        lambda png, cfg=None: (seen.append(1), (png, 0))[1])
+    cutout.remove_background(chain["raw"], strategies=STRATS, garment="Bottoms Shorts",
+                             origin="PHOTOBOOTH")
+    assert seen == [1]
+    seen.clear()
+    cutout.remove_background(chain["raw"], strategies=STRATS, garment="Shoes Running",
+                             origin="WEB")
+    assert seen == []                                 # the object route keeps its pair rules
+
+
+def test_a_garment_ask_cuts_one_piece_a_shoe_ask_keeps_the_pair(chain, monkeypatch):
+    """The escalation's object-isnet ask for a garment is a SINGLE-piece cut; the
+    shoes-and-bags route keeps every large piece (a pair apart is two)."""
+    asked = []
+
+    def spy(data, ocfg, single=False):
+        asked.append(single)
+        return chain["cut"], None
+
+    monkeypatch.setattr(cutout, "_object_isnet", spy)
+    monkeypatch.setattr(cutout, "_kept_backdrop", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
+    cutout.remove_background(chain["raw"], strategies=[cutout.OBJECT, "gemini-paint", "openai-paint"],
+                             garment="T-Shirts & Tops Tops", origin="DECISION")
+    cutout.remove_background(chain["raw"], strategies=STRATS, garment="Shoes Running", origin="WEB")
+    assert asked == [True, False]
+
+
+def test_single_piece_keeps_only_the_largest(monkeypatch):
+    monkeypatch.setattr(hc, "segmenter", lambda model: FakeSeg())
+    rgb, m = pair()                                   # two shoes apart
+    alpha, rep = oc.cutout(rgb, oc.Config(solid_px=9, single_piece=True))
+    assert rep.pieces == 1
+    import cv2 as _cv2
+    n, _l = _cv2.connectedComponents((alpha > 0.5).astype(np.uint8), connectivity=8)
+    assert n - 1 == 1

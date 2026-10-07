@@ -702,18 +702,29 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
     # made the matte step run on every pass and change nothing, because a product
     # can hold a matted FRONT and a second, never-matted FRONT original at the
     # same time and the script (correctly) considers that view done.
-    matted_views = {m["view"] for m in garments if m["processing"] == "BG_REMOVED"}
-    unmatted_views = sorted(
-        {m["view"] for m in garments if m["processing"] == "RAW"} - matted_views
-    )
-    # Live RAW rows sitting BESIDE a cut-out of the same view. Not something the
-    # matte step will touch, and not nothing either: replaceWithDerived
-    # supersedes the original it mattes, so a live RAW next to a live BG_REMOVED
-    # is either a second source photo nobody matted or a supersede that did not
-    # happen. IMG.010 reports it; this is here so the reason the matte step
-    # skipped is visible rather than mysterious.
-    leftover_raw = len([m for m in garments
-                        if m["processing"] == "RAW" and m["view"] in matted_views])
+    #
+    # AND PER ORIGIN (7 Oct 2026), as backfill-bg-removal.ts now tests it. A view
+    # carries one cut-out per origin — a decision-flow product's DECISION front beside
+    # its booth one — so MID-000447's never-matted DECISION front, beside a matted WEB
+    # front, was "done" here, missing from the Edited gallery and blocking with
+    # IMG.010. A row with no origin still covers, and is covered by, its whole view.
+    def _covers(cut: dict[str, Any], raw: dict[str, Any]) -> bool:
+        return cut["view"] == raw["view"] and (
+            not cut.get("origin") or not raw.get("origin") or cut["origin"] == raw["origin"])
+
+    cuts = [m for m in garments if m["processing"] == "BG_REMOVED"]
+    raws = [m for m in garments if m["processing"] == "RAW"]
+    unmatted_rows = [r for r in raws if not any(_covers(c, r) for c in cuts)]
+    matted_views = {m["view"] for m in cuts}
+    unmatted_views = sorted({r["view"] if r["view"] not in matted_views
+                             else f'{r["view"]} ({r.get("origin")})' for r in unmatted_rows})
+    # Live RAW rows sitting BESIDE a cut-out of the same view AND origin. Not
+    # something the matte step will touch, and not nothing either:
+    # replaceWithDerived supersedes the original it mattes, so such a RAW is either
+    # a second source photo nobody matted or a supersede that did not happen.
+    # IMG.010 reports it; this is here so the reason the matte step skipped is
+    # visible rather than mysterious.
+    leftover_raw = len([r for r in raws if r["view"] in matted_views and r not in unmatted_rows])
     # The views whose cut-out EXISTS and can therefore be judged (readiness
     # phase 3): on its canvas, on the tenant's backdrop. FRONT/BACK only — the
     # views generation seeds from and the matte step pays for.
@@ -1395,7 +1406,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     cutout_verdict: Any = None    # what _approve enforces
     # Whether this run's matte step re-cut the product's cut-outs (or would,
     # in a dry run) — the rematte step below asks before cutting them again.
-    matte_state: dict[str, Any] = {"replaced": False}
+    matte_state: dict[str, Any] = {"replaced": False, "escalated": []}
 
     def _cutouts_now() -> Any:
         """Measure the live cut-outs against their originals and the backdrop."""
@@ -1407,6 +1418,16 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                            catalog=fresh.get("catalog"),
                            imagery_settings=fresh.get("imagery_settings"))
         return cutouts.judge(snap, policy())
+
+    def _recut_after() -> list[str]:
+        """`readiness.cutouts.recut_strategies`: the methods a cut-out the default
+        chain got wrong is re-cut with — known strategy names only. Used by the
+        matte step's escalation and by the rematte step."""
+        from app.imaging import cutout as _co
+        from app.imaging import cutouts as _cs
+
+        return [str(s) for s in (_cs.config(policy()).get("recut_strategies") or [])
+                if str(s) in _co.STRATEGY_NAMES]
 
     def _matte() -> str:
         nonlocal cutout_before, cutout_verdict
@@ -1471,6 +1492,17 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 expected=cutout_before.expected)
 
         args = [*common, *live, *force]
+        # FRAMING ONLY IS NOT A RE-CUT (6 Oct 2026). A view whose every problem is
+        # the framing standard has a RIGHT cut-out that is not cropped and centred;
+        # segmenting it again (v2, v1, then the paid methods when a check refuses)
+        # only re-made the same cut-out to frame it — most of a 120-200 s matte
+        # step per product on the Midtex part-1 run. Those views go to Hermes as
+        # `frame-only`: the cut-out on file is cropped and centred, ~2 s. Needs a
+        # vnyx-api that forwards the strategy; an older one re-cuts as before.
+        frame_views: list[str] = []
+        if replace and cutout_before is not None and remote_supports("bgStrategies", "matteViews"):
+            frame_views = [v for v in cutout_before.frame_only_views if v in replace]
+        recut_views = [v for v in replace if v not in frame_views]
         if replace:
             # `--keep-better` beside `--replace`, always (item 8 of
             # docs/PICTURE-CHECK-FIXES.md). `replaceWithDerived` supersedes the
@@ -1506,13 +1538,49 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             # keeps the old whole-product behaviour rather than losing the
             # re-matte over it. The guard is what may never be dropped; this is
             # an economy.
-            if remote_supports("matteViews"):
-                args.extend(["--views", ",".join(replace)])
-            matte_state["replaced"] = True
-        ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args,
-                              timeout_s=600, quiet=quiet)
-        if not ok:
-            raise StepFailed("background removal returned non-zero")
+            matte_state["replaced"] = bool(recut_views)
+            matte_state["framed"] = list(frame_views)
+
+        def _run_matte(extra: list[str]) -> tuple[int | None, int | None, int | None]:
+            ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", [*args, *extra],
+                                  timeout_s=600, quiet=quiet)
+            if not ok:
+                raise StepFailed("background removal returned non-zero")
+            w = f = k = None
+            for line in (out or "").splitlines():
+                low = line.lower()
+                if "cut-outs written" in low:
+                    w = _trailing_int(line)
+                elif "kept" in low and ":" in line:
+                    k = _trailing_int(line)
+                elif "failed" in low and ":" in line:
+                    f = _trailing_int(line)
+            return w, f, k
+
+        def _add(a: int | None, b: int | None) -> int | None:
+            return None if a is None and b is None else (a or 0) + (b or 0)
+
+        written = failed = kept = None
+        if frame_views:
+            w, f, k = _run_matte(["--views", ",".join(frame_views), "--bg-strategies", "frame-only"])
+            if f:
+                # A cut-out Hermes could not frame safely comes back with nothing:
+                # those views are re-cut after all, exactly as before.
+                recut_views = list(dict.fromkeys([*recut_views, *frame_views]))
+                matte_state["replaced"] = True
+            else:
+                written, kept = _add(written, w), _add(kept, k)
+        if recut_views or (state["unmatted"] and not frame_views):
+            extra = ["--views", ",".join(recut_views)] if (recut_views and remote_supports("matteViews")) else []
+            w, f, k = _run_matte(extra)
+            written, failed, kept = _add(written, w), _add(failed, f), _add(kept, k)
+        if frame_views and not recut_views:
+            parts.append(f"framed {', '.join(frame_views)} without cutting again (the cut-out on "
+                         f"file was right, only its framing was not)")
+        elif frame_views:
+            framed_now = [v for v in frame_views if v not in recut_views]
+            if framed_now:
+                parts.append(f"framed {', '.join(framed_now)} without cutting again")
 
         # EXIT CODE 0 IS NOT ENOUGH HERE, and trusting it hid a real outage.
         #
@@ -1529,17 +1597,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # PAGE -- HTML with a 200-shaped body, which is why nothing downstream
         # noticed.
         #
-        # So the summary the script already prints is parsed, and a step that
-        # wrote nothing while failing something says so.
-        written = failed = kept = None
-        for line in (out or "").splitlines():
-            low = line.lower()
-            if "cut-outs written" in low:
-                written = _trailing_int(line)
-            elif "kept" in low and ":" in line:
-                kept = _trailing_int(line)
-            elif "failed" in low and ":" in line:
-                failed = _trailing_int(line)
+        # So the summary the script already prints is parsed (`_run_matte`, per
+        # call), and a step that wrote nothing while failing something says so.
         if failed and not written:
             raise StepFailed(
                 f"background removal produced no cut-outs ({failed} image(s) "
@@ -1564,6 +1623,27 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # step just wrote. Still wrong is a verdict, not a retry.
         if apply and cutouts_on and (replace or state["unmatted"]):
             cutout_verdict = _cutouts_now()
+            # STILL WRONG AFTER THE DEFAULT CHAIN'S RE-CUT (6 Oct 2026): that chain
+            # has now answered the same question the same way twice — MID-000053's
+            # FRONT came back with the identical "neckline cut away" after its
+            # re-matte, and nothing escalated. The views still bad go ONCE to the
+            # paid methods (`readiness.cutouts.recut_strategies`: Gemini's
+            # background removal, then gpt-image's), and are measured a last time.
+            # `--keep-better` still refuses a candidate with less garment, and a
+            # view the measurement calls unfixable (the photograph itself lacks
+            # what the cut-out needs) is not paid for.
+            still = ([v for v in cutout_verdict.bad_views
+                      if v in recut_views and v not in (cutout_verdict.unfixable_views or [])]
+                     if cutout_verdict.action == "bad" else [])
+            paid_plan = _recut_after()
+            if still and paid_plan and remote_supports("bgStrategies", "matteViews"):
+                w2, f2, _k2 = _run_matte(["--views", ",".join(still),
+                                          "--bg-strategies", ",".join(paid_plan)])
+                matte_state["escalated"] = list(still)
+                note += (f" — the default chain answered the same way twice, so "
+                         f"{', '.join(still)} went to {', '.join(paid_plan)}"
+                         + (f" ({w2 or 0} written, {f2} FAILED)" if f2 else ""))
+                cutout_verdict = _cutouts_now()
             if cutout_verdict.action == "bad":
                 note += (" — STILL WRONG after the re-matte: "
                          + "; ".join(cutout_verdict.reasons)
@@ -2178,6 +2258,16 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         #                       answer for what IS the garment and a mask
         #                       strategy is not more likely to find the collar.
         plan = _cutout.rematte_strategies(why)
+        # THE DEFAULT CHAIN ALREADY ANSWERED THIS RUN (6 Oct 2026): when the matte
+        # step re-cut this product, asking the same chain again returns the same
+        # cut — which is why this step used to skip entirely, leaving MID-000184's
+        # torn panels for good. The re-cut goes to `readiness.cutouts
+        # .recut_strategies` instead (the whole-product IS-Net cut, then the paid
+        # methods); `--keep-better` still refuses one with less garment. When the
+        # matte step did NOT re-cut this run, the chain's own answer (`plan`)
+        # stands: the current chain may well fix a cut-out an older one made.
+        if matte_state["replaced"] and _recut_after():
+            plan = _recut_after()
 
         # A LEFTOVER WITH NOTHING CONFIGURED TO REMOVE IT IS LEFT ALONE.
         #
@@ -2223,6 +2313,11 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
         args = [*common, *live, *(["--provider", provider] if provider else []),
                 "--replace", "--keep-better"]
+        # Only the views the audit named: with the paid methods, re-cutting a sound
+        # view is a bill for nothing.
+        named = [v for v in views if v in ("FRONT", "BACK")]
+        if named and remote_supports("matteViews"):
+            args.extend(["--views", ",".join(named)])
         if plan:
             args.extend(["--bg-strategies", ",".join(plan)])
         ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args,
@@ -2289,7 +2384,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         rematte_why = "--no-matte"
     elif photo_verdict is None or not _pa.rematte_views(photo_verdict, policy()):
         rematte_why = "the photo audit found every cut-out whole"
-    elif matte_state["replaced"]:
+    elif set(_pa.rematte_views(photo_verdict, policy())) <= set(matte_state.get("escalated") or []):
+        # The matte step's escalation already asked the paid methods about exactly
+        # these views this run; asking them again answers the same way and bills twice.
+        rematte_why = ("the paid methods re-cut these views this run already (the matte "
+                       "step's escalation)")
+    elif matte_state["replaced"] and not (_recut_after() and remote_supports("bgStrategies")):
         rematte_why = ("the matte step re-cut this product this run already — the same "
                        "segmenter would return the same cut")
     else:

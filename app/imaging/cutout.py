@@ -282,6 +282,12 @@ def config(pol: dict[str, Any] | None = None) -> dict[str, Any]:
 # shirt, and keying green would eat anything olive.
 KEY_RGB = (255, 0, 255)
 
+# PNG ENCODING OF EVERY CANDIDATE (6 Oct 2026). Was `optimize=True`: on a
+# 3000x4000 cut-out 1.02 s against 0.39 s at zlib level 6 and no smaller (2.8 MB
+# against 2.7 MB) — and each attempt is encoded more than once, refused or not,
+# which was ~30% of a cloth-seg attempt in the profile of MID-000170 FRONT.
+PNG_LEVEL = 6
+
 PROMPT = (
     "Isolate ONLY the garment in this photograph and place it on a solid "
     "background of pure magenta, RGB (255, 0, 255).\n"
@@ -431,7 +437,7 @@ def _key_out(data: bytes) -> tuple[bytes | None, str | None]:
     rgba[mask] = (255, 255, 255, 0)
 
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", compress_level=PNG_LEVEL)
     return buf.getvalue(), None
 
 
@@ -497,7 +503,7 @@ def _apply_mask(source: bytes, mask_png: bytes) -> tuple[bytes | None, str | Non
     out[np.asarray(a_img) == 0] = (255, 255, 255, 0)
 
     buf = io.BytesIO()
-    Image.fromarray(out, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(out, "RGBA").save(buf, format="PNG", compress_level=PNG_LEVEL)
     return buf.getvalue(), None
 
 
@@ -732,6 +738,344 @@ def _png_with_icc(png: bytes, icc: bytes | None) -> bytes:
     return png[:ihdr_end] + chunk + png[ihdr_end:]
 
 
+def _cloth_edges_cfg() -> dict[str, Any]:
+    """`imagery.cutout.cloth_edges` with defaults filled in."""
+    out: dict[str, Any] = {"enabled": True, "radius": 0.004, "eps": 1e-4, "band": [0.44, 0.56],
+                           "trim_origins": ["WEB", "MANUAL"], "trim_min_score": 0.12,
+                           "trim_wall_score": 0.02, "trim_edge": 10.0, "trim_gap": 0.008,
+                           "trim_ring": 0.05, "trim_max_add": 0.04,
+                           "trim_garment_de": 10.0, "trim_garment_share": 0.005,
+                           "trim_wall_de": 4.0, "trim_wall_de_max": 15.0, "trim_margin": 2.0,
+                           "trim_min_piece": 0.001, "trim_above": 0.01}
+    block = ((policy().get("imagery") or {}).get("cutout") or {}).get("cloth_edges")
+    if block is False:
+        out["enabled"] = False
+    elif isinstance(block, dict):
+        out.update({k: v for k, v in block.items() if v is not None})
+    return out
+
+
+def _cloth_score(session: Any, img: Any) -> Any:
+    """The parser's own GARMENT SCORE at the model's 768 grid: 0.5 exactly where its argmax
+    changes between background and any garment class.
+
+    7 Oct 2026, MID-000430, "the boundary is a zig-zag": rembg's `predict` takes the ARGMAX
+    label map at 768x768 and LANCZOS-resizes the LABELS to the photograph (5.2x on a
+    3000x4000), so every cut-out's outline was a staircase of ~5 px steps with the wall
+    caught in the risers. The score is smooth and can be upsampled honestly."""
+    import numpy as np
+
+    logits = session.inner_session.run(
+        None, session.normalize(img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), (768, 768)))[0][0]
+    e = np.exp(logits - logits.max(axis=0, keepdims=True))
+    p = e / e.sum(axis=0, keepdims=True)
+    fg = p[1:].max(axis=0)
+    return (fg / np.maximum(fg + p[0], 1e-6)).astype(np.float32)
+
+
+def _cloth_alpha(rgb: Any, score: Any, ecfg: dict[str, Any]) -> tuple[Any, Any]:
+    """The score on the photograph's grid, SNAPPED to the photograph's own edges, and the
+    alpha it gives: (alpha float32 0..1, the snapped score).
+
+    Bilinear alone leaves the outline where the 768 grid put it — 6 px out into the wall
+    on MID-000430's shoulder, a light rim on a dark shirt. A guided filter with the photo
+    as guide (He et al.; radius `radius` of the long side) moves it onto the photograph's
+    edge (measured: the dark-to-wall step at x 2071, the snapped 0.5 at 2072). The band
+    [lo, hi] is a ~1-2 px antialiased edge. Worked inside the garment's box only: the
+    filter's arrays are full-resolution floats."""
+    import cv2
+    import numpy as np
+
+    from app.imaging.hanger_cutout import _guided_filter
+
+    H, W = rgb.shape[:2]
+    s = cv2.resize(score, (W, H), interpolation=cv2.INTER_LINEAR)
+    r = max(4, int(round(float(ecfg["radius"]) * max(H, W))))
+    ys, xs = np.where(s >= 0.05)
+    if ys.size == 0:
+        return np.zeros((H, W), np.float32), s
+    m = 2 * r + 4
+    y0, y1 = max(0, int(ys.min()) - m), min(H, int(ys.max()) + m + 1)
+    x0, x1 = max(0, int(xs.min()) - m), min(W, int(xs.max()) + m + 1)
+    gray = cv2.cvtColor(np.ascontiguousarray(rgb[y0:y1, x0:x1]), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255
+    snapped = s.copy()
+    snapped[y0:y1, x0:x1] = np.clip(_guided_filter(gray, s[y0:y1, x0:x1], r, float(ecfg["eps"])), 0, 1)
+    lo, hi = (float(v) for v in ecfg["band"])
+    t = np.clip((snapped - lo) / max(1e-6, hi - lo), 0, 1)
+    return (t * t * (3 - 2 * t)).astype(np.float32), snapped
+
+
+def _trim_looks_like_garment(crop: Any, L: Any, m: Any, flooded: Any, cl: Any, stats: Any,
+                             keep: Any, gap: int, ecfg: dict[str, Any],
+                             notes: list[dict[str, Any]] | None = None) -> Any:
+    """Which of the candidate pieces LOOK like the garment: a bool per piece label.
+
+    The edge flood alone, run over 69 wall photos from 14 tenants (7 Oct 2026), put back
+    MID-000430's band and cuffs — and everywhere else wall: pockets of wall closed in by a
+    hanger wire or between an arm and the body, slivers on a shoulder, a wall hook, a
+    hand. What tells real trim apart is its colour. A piece is kept when:
+      - the GARMENT has its colour: at least `trim_garment_share` of the garment lies
+        within `trim_garment_de` of it (a share, not a colour cluster — on a black back
+        view the white collar and stripes are too few pixels to win a cluster);
+      - it is at least `trim_wall_de` from the WALL right beside it (that wall is what
+        the parser saw there), and nearer the garment's colour than the wall's by
+        `trim_margin`;
+      - it is CAMOUFLAGED — no more than `trim_wall_de_max` from that wall. The parser
+        loses white on white; a dark clip, or a dark piece with a wedge of wall caught
+        inside it, stands out from the wall and is not what this is for (the second
+        pass over the 69 photos put back eight hanger clips and two such wedges);
+      - it is at least `trim_min_piece` of the garment's area (flecks on a knit's edge are
+        not what was lost);
+      - it does not rise above the garment's top by more than `trim_above` of its height.
+        What rises above a hung garment is what it hangs from — a clip over the
+        waistband, a hook over the collar, the hanger's arm (the third pass: five of six
+        photos still put back hardware, the sixth was MID-000430, whose band lies below
+        the collar's tips). The user is content to see a hanger; nothing is gained by
+        adding one back.
+    Lab, the median per piece."""
+    import cv2
+    import numpy as np
+
+    out = keep.copy()
+    lab = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB).astype(np.float32)
+    lab[..., 0] = L
+    lab[..., 1:] -= 128.0
+    inner = cv2.erode(m.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    gpx = lab[inner]
+    if gpx.shape[0] < 500:
+        out[:] = False
+        return out
+    if gpx.shape[0] > 40000:
+        gpx = gpx[np.random.default_rng(7).choice(gpx.shape[0], 40000, replace=False)]
+    g_share = float(ecfg["trim_garment_share"])
+    min_px = float(ecfg["trim_min_piece"]) * float(m.sum())
+    rows = np.nonzero(m.any(axis=1))[0]
+    g_top, g_h = int(rows[0]), int(rows[-1] - rows[0] + 1)
+    highest = g_top - float(ecfg["trim_above"]) * g_h
+    near = np.ones((2 * gap + 1, 2 * gap + 1), np.uint8)
+    Hc, Wc = m.shape
+    for i in np.nonzero(keep)[0]:
+        if float(stats[i, cv2.CC_STAT_AREA]) < min_px or float(stats[i, cv2.CC_STAT_TOP]) < highest:
+            out[i] = False
+            if notes is not None:
+                notes.append({"piece": int(i), "px": int(stats[i, cv2.CC_STAT_AREA]),
+                              "at": (int(stats[i, 0]), int(stats[i, 1])), "kept": False,
+                              "why": "too small" if float(stats[i, cv2.CC_STAT_AREA]) < min_px
+                              else "rises above the garment", "d_wall": -1, "d_garment": -1,
+                              "colour": []})
+            continue
+        bx, by, bw, bh = (int(v) for v in stats[i, :4])
+        sx0, sy0 = max(0, bx - 2 * gap), max(0, by - 2 * gap)
+        sx1, sy1 = min(Wc, bx + bw + 2 * gap), min(Hc, by + bh + 2 * gap)
+        piece = cl[sy0:sy1, sx0:sx1] == i
+        beside = (cv2.dilate(piece.astype(np.uint8), near) > 0) & flooded[sy0:sy1, sx0:sx1] & ~piece
+        if beside.sum() < 30:
+            out[i] = False        # no wall beside it to tell it from
+            continue
+        patch = lab[sy0:sy1, sx0:sx1]
+        pc = np.median(patch[piece], axis=0)
+        wc = np.median(patch[beside], axis=0)
+        d_wall = float(np.linalg.norm(pc - wc))
+        # How near the garment's own colours come: the distance within which
+        # `trim_garment_share` of its pixels lie.
+        d_garment = float(np.quantile(np.linalg.norm(gpx - pc, axis=1), g_share))
+        # No second opinion when the garment kept none of the piece's colour (MID-000430's
+        # BACK, whose parser dropped the white collar AND both cuffs): IS-Net, tried on 67
+        # wall photos, vouched for five such pieces and all five were a mannequin form, a
+        # mounting board or wall.
+        ok = (d_garment <= float(ecfg["trim_garment_de"])
+              and float(ecfg["trim_wall_de"]) <= d_wall <= float(ecfg["trim_wall_de_max"])
+              and d_garment + float(ecfg["trim_margin"]) <= d_wall)
+        out[i] = ok
+        if notes is not None:
+            notes.append({"piece": int(i), "px": int(piece.sum()), "at": (bx, by), "box": (bx, by, bw, bh),
+                          "d_wall": round(d_wall, 1), "d_garment": round(d_garment, 1),
+                          "colour": [round(float(v), 1) for v in pc], "kept": bool(ok)})
+    return out
+
+
+def _recover_trim(rgb: Any, alpha: Any, score: Any, ecfg: dict[str, Any],
+                  notes: list[dict[str, Any]] | None = None) -> tuple[Any, float]:
+    """White trim the parser lost against a WHITE WALL, put back: (alpha, share added).
+
+    MID-000430 (7 Oct 2026): the white back-collar band behind the neck (the hanger's hook
+    goes through it) and both white cuffs — the parser scored them 0.06-0.6, against a
+    wall of the same colour. Colour cannot tell them apart, and neither could texture (the
+    first try: it took the sleeve's SHADOW, whose own edge reads as texture, and drew a
+    ragged outline). An EDGE can: trim meets the wall at a step — a seam, a fold, its own
+    shadow line — where a shadow fades into the wall with none.
+
+    So the WALL IS FLOODED from where it is certain — beyond twice `trim_ring` of the
+    garment's width, or scored under `trim_wall_score` — through every pixel that is not on
+    an edge (lightness gradient over `trim_edge`), with gaps narrower than `trim_gap` of the
+    width closed to it (at a collar's corner the band's edge and the front collar's leave
+    one). What the flood cannot reach, within `trim_ring` of the garment, is a piece of
+    garment when the parser leaned that way on average (`trim_min_score`). Pieces as thin
+    as the gap (a hanger wire, a pencil line) are opened away, only pieces touching the
+    garment are kept, and the new outline is drawn on the photograph's own edge (guided
+    filter). More than `trim_max_add` of the garment is not trim, and nothing is added.
+    Wall photos only (`trim_origins`): on the photobooth the same rule would bring back the
+    white form under the hem."""
+    import cv2
+    import numpy as np
+
+    from app.imaging.hanger_cutout import _guided_filter
+
+    mask = alpha >= 0.5
+    if mask.sum() < 1000:
+        return alpha, 0.0
+    ys, xs = np.where(mask)
+    gw = int(xs.max() - xs.min() + 1)
+    H, W = mask.shape
+    ring_px = float(ecfg["trim_ring"]) * gw
+    pad = int(2 * ring_px) + 8
+    y0, y1 = max(0, int(ys.min()) - pad), min(H, int(ys.max()) + pad + 1)
+    x0, x1 = max(0, int(xs.min()) - pad), min(W, int(xs.max()) + pad + 1)
+    m = mask[y0:y1, x0:x1]
+    sc = score[y0:y1, x0:x1]
+    crop = np.ascontiguousarray(rgb[y0:y1, x0:x1])
+    L = cv2.cvtColor(crop, cv2.COLOR_RGB2LAB)[..., 0].astype(np.float32) * (100.0 / 255.0)
+    Ls = cv2.GaussianBlur(L, (0, 0), 1.0)
+    grad = np.hypot(cv2.Sobel(Ls, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(Ls, cv2.CV_32F, 0, 1, ksize=3))
+    edge = cv2.dilate((grad > float(ecfg["trim_edge"])).astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    dist = cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 5)
+    wall = (~m) & ((dist > 2 * ring_px) | (sc < float(ecfg["trim_wall_score"])))
+    gap = max(5, int(float(ecfg["trim_gap"]) * gw)) | 1
+    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (gap, gap))
+    passable = (~m) & ~edge
+    open_to_wall = cv2.morphologyEx(passable.astype(np.uint8), cv2.MORPH_OPEN, disk) > 0
+    _n, lbl = cv2.connectedComponents(open_to_wall.astype(np.uint8), connectivity=4)
+    reached = np.unique(lbl[wall & open_to_wall])
+    flooded = np.isin(lbl, reached[reached > 0])
+    # Back up to the edges the opening kept it from (a corner, a pencil line's side) —
+    # not through a gap: half the gap's width in, as far as the opening took.
+    flooded |= (cv2.dilate(flooded.astype(np.uint8), disk) > 0) & passable
+    # The edge itself is shared: each of its pixels goes to the nearer side, so the new
+    # outline lies along the middle of the step and not on its wall side.
+    inside = ~edge & ~flooded
+    d_wall = cv2.distanceTransform((~flooded).astype(np.uint8), cv2.DIST_L2, 3)
+    d_in = cv2.distanceTransform((~inside).astype(np.uint8), cv2.DIST_L2, 3)
+    cand = (~m) & (dist <= ring_px) & ~flooded & ~wall & ~(edge & (d_wall < d_in))
+    k = gap + 4
+    cand = cv2.morphologyEx(cand.astype(np.uint8), cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    nc, cl, stats, _cen = cv2.connectedComponentsWithStats(cand, connectivity=8)
+    if nc <= 1:
+        return alpha, 0.0
+    touching = np.unique(cl[cv2.dilate(m.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0])
+    lean = np.bincount(cl.ravel(), weights=sc.ravel(), minlength=nc) / np.maximum(
+        np.bincount(cl.ravel(), minlength=nc), 1)
+    keep = np.zeros(nc, bool)
+    keep[touching] = True
+    keep &= lean >= float(ecfg["trim_min_score"])
+    keep[0] = False
+    if keep.any():
+        keep &= _trim_looks_like_garment(crop, L, m, flooded, cl, stats, keep, gap, ecfg, notes)
+    add = keep[cl]
+    share = float(add.sum()) / float(m.sum())
+    if not add.any() or share > float(ecfg["trim_max_add"]):
+        return alpha, 0.0
+    # The new outline on the photograph's own edge, antialiased; only around what was added.
+    r = max(3, int(round(0.002 * max(H, W))))
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255
+    g = np.clip(_guided_filter(gray, (m | add).astype(np.float32), r, float(ecfg["eps"])), 0, 1)
+    t = np.clip((g - 0.4) / 0.2, 0, 1)
+    near = cv2.dilate(add.astype(np.uint8), np.ones((2 * r + 3, 2 * r + 3), np.uint8)) > 0
+    soft = np.where(near, t * t * (3 - 2 * t), 0).astype(np.float32)
+    out = alpha.copy()
+    out[y0:y1, x0:x1] = np.maximum(out[y0:y1, x0:x1], soft)
+    return out, share
+
+
+_TRIM_MEMO: dict[str, Any] = {}
+_TRIM_MEMO_LOCK = __import__("threading").Lock()
+
+
+def _trim_key(data: bytes, model: str) -> str:
+    import hashlib
+
+    return f"{hashlib.blake2b(data, digest_size=16).hexdigest()}:{model}"
+
+
+def _trim_memo_put(data: bytes, model: str, score: Any) -> None:
+    """A parser's score for a photo (its own 768 grid, ~1 MB in half precision), for
+    _finish_trim. Written for every parse — which one a wall photo's chain accepts is
+    known only later — and the oldest dropped past eight (two cut-outs run at once, each
+    may try v2, v1 and the stock parser)."""
+    import numpy as np
+
+    with _TRIM_MEMO_LOCK:
+        while len(_TRIM_MEMO) >= 8:
+            _TRIM_MEMO.pop(next(iter(_TRIM_MEMO)))
+        _TRIM_MEMO[_trim_key(data, model)] = score.astype(np.float16)
+
+
+def _finish_trim(data: bytes, out: bytes, name: str, label: str) -> bytes:
+    """An accepted wall-photo cut-out with the white trim the parser lost put back
+    (_recover_trim), its edge colours cleaned again. `name` is the strategy that cut it:
+    only a garment parser's has a score to read. Unchanged when there is nothing to put
+    back. Never raises."""
+    import numpy as np
+    from PIL import Image
+
+    model = {"cloth-seg-ft": _CLOTH_FT_PATH, "cloth-seg-ft-backup": _CLOTH_FT_BACKUP_PATH,
+             "cloth-seg": _CLOTH_MODEL}.get(name)
+    if not model:
+        return out
+    try:
+        with _TRIM_MEMO_LOCK:
+            score = _TRIM_MEMO.pop(_trim_key(data, model), None)
+        if score is None:
+            return out
+        arr = np.asarray(Image.open(io.BytesIO(out)).convert("RGBA"))
+        alpha = np.ascontiguousarray(arr[..., 3])
+        src = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+        if src.shape[:2] != alpha.shape:
+            return out
+        ecfg = _cloth_edges_cfg()
+        _a, snapped = _cloth_alpha(src, score.astype(np.float32), ecfg)
+        before = alpha.astype(np.float32) / 255
+        a, added = _recover_trim(src, before, snapped, ecfg)
+        if not added:
+            return out
+        # The cut-out's own colours (a refined one has painted where clips were); the
+        # photograph's only where trim was put back.
+        rgb = arr[..., :3].copy()
+        grew = a > before + 1e-3
+        rgb[grew] = src[grew]
+        rgb = _decontaminate(rgb, a)
+        new_alpha = (a * 255).round().astype(np.uint8)
+        res = np.dstack([rgb, new_alpha])
+        res[new_alpha == 0] = (255, 255, 255, 0)
+        buf = io.BytesIO()
+        Image.fromarray(res, "RGBA").save(buf, format="PNG", compress_level=PNG_LEVEL)
+        log.info("bg-removal %s: put back %.2f%% of the garment — white trim lost against the "
+                 "wall", label, 100 * added)
+        return buf.getvalue()
+    except Exception as exc:  # noqa: BLE001
+        log.info("bg-removal %s: trim not put back (%s)", label, exc.__class__.__name__)
+        return out
+
+
+def _decontaminate(rgb: Any, alpha: Any) -> Any:
+    """A partly transparent edge pixel takes the colour of the nearest SOLID garment pixel,
+    so the wall's white does not ring a dark outline on whatever backdrop it goes onto."""
+    import cv2
+    import numpy as np
+
+    solid = alpha >= 0.98
+    edge = (alpha > 0) & ~solid
+    if not edge.any() or not solid.any():
+        return rgb
+    _d, lbl = cv2.distanceTransformWithLabels((~solid).astype(np.uint8), cv2.DIST_L2, 5,
+                                              labelType=cv2.DIST_LABEL_PIXEL)
+    sy, sx = np.nonzero(solid)
+    idx = np.clip(lbl[edge] - 1, 0, sy.size - 1)
+    out = rgb.copy()
+    out[edge] = rgb[sy[idx], sx[idx]]
+    return out
+
+
 def _cloth_seg(data: bytes, model: str | None = None) -> tuple[bytes | None, str | None]:
     """Segment the garment locally. Returns (png, error). Never raises.
 
@@ -768,22 +1112,46 @@ def _cloth_seg(data: bytes, model: str | None = None) -> tuple[bytes | None, str
         # switched off for the life of the process afterwards.
         return None, f"could not load {model}: {str(exc)[:140]}"
 
-    try:
-        from rembg import remove
-        src = Image.open(io.BytesIO(data)).convert("RGBA")
-        stacked = Image.open(io.BytesIO(remove(data, session=session)))
-        stacked = stacked.convert("RGBA")
-    except Exception as exc:  # noqa: BLE001
-        return None, f"{exc.__class__.__name__}: {str(exc)[:140]}"
+    ecfg = _cloth_edges_cfg()
+    src = None
+    if ecfg.get("enabled") and hasattr(session, "inner_session") and hasattr(session, "normalize"):
+        # THE PARSER'S OWN SCORE, snapped to the photograph's edges (7 Oct 2026, see
+        # _cloth_score / _cloth_alpha): a smooth outline on the garment's real edge,
+        # where rembg's label-map resize drew a staircase.
+        try:
+            src = Image.open(io.BytesIO(data)).convert("RGBA")
+            rgb = np.asarray(src)[:, :, :3]
+            score = _cloth_score(session, src.convert("RGB"))
+            a, _snapped = _cloth_alpha(rgb, score, ecfg)
+            rgb = _decontaminate(rgb, a)
+            alpha = (a * 255).round().astype(np.uint8)
+            src = Image.fromarray(np.dstack([rgb, alpha]), "RGBA")
+            # Kept for the finishing step (_finish_trim, wall photos): white trim is put
+            # back only once the checks have accepted the parser's own answer — joined
+            # to a white collar, the trim is a white ring the leftover check (rightly,
+            # for a podium) would refuse.
+            _trim_memo_put(data, model, score)
+        except Exception as exc:  # noqa: BLE001 — rembg's own path below
+            log.info("cloth-seg: the snapped-edge path failed (%s: %s); rembg's mask instead",
+                     exc.__class__.__name__, str(exc)[:120])
+            src = None
+    if src is None:
+        try:
+            from rembg import remove
+            src = Image.open(io.BytesIO(data)).convert("RGBA")
+            stacked = Image.open(io.BytesIO(remove(data, session=session)))
+            stacked = stacked.convert("RGBA")
+        except Exception as exc:  # noqa: BLE001
+            return None, f"{exc.__class__.__name__}: {str(exc)[:140]}"
 
-    w, h = src.size
-    panels = max(1, stacked.height // h)
-    alpha = np.zeros((h, w), dtype=np.uint8)
-    for i in range(panels):
-        band = stacked.crop((0, i * h, w, (i + 1) * h))
-        if band.size != (w, h):
-            continue
-        alpha = np.maximum(alpha, np.asarray(band.getchannel("A")))
+        w, h = src.size
+        panels = max(1, stacked.height // h)
+        alpha = np.zeros((h, w), dtype=np.uint8)
+        for i in range(panels):
+            band = stacked.crop((0, i * h, w, (i + 1) * h))
+            if band.size != (w, h):
+                continue
+            alpha = np.maximum(alpha, np.asarray(band.getchannel("A")))
 
     kept = float((alpha >= 250).mean())
     if kept < 0.02:
@@ -794,7 +1162,7 @@ def _cloth_seg(data: bytes, model: str | None = None) -> tuple[bytes | None, str
     out = np.dstack([np.asarray(src)[:, :, :3], alpha])
     out[alpha == 0] = (255, 255, 255, 0)
     buf = io.BytesIO()
-    Image.fromarray(out, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(out, "RGBA").save(buf, format="PNG", compress_level=PNG_LEVEL)
     return buf.getvalue(), None
 
 
@@ -1813,6 +2181,46 @@ def _same_framing(source: bytes, result: bytes) -> tuple[bool, str]:
     return True, f"framing kept ({out_ratio:.2f})"
 
 
+def _finish_neck(data: bytes, out: bytes, origin: str | None, garment: str | None,
+                 label: str) -> bytes:
+    """The accepted cut-out with its neck opening finished (app/imaging/neckline.py),
+    or unchanged. Never raises."""
+    try:
+        from app.imaging import neckline
+
+        new, rep = neckline.finish(data, out, origin=origin, garment=garment)
+    except Exception as exc:  # noqa: BLE001
+        log.info("bg-removal %s: neckline not finished (%s)", label, exc.__class__.__name__)
+        return out
+    if rep.get("done"):
+        log.info("bg-removal %s: neckline %s (%s)", label, rep["done"],
+                 ", ".join(f"{k} {v}" for k, v in rep.items() if k not in ("done",)))
+    return new
+
+
+def _paint_as_mask(source: bytes, painted: bytes) -> tuple[bytes | None, str | None]:
+    """The painted answer's SILHOUETTE applied to the photograph's own pixels.
+
+    7 Oct 2026, "why is my quality degraded when we do background removal": a paint
+    strategy's output is the MODEL'S RENDER — ~1 MP from a 12 MP photograph — and
+    accepting it wrote 674x899 cut-outs over 3000x4000 booth photos. By the time this
+    runs the paint has already proven WHERE the garment is (`_same_framing`) and that
+    it IS the photograph's garment (`_paint_fidelity`), so only its silhouette is
+    needed: taken from its alpha and applied to the original through `_apply_mask`,
+    exactly like a mask strategy. Full resolution, the photo's own colours, and the
+    model's relighting gone with its pixels. Returns (png, error); the caller keeps
+    the painted answer when this cannot be done."""
+    from PIL import Image
+
+    try:
+        a = Image.open(io.BytesIO(painted)).convert("RGBA").getchannel("A")
+        buf = io.BytesIO()
+        a.save(buf, format="PNG", compress_level=PNG_LEVEL)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"could not read the painted alpha ({exc.__class__.__name__})"
+    return _apply_mask(source, buf.getvalue())
+
+
 def _has_alpha(data: bytes) -> bool:
     """Does this image already carry a usable alpha channel?"""
     from PIL import Image
@@ -1866,7 +2274,7 @@ def _intersect_alpha(mask_png: bytes, cloth_png: bytes) -> tuple[bytes | None, s
     arr[alpha == 0] = (255, 255, 255, 0)
 
     buf = io.BytesIO()
-    Image.fromarray(arr, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(arr, "RGBA").save(buf, format="PNG", compress_level=PNG_LEVEL)
     return buf.getvalue(), None
 
 
@@ -1888,6 +2296,9 @@ HANGER = "hanger-isnet"
 # (`imagery.cutout.object.families`); its cut-outs, and every other strategy's for
 # these products, are judged by object_cutout.checks instead of the garment checks.
 OBJECT = "object-isnet"
+# Not a segmenter: the caller asks for the cut-out on file to be cropped and centred,
+# and nothing cut again (`remove_background`). Accepted alone, never in a chain.
+FRAME_ONLY = "frame-only"
 
 
 def object_config(pol: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1935,8 +2346,12 @@ def _product_prompt(prompt: str, family: str | None) -> str:
     return head + re.sub(r"\bgarment\b", "product", prompt)
 
 
-def _object_isnet(data: bytes, ocfg: dict[str, Any]) -> tuple[bytes | None, str | None]:
-    """The shoe / bag cut-out (object_cutout.cutout). Never raises."""
+def _object_isnet(data: bytes, ocfg: dict[str, Any],
+                  single: bool = False) -> tuple[bytes | None, str | None]:
+    """The whole-product cut-out (object_cutout.cutout). Never raises.
+
+    `single`: the product is ONE piece — a garment, cut this way on the escalation's
+    explicit ask. Shoes come in pairs and keep every large piece."""
     from PIL import Image
     import numpy as np
 
@@ -1944,7 +2359,8 @@ def _object_isnet(data: bytes, ocfg: dict[str, Any]) -> tuple[bytes | None, str 
         from app.imaging import object_cutout as oc
 
         rgb = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
-        alpha, rep = oc.cutout(rgb, oc.Config(model=str(ocfg.get("model") or "isnet-general-use")))
+        alpha, rep = oc.cutout(rgb, oc.Config(model=str(ocfg.get("model") or "isnet-general-use"),
+                                              single_piece=single))
     except Exception as exc:  # noqa: BLE001 — the next strategy runs
         return None, f"object cut-out failed ({exc.__class__.__name__}: {exc})"
     if rep.notes:
@@ -1955,7 +2371,7 @@ def _object_isnet(data: bytes, ocfg: dict[str, Any]) -> tuple[bytes | None, str 
     rgba = np.dstack([rgb, (np.clip(alpha, 0, 1) * 255).round().astype(np.uint8)])
     rgba[rgba[..., 3] == 0] = (255, 255, 255, 0)
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", compress_level=PNG_LEVEL)
     return buf.getvalue(), None
 
 
@@ -1981,6 +2397,91 @@ def hanger_route(origin: str | None, hcfg: dict[str, Any]) -> bool:
     the fine-tuned cloth-seg is trained to remove and IS-Net would keep."""
     return bool(hcfg.get("enabled") and origin
                 and str(origin).upper() in {str(o).upper() for o in hcfg.get("origins") or []})
+
+
+def _kept_stand(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
+    """Did a TOP's cut-out keep the mannequin's stand? (kept, why)
+
+    MID-000442's FRONT and MID-000445's BACK (7 Oct 2026): photos the catalogue calls WEB
+    but taken in the booth — mannequin, pole, podium. Gemini's answer and then IS-Net's
+    kept all of it, the backdrop checks passed (the podium is grey cloth, not the curtain's
+    colour) and the stand went to the listing. A top ends at its hem; a cut-out of one
+    that reaches the photograph's FOOT across more than `stand_bottom_max` of its width is
+    standing on something. The bottom `stand_band` of the frame is read, so a podium the
+    frame cuts one row short still counts. Never raises; (False, "") when unreadable."""
+    import numpy as np
+    from PIL import Image
+
+    cfg = cfg if cfg is not None else config()
+    try:
+        a = np.asarray(Image.open(io.BytesIO(png)).convert("RGBA").getchannel("A"))
+    except Exception:  # noqa: BLE001
+        return False, ""
+    h, w = a.shape
+    band = max(2, int(round(float(cfg.get("stand_band") or 0.005) * h)))
+    reach = float(((a[h - band:] >= 128).any(axis=0)).mean())
+    limit = float(cfg.get("stand_bottom_max") or 0.03)
+    if reach > limit:
+        return True, (f"kept the stand: the cut-out runs off the foot of the photograph across "
+                      f"{reach:.0%} of its width (a top ends at its hem; at most {limit:.0%} may "
+                      f"touch it) — the mannequin's pole and podium were left in")
+    return False, ""
+
+
+def _drop_stray_pieces(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bytes, int]:
+    """A garment cut-out's DETACHED pieces, dropped: (png, how many went).
+
+    MID-000053's FRONT (6 Oct 2026): Gemini's keyed answer left a corner of the studio
+    screen opaque at the frame's foot — dark, so no backdrop-COLOUR check ever saw it —
+    and a fragment floated beside the tank top on the live listing. A garment is one
+    piece, but crushing every cut-out to one piece would eat a set's second garment, so
+    only a piece that is both SMALL beside the main one (under `stray_max_frac` of its
+    area) and CLEAR of it (bounding-box gap over `stray_gap_frac` of its long side)
+    goes: a bikini half is large, a detached button or a fringe thread sits close.
+    Never raises; (png, 0) means unchanged."""
+    import numpy as np
+    from PIL import Image
+
+    cfg = cfg if cfg is not None else config()
+    try:
+        import cv2
+
+        im = Image.open(io.BytesIO(png)).convert("RGBA")
+        arr = np.asarray(im).copy()
+        hard = (arr[..., 3] >= 128).astype(np.uint8)
+        n, lbl, stats, _ = cv2.connectedComponentsWithStats(hard, connectivity=8)
+        if n <= 2:
+            return png, 0
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        main = int(np.argmax(areas)) + 1
+        lx0, ly0 = int(stats[main, cv2.CC_STAT_LEFT]), int(stats[main, cv2.CC_STAT_TOP])
+        lx1 = lx0 + int(stats[main, cv2.CC_STAT_WIDTH])
+        ly1 = ly0 + int(stats[main, cv2.CC_STAT_HEIGHT])
+        max_area = float(cfg.get("stray_max_frac") or 0.05) * float(stats[main, cv2.CC_STAT_AREA])
+        min_gap = max(12.0, float(cfg.get("stray_gap_frac") or 0.04) * max(lx1 - lx0, ly1 - ly0))
+        drop = []
+        for i in range(1, n):
+            if i == main or float(stats[i, cv2.CC_STAT_AREA]) >= max_area:
+                continue
+            x0, y0 = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+            x1, y1 = x0 + int(stats[i, cv2.CC_STAT_WIDTH]), y0 + int(stats[i, cv2.CC_STAT_HEIGHT])
+            if max(lx0 - x1, x0 - lx1, ly0 - y1, y0 - ly1, 0) > min_gap:
+                drop.append(i)
+        if not drop:
+            return png, 0
+        gone = np.isin(lbl, drop)
+        # Each dropped piece's soft rim goes with it; the garment is farther away
+        # than any rim by the gap rule above.
+        soft = (arr[..., 3] > 0) & (arr[..., 3] < 128)
+        if soft.any():
+            near = cv2.dilate(gone.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+            gone |= soft & near
+        arr[gone] = (255, 255, 255, 0)
+        buf = io.BytesIO()
+        Image.fromarray(arr, "RGBA").save(buf, format="PNG", compress_level=PNG_LEVEL)
+        return buf.getvalue(), len(drop)
+    except Exception:  # noqa: BLE001 — the candidate goes on uncleaned
+        return png, 0
 
 
 def _paint_fidelity(source: bytes, out: bytes, side: int = 512) -> tuple[float | None, float | None]:
@@ -2128,7 +2629,7 @@ def _hanger_isnet(data: bytes, hcfg: dict[str, Any],
     rgba = rgba.copy()
     rgba[rgba[..., 3] == 0] = (255, 255, 255, 0)
     buf = io.BytesIO()
-    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", optimize=True)
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG", compress_level=PNG_LEVEL)
     return buf.getvalue(), None
 # What a cut-out accepted because the two fine-tuned parsers AGREED is reported
 # as (see `agreement_min_iou`): still the primary's pixels, named apart so the
@@ -2228,6 +2729,14 @@ def remove_background(
     time — never a server killed with every request in it."""
     from app.imaging import ort_memory
 
+    if strategies and [str(s) for s in strategies] == [FRAME_ONLY]:
+        # NOTHING IS CUT (6 Oct 2026): the caller says the cut-out on file is right
+        # and only its framing is not. The endpoint crops and centres `previous`
+        # and hands it back as the replacement (main.EXISTING_FRAMED) — about two
+        # seconds, against a full chain per view that only re-made the same
+        # cut-out to frame it.
+        return None, ("frame-only: nothing was cut again — the cut-out on file is cropped "
+                      "and centred instead"), "none"
     cfg = config()
     cap = cfg.get("max_concurrent")
     cap = 2 if cap is None else int(cap)
@@ -2343,6 +2852,23 @@ def _remove_background(
     # The fine-tuned parse, made once: the hanger strategy compares against it and
     # the chain's own v2 turn reuses it.
     ft_memo: dict[str, Any] = {}
+    # WHITE TRIM AGAINST A WHITE WALL (7 Oct 2026, _finish_trim): an accepted parser
+    # cut-out of a wall photo gets back the collar band and cuffs the parser lost — never
+    # on the photobooth, where the same rule would bring back the white form under the
+    # hem, and only on a top (or a garment of unknown type): on bottoms hung from a clip
+    # hanger the wall between the bar and the waistband is a closed-in strip of the very
+    # kind the step looks for (MBF-000128).
+    ecfg_now = _cloth_edges_cfg()
+    on_wall = bool(ecfg_now.get("enabled")) and bool(origin) and str(origin).upper() in {
+        str(o).upper() for o in ecfg_now.get("trim_origins") or []}
+    from app.imaging import neckline as _neckline
+
+    is_top = not family and _neckline.applies_to(garment)
+    if on_wall and not family:
+        on_wall = is_top
+    # A top's cut-out must not reach the floor (see _kept_stand). Bottoms are left out: a
+    # pair of trousers hung on a wall can be framed to the photograph's foot.
+    stand_checked = is_top and bool(cfg.get("stand_check", True))
 
     def ft_once() -> tuple[bytes | None, str | None]:
         if "v2" not in ft_memo:
@@ -2354,8 +2880,8 @@ def _remove_background(
     openai_prompt = _product_prompt(OPENAI_PROMPT, family)
     chain = (
         # A SHOE OR A BAG: IS-Net, the whole product. Dropped from the chain below
-        # unless `family`.
-        (OBJECT, "direct", lambda: _object_isnet(data, ocfg)),
+        # unless `family` — or the caller asked for it by name (a garment, one piece).
+        (OBJECT, "direct", lambda: _object_isnet(data, ocfg, single=not family)),
         # A PHOTO HUNG ON THE WALL: IS-Net keeps the whole garment, clips and all,
         # and only the bar, hook and wire are painted out. Dropped from the chain
         # below unless `on_hanger`.
@@ -2413,8 +2939,19 @@ def _remove_background(
         # otherwise quietly run the default chain and produce the same stand
         # the caller asked a different segmenter for.
         return None, f"no background-removal strategy is named {', '.join(unknown)}", "none"
+    # THE OBJECT CUT ON REQUEST, whatever the product (6 Oct 2026). The family gate
+    # routes shoes and bags there by DEFAULT; a caller that names `object-isnet` and
+    # NO garment parser is asking for the whole-product cut deliberately — the
+    # escalation for a cut-out the parsers keep tearing (MID-000053's BACK: the dark
+    # layer seen through the racerback read as background; IS-Net cut it whole).
+    # A list that still names a parser (the policy default, `url_strategies`) keeps
+    # the gate: there the object cut is the shoes-and-bags route, nothing more.
+    # Judged by the garment checks, not the object checks, when the product is not
+    # a shoe or a bag.
+    object_asked = bool(wanted and OBJECT in wanted
+                        and not ({"cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg"} & wanted))
     chain = tuple(s for s in chain if (wanted is None or s[0] in wanted) and s[0] not in banned
-                  and (s[0] != HANGER or on_hanger) and (s[0] != OBJECT or family))
+                  and (s[0] != HANGER or on_hanger) and (s[0] != OBJECT or family or object_asked))
     if family:
         # THE OBJECT CHAIN: the object strategy, then `object.then` in that order —
         # whatever of them the caller allows. A caller that allowed none of them (an
@@ -2507,9 +3044,11 @@ def _remove_background(
     # be queued to try the same thing again.
     kept_existing: list[str] = []
 
-    for name, kind, fn in chain:
+    chain = list(chain)
+    for idx, (name, kind, fn) in enumerate(chain):
         for attempt in range(1, (paid_attempts if kind != "direct" else 1) + 1):
             label = f"{name}#{attempt}"
+            converted = False       # a paint answer turned into a mask on the original
             started = time.perf_counter()
             out, err = fn()
             took = time.perf_counter() - started
@@ -2517,6 +3056,19 @@ def _remove_background(
             if err or not out:
                 log.info("bg-removal %s FAILED in %.1fs: %s", label, took, err)
                 attempts.append(f"{label}: {err}")
+                if name == HANGER and "no hanger bar" in str(err or ""):
+                    # NO BAR, NO HUNG PHOTO (7 Oct 2026): the paid background removal
+                    # goes after the garment parsers, not before. The hanger route
+                    # sends WEB photos to Gemini next because v2 and v1 keep a bar and
+                    # its clips — but a WEB photo with no bar is a model, a web image,
+                    # a hanger inside the shirt (MID-000430), or the booth's mannequin
+                    # on its podium (MID-000442, MID-000445), which Gemini kept whole
+                    # and the fine-tuned parsers were trained to remove.
+                    # Every local cut first, then the paid ones in the order they had.
+                    rest = chain[idx + 1:]
+                    chain[idx + 1:] = ([s for s in rest if s[1] == "direct"]
+                                       + [s for s in rest if s[1] != "direct"])
+                    log.info("bg-removal: no hanger bar — the garment parsers before the paid methods")
                 continue
 
             if kind == "direct":
@@ -2574,6 +3126,17 @@ def _remove_background(
                 else:
                     log.info("bg-removal %s left unrefined: %s", label, rinfo.get("why"))
 
+            # A DETACHED PIECE CLEAR OF THE GARMENT IS NOT THE GARMENT (6 Oct 2026,
+            # `_drop_stray_pieces`): the backdrop checks ask about the backdrop's
+            # COLOUR, so a dark corner of the studio screen passed them all and
+            # floated beside MID-000053's tank top on the live listing. The object
+            # route keeps its own piece rules (a pair of shoes is two pieces).
+            if not family:
+                out, strays = _drop_stray_pieces(out, cfg)
+                if strays:
+                    log.info("bg-removal %s: dropped %d stray piece(s) clear of the garment",
+                             label, strays)
+
             # Only the paint path can reframe; the mask path preserves the
             # source dimensions by construction, so there is nothing to check.
             if kind == "paint":
@@ -2595,6 +3158,18 @@ def _remove_background(
                     log.info("bg-removal %s %s in %.1fs", label, why, took)
                     attempts.append(f"{label}: {why}")
                     continue
+                # THE PHOTOGRAPH'S PIXELS AT THE PHOTOGRAPH'S SIZE (7 Oct 2026,
+                # see _paint_as_mask): the paint's silhouette on the original,
+                # never the model's ~1 MP render stored as the product's picture.
+                if cfg.get("paint_keep_resolution", True):
+                    full, conv_err = _paint_as_mask(data, out)
+                    if full is not None:
+                        out = full
+                        converted = True
+                        log.info("bg-removal %s: the painted silhouette was applied to the "
+                                 "photograph's own pixels at full size", label)
+                    else:
+                        log.info("bg-removal %s kept the painted pixels (%s)", label, conv_err)
 
             ok, why = _is_cutout(out)
             if not ok:
@@ -2617,6 +3192,14 @@ def _remove_background(
                     attempts.append(f"{label}: {obj_why}")
                     continue
                 why = f"{why}; {obj_why}"
+
+            # A TOP THAT REACHES THE FLOOR KEPT ITS STAND (7 Oct 2026, _kept_stand).
+            if not family and stand_checked:
+                stood, stand_why = _kept_stand(out, cfg)
+                if stood:
+                    log.info("bg-removal %s kept the stand in %.1fs: %s", label, took, stand_why)
+                    attempts.append(f"{label}: {stand_why}")
+                    continue
 
             # The border says something was removed; this says whether what
             # remains is only the product. See _kept_backdrop.
@@ -2654,10 +3237,20 @@ def _remove_background(
 
             log.info("bg-removal %s produced a cut-out in %.1fs (%d KB, %s)",
                      label, took, len(out) // 1024, why)
+            # THE NECK OPENING, FINISHED (app/imaging/neckline.py) — after every
+            # check, which judged the segmenter's own answer: the booth's form put
+            # back inside the collar, the hanger and studio fragments cleared out
+            # of a hung top's. On the photograph's canvas only.
+            if not family and (kind != "paint" or converted):
+                if on_wall and kind == "direct":
+                    out = _finish_trim(data, out, name, label)
+                out = _finish_neck(data, out, origin, garment, label)
             _done(out, name)
             # The photograph's own pixels carry its colour profile; a painted
-            # answer is the model's picture, in the model's colours.
-            if kind != "paint":
+            # answer is the model's picture, in the model's colours — unless its
+            # silhouette was applied to the original (`converted`), which makes
+            # the pixels the photograph's again.
+            if kind != "paint" or converted:
                 out = _png_with_icc(out, _icc_of(data))
             return out, None, name
 
@@ -2667,6 +3260,10 @@ def _remove_background(
             out, why = agreed_cut()
             if out is not None:
                 log.info("bg-removal %s: accepted despite the leftover check (%s)", AGREED, why)
+                if not family:
+                    if on_wall:
+                        out = _finish_trim(data, out, "cloth-seg-ft", AGREED)
+                    out = _finish_neck(data, out, origin, garment, AGREED)
                 _done(out, "cloth-seg-ft")
                 return _png_with_icc(out, _icc_of(data)), None, AGREED
             # BOTH MADE A GOOD CUT-OUT AND BOTH LOST ONLY TO THE ONE ON FILE.

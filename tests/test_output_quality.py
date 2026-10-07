@@ -60,11 +60,20 @@ def test_the_chain_carries_the_photos_profile_on_its_own_pixels_only(monkeypatch
     assert provider == "cloth-seg-ft"
     assert Image.open(io.BytesIO(out)).info.get("icc_profile") == P3
 
-    # A painted answer is the model's picture, in the model's colours: no profile added.
+    # A painted answer's SILHOUETTE is applied to the photograph's own pixels
+    # (7 Oct 2026, _paint_as_mask), which makes the pixels the photograph's again —
+    # so the profile comes with them.
     monkeypatch.setattr(cutout, "_cloth_seg_ft", lambda data: (None, "x"))
     monkeypatch.setattr(cutout, "_gemini", lambda data, t, prompt=None: (cut_png(), None))
     monkeypatch.setattr(cutout, "_same_framing", lambda s, o: (True, "same"))
     monkeypatch.setattr(cutout, "_paint_fidelity", lambda s, o: (1.0, 1.0))
+    out, err, provider = cutout.remove_background(src, strategies=["cloth-seg-ft", "gemini-paint"])
+    assert provider == "gemini-paint"
+    assert Image.open(io.BytesIO(out)).info.get("icc_profile") == P3
+
+    # ... and only a paint that could NOT be converted keeps the model's colours,
+    # with no profile pretended onto them.
+    monkeypatch.setattr(cutout, "_paint_as_mask", lambda s, o: (None, "no alpha"))
     out, err, provider = cutout.remove_background(src, strategies=["cloth-seg-ft", "gemini-paint"])
     assert provider == "gemini-paint"
     assert Image.open(io.BytesIO(out)).info.get("icc_profile") is None
