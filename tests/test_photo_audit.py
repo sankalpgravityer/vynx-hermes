@@ -457,6 +457,56 @@ def test_the_model_s_own_words_are_not_repeated_by_the_measurement():
     assert v.reasons == ["RENDER DEFECT — AI_FRONT_34 render: garment colour wrong; the body is not whole"]
 
 
+# GENERATION ARTEFACTS (8 Oct 2026). MID-000805's AI_CLOSEUP passed with an
+# orange-and-black half-object in the bottom-left corner and the shirt washing
+# out into a grey haze before the bottom edge: `scene` asks about a studio and
+# `body_flaw` reads the edge as a crop, so neither saw it. Measured on its own
+# scale; only `clear` is a defect.
+
+def _raw_art(level, what="", on=(7,), ok=True):
+    raw = _raw_scene(on=on, ok=ok)
+    for e in raw["images"]:
+        e["artefacts"], e["artefact"] = "none", ""
+        if e["index"] in on:
+            e["artefacts"], e["artefact"] = level, what
+    return raw
+
+
+def test_mid_000805_a_fragment_in_the_corner_is_a_render_defect_of_that_view():
+    v = _decide(_raw_art("clear", "orange object in bottom-left corner"), media=MEDIA_FIVE)
+    assert v.action == "regen" and v.code == "RENDER_DEFECT"
+    assert v.reasons == ["RENDER DEFECT — AI_CLOSEUP render: orange object in bottom-left corner"]
+    assert v.bad_views == ["AI_CLOSEUP"] and pa.regen_views(v, POL) == ["AI_CLOSEUP"]
+
+
+def test_an_artefact_with_no_words_still_says_what_kind_of_defect():
+    v = _decide(_raw_art("clear"), media=MEDIA_FIVE)
+    assert v.reasons == ["RENDER DEFECT — AI_CLOSEUP render: generation artefacts in the picture"]
+
+
+def test_a_slight_artefact_is_recorded_and_nothing_follows():
+    v = _decide(_raw_art("slight", "faint speck on backdrop"), media=MEDIA_FIVE)
+    assert v.action == "ok" and v.bad_views == [] and v.soft == []
+
+
+def test_artefacts_are_not_asked_of_a_garment_photograph():
+    v = _decide(_raw_art("clear", "smear", on=(1, 2)), media=MEDIA_FIVE)
+    assert v.action == "ok" and v.bad_cutouts == [] and v.bad_views == []
+
+
+def test_the_issue_line_and_the_artefact_are_one_sentence_not_two():
+    raw = _raw_art("clear", "bottom fades into grey haze", ok=False)
+    raw["images"][6]["issue"] = "bottom fades into grey haze"
+    v = _decide(raw, media=MEDIA_FIVE)
+    assert v.reasons == ["RENDER DEFECT — AI_CLOSEUP render: bottom fades into grey haze"]
+
+
+def test_an_answer_cached_before_the_artefacts_question_is_judged_as_it_was():
+    raw = _raw_scene()
+    assert all("artefacts" not in e for e in raw["images"])
+    assert _decide(raw, media=MEDIA_FIVE).action == "ok"
+
+
 # FRAMING, per view (21 Sep 2026). The user's standard, which is also what
 # nanobanana.py already asks the renderer for: AI_FRONT and AI_BACK show the
 # whole figure; the three-quarter views are knee-up, so a cut THROUGH the lower

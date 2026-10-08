@@ -322,8 +322,10 @@ def _activate_shopify_draft(row: dict[str, Any], *, apply: bool) -> dict[str, An
                 "reason": "this vnyx-api has no `golive` step yet — deploy vnyx-api"}
     args = ["--product", str(row["productId"]), *(["--apply"] if apply else [])]
     try:
+        # 300 s: vnyx-api waits out Shopify's product lock (up to ~2 min) when the
+        # sync step's push is still writing the same product (MID-000805).
         ok, out, results = rp.run_step(_vnyx_api_dir(), _GOLIVE_SCRIPT, args,
-                                       timeout_s=120, quiet=True,
+                                       timeout_s=300, quiet=True,
                                        results_name="golive.json")
     except Exception as exc:  # noqa: BLE001 — a failed go-live must not fail the verdict
         return {"outcome": "failed", "reason": f"{type(exc).__name__}: {exc}"[:300]}
