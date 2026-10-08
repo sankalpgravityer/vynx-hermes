@@ -295,6 +295,44 @@ def _archive(row: dict[str, Any], reason: str) -> bool:
     return bool(ok)
 
 
+_GOLIVE_SCRIPT = "activate-shopify-draft.ts"
+
+
+def golive_wanted(rs: cfgmod.RunSettings, verdict: Verdict) -> bool:
+    """Should this product's Shopify DRAFT be made live? (The Brain's
+    `activateShopifyDrafts`, 8 Oct 2026.)
+
+    Only a product the agent found ALREADY APPROVED and passing every check —
+    never one it just approved (`publishActiveOnApprove` decides those), never
+    one it held or failed. Whether it really is a draft on Shopify, Active here
+    and in the Approved stage is vnyx-api's to check (activate-draft.ts), from
+    Shopify's own answer.
+    """
+    return rs.activate_drafts and verdict.status == "VERIFIED" and verdict.outcome == "ALREADY_APPROVED"
+
+
+def _activate_shopify_draft(row: dict[str, Any], *, apply: bool) -> dict[str, Any]:
+    """Run vnyx-api's `golive` step. Never raises: returns its verdict dict
+    (outcome activated | would_activate | skipped | failed, and a reason)."""
+    import importlib
+
+    rp = importlib.import_module("scripts.repair_product")
+    if not rp.remote_has_step(_GOLIVE_SCRIPT):
+        return {"outcome": "skipped",
+                "reason": "this vnyx-api has no `golive` step yet — deploy vnyx-api"}
+    args = ["--product", str(row["productId"]), *(["--apply"] if apply else [])]
+    try:
+        ok, out, results = rp.run_step(_vnyx_api_dir(), _GOLIVE_SCRIPT, args,
+                                       timeout_s=120, quiet=True,
+                                       results_name="golive.json")
+    except Exception as exc:  # noqa: BLE001 — a failed go-live must not fail the verdict
+        return {"outcome": "failed", "reason": f"{type(exc).__name__}: {exc}"[:300]}
+    if isinstance(results, dict) and results.get("outcome"):
+        return results
+    last = next((ln for ln in reversed((out or "").splitlines()) if ln.strip()), "")
+    return {"outcome": "skipped" if ok else "failed", "reason": last[:300] or "no answer"}
+
+
 def _has_care_label(product_id: str) -> bool:
     r = db.fetch_one(
         """
@@ -777,6 +815,29 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
             )
             return abort
 
+    # MAKE A SHOPIFY DRAFT LIVE (the Brain's `activateShopifyDrafts`, 8 Oct 2026).
+    # An approved product that passed everything, Active here and still a Draft
+    # on Shopify, is set Active there — draft → active and nothing else; vnyx-api
+    # reads Shopify's status first. LIVE writes it; any other pass only asks
+    # Shopify and says what it would do. The verdict is not changed either way.
+    golive: dict[str, Any] | None = None
+    if golive_wanted(rs, verdict):
+        golive = _activate_shopify_draft(row, apply=approve)
+        outcome = str(golive.get("outcome") or "")
+        tag = {"activated": "pass", "failed": "warn"}.get(outcome, "check")
+        said = {"activated": "Shopify Draft → Active",
+                "would_activate": "Shopify Draft — would be made Active (not LIVE)",
+                "failed": "Shopify draft NOT made live"}.get(outcome, "Shopify status left alone")
+        events.emit(tenant_id, tag,
+                    f"{row['productSku']} — {said}: {golive.get('reason') or ''}".rstrip(": "),
+                    run_id=row["runId"], run_product_id=row["id"],
+                    product_id=product_id, detail=golive)
+    elif rs.activate_drafts and section == "APPROVED" and verdict.status != "VERIFIED":
+        events.emit(tenant_id, "check",
+                    f"{row['productSku']} — not made live on Shopify: it did not pass every check",
+                    run_id=row["runId"], run_product_id=row["id"],
+                    product_id=product_id)
+
     _finish(
         row,
         verdict,
@@ -795,6 +856,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
             "order": result.get("order"),
             "copy": result.get("copy"),
             "generation": gen or None,
+            "shopifyGoLive": golive,
         },
         duration_ms=duration,
         expect_status=expect_status,

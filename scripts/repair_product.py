@@ -239,6 +239,9 @@ STEP_FOR_SCRIPT = {
     "rebuild-media-cache.ts": "reorder",
     "approve-products.ts": "approve",
     "resync-listings.ts": "resync",
+    # The Brain's `activateShopifyDrafts` (8 Oct 2026): a Shopify draft of an
+    # approved, passing product made Active. Called by the runner, not the chain.
+    "activate-shopify-draft.ts": "golive",
 }
 
 
@@ -274,6 +277,8 @@ _REMOTE_OPTIONS: set[str] | None = None
 # Whether the step runner can run a step in the background and be polled (the
 # ping's `asyncSteps`). None = not asked; False = asked, and it cannot.
 _REMOTE_ASYNC: bool | None = None
+# The step names it runs (the ping's `steps`); empty = it did not say.
+_REMOTE_STEPS: set[str] = set()
 
 
 def remote_options() -> set[str]:
@@ -298,7 +303,7 @@ def remote_options() -> set[str]:
     Never raises: a ping that fails answers "nothing", which is the same
     conservative branch as an old server.
     """
-    global _REMOTE_OPTIONS, _REMOTE_ASYNC
+    global _REMOTE_OPTIONS, _REMOTE_ASYNC, _REMOTE_STEPS
     if _REMOTE_OPTIONS is not None:
         return _REMOTE_OPTIONS
 
@@ -324,6 +329,7 @@ def remote_options() -> set[str]:
         body = r.json() if r.status_code == 200 else {}
         _REMOTE_OPTIONS = {str(o) for o in (body.get("options") or [])}
         _REMOTE_ASYNC = body.get("asyncSteps") is True
+        _REMOTE_STEPS = {str(s) for s in (body.get("steps") or [])}
     except Exception:  # noqa: BLE001 — a probe that cannot run is not a failure
         _REMOTE_OPTIONS = set()
         _REMOTE_ASYNC = False
@@ -360,6 +366,19 @@ def remote_supports(*options: str) -> bool:
     if not known or _LOCAL_TRANSPORT in known:
         return True
     return all(o in known for o in options)
+
+
+def remote_has_step(script: str) -> bool:
+    """May this script's step be sent? `remote_supports`, for a whole step.
+
+    The same rule: False only when the server answered the ping, listed its
+    steps, and this one was not among them — an older vnyx-api would answer the
+    step itself with a 400.
+    """
+    known = remote_options()
+    if not known or _LOCAL_TRANSPORT in known or not _REMOTE_STEPS:
+        return True
+    return STEP_FOR_SCRIPT.get(script, "") in _REMOTE_STEPS
 
 
 def run_remote(script: str, args: list[str], *, timeout_s: int,
