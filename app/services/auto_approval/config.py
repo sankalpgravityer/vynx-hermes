@@ -44,6 +44,10 @@ class RunSettings:
     # Shopify reports. Off — the default — sends them as a draft, status Draft.
     publish_active: bool = False
     sync_changes: bool = False
+    # The Brain's `activateShopifyDrafts` (8 Oct 2026): an already-approved
+    # product that passes, Active in vnyx and a DRAFT on Shopify, is made Active
+    # there (vnyx-api step `golive`). Only draft → active; LIVE mode only.
+    activate_drafts: bool = False
 
     @property
     def apply(self) -> bool:
@@ -118,6 +122,7 @@ def settings_from_snapshot(snapshot: Any, fallback_max_attempts: int = 3) -> Run
         publish_on_approve=bool(chain.get("publishOnApprove", True)),
         publish_active=bool(chain.get("publishActive", False)),
         sync_changes=bool(chain.get("syncChanges", False)),
+        activate_drafts=bool(chain.get("activateDrafts", False)),
     )
 
 
