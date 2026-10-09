@@ -458,7 +458,8 @@ def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
     # cannot express this product's size, whatever the guide is called.
     finding = next(
         (f for f in findings
-         if f.rule_id in ("SIZE.014", "SIZE.013", "SIZE.011", "SIZE.012")), None
+         if f.rule_id in ("SIZE.014", "SIZE.013", "SIZE.011", "SIZE.012",
+                          "SIZE.015")), None
     )
     if finding is None:
         return
@@ -512,7 +513,8 @@ def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
 
 
 def _plan_master(p: ProductSnapshot, pol: dict[str, Any],
-                 plan: list[dict[str, Any]]) -> str | None:
+                 plan: list[dict[str, Any]],
+                 render_gender: str | None = None) -> str | None:
     """Settle the master category — the anchor every other field hangs off.
 
     Readiness phase 1 (docs/READINESS-PLAN.md §4 step 1). Runs FIRST, and the
@@ -527,7 +529,7 @@ def _plan_master(p: ProductSnapshot, pol: dict[str, Any],
     escalated under MASTER_CATEGORY_UNRESOLVED; nothing downstream can be
     settled until a person names the root, and the outcome says so by name.
     """
-    decision = readiness.decide_master(p, pol)
+    decision = readiness.decide_master(p, pol, render_gender=render_gender)
     action = decision["action"]
     if action in ("keep", "skip"):
         return None
@@ -1387,6 +1389,13 @@ def _plan_escalations(findings: list[Finding],
                 "kind": "escalate", "field": (f.fields or [None])[0],
                 "reason": "DATA.010", "detail": f.message,
             })
+        elif f.rule_id == "DATA.011" and "brand" not in planned:
+            # A brand that says "no brand" (8 Oct 2026): a person adds the real
+            # one or confirms the garment is unbranded. Nothing here invents one.
+            plan.append({
+                "kind": "escalate", "field": "brand",
+                "reason": "DATA.011", "detail": f.message,
+            })
 
 
 # --------------------------------------------------------------------------- #
@@ -1441,11 +1450,69 @@ def _field_issues(findings: list[Finding],
     return out
 
 
+def _garment_words(text: Any) -> set[str]:
+    return {readiness._singular(w) for w in re.split(r"[^a-z0-9]+", str(text or "").lower())
+            if w and len(w) > 1}
+
+
+def _plan_render_garment(p: ProductSnapshot, garment: str | None,
+                         plan: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """File the product where the image gate's garment belongs (8 Oct 2026, the user).
+
+    CATEGORY_IMAGE_MISMATCH used to be a person's call: the render shows a tank
+    top, the record says Dress, and either could be wrong. The user's rule is
+    that the image gate decides — MID-000615 (Women > T-Shirts & Tops > "Dress")
+    and MID-000803 (Women > Dresses > Casual Dress) both render as tank tops.
+
+    The garment is matched WORD BY WORD to the subcategories under the product's
+    own master: every word the same ("Tank Top") beats a subcategory naming all
+    of the garment and more ("Casual Dress" for "dress"), which beats one whose
+    words the garment contains ("Tops" for "tank top" — Midtex's women's tree
+    has no Tank Top). A tie is broken by the tenant's own order in the tree.
+    Nothing matching under this master plans nothing, and the hold stands.
+    """
+    if not garment or not p.catalog or not p.master_category:
+        return None
+    branch = (p.catalog.categories or {}).get(p.master_category) or {}
+    want = _garment_words(garment)
+    if not want:
+        return None
+    best: tuple[int, int] | None = None
+    pick: tuple[str, str] | None = None
+    order = 0
+    for category, subs in branch.items():
+        for sub in subs or []:
+            order += 1
+            have = _garment_words(sub)
+            if not have:
+                continue
+            score = 3 if have == want else 2 if want <= have else 1 if have <= want else 0
+            if score and (best is None or score > best[0]):
+                best, pick = (score, order), (category, sub)
+    if pick is None:
+        return None
+    if (readiness._singular(p.category or "") == readiness._singular(pick[0])
+            and readiness._singular(p.subcategory or "") == readiness._singular(pick[1])):
+        return None
+    for field, value, was in (("category", pick[0], p.category),
+                              ("subCategory", pick[1], p.subcategory)):
+        if readiness._singular(was or "") != readiness._singular(value):
+            plan.append({
+                "kind": "set_column", "field": field, "value": value,
+                "reason": "CATEGORY_IMAGE_MISMATCH", "basis": "render",
+                "detail": (f"the image gate sees {garment!r}; filed under "
+                           f"'{p.master_category} > {pick[0]} > {pick[1]}'"
+                           + (f" (was '{was}')" if was else "")),
+            })
+    return pick
+
+
 def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
              imagery_settings: dict[str, Any] | None = None,
              llm: Any | None = None,
              split_on_both_genders: bool = False,
              severity_overrides: dict[str, str] | None = None,
+             hints: dict[str, Any] | None = None,
              ) -> dict[str, Any]:
     """Verify one product and compute the repair for everything blocking it.
 
@@ -1456,9 +1523,16 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
     `RULE:field` — see apply_severity_overrides. Threaded down to every
     `_all_findings` call rather than applied once here, so the three passes
     cannot disagree about the same finding.
+
+    `hints` is what the image gate saw on the lead render, sent by the repair
+    chain (8 Oct 2026): `render_gender` settles a gender/master conflict
+    (readiness.decide_master) and `render_garment` re-files a product the
+    gate found under the wrong garment (`_plan_render_garment`). Absent, the
+    gate plans exactly as before.
     """
     started = time.perf_counter()
     pol = policy()
+    hints = hints or {}
 
     p = to_snapshot(raw, catalog=catalog, imagery_settings=imagery_settings)
     findings = _all_findings(
@@ -1482,6 +1556,15 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
     reported = list(findings)
 
     plan: list[dict[str, Any]] = []
+    # THE IMAGE GATE'S GARMENT, FIRST: it decides the branch and the leaf, and
+    # everything below plans against where the product is about to be filed.
+    refiled = _plan_render_garment(p, hints.get("render_garment"), plan)
+    if refiled:
+        p = p.model_copy(update={"category": refiled[0], "subcategory": refiled[1]})
+        findings = _all_findings(
+            p, pol, split_on_both_genders=split_on_both_genders,
+            severity_overrides=severity_overrides,
+        )
     # Built whenever ANY finding fired, not only a blocking one.
     #
     # `if blocking:` was wrong and hid a whole class of repair. SIZE.012 (on a
@@ -1497,7 +1580,7 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
         # so it is settled before any of them run, and the rules are re-run on
         # a shadow carrying the new master so they plan against the product as
         # it is about to be, not as it was.
-        anchored = _plan_master(p, pol, plan)
+        anchored = _plan_master(p, pol, plan, render_gender=hints.get("render_gender"))
         if anchored:
             p = p.model_copy(update={"master_category": anchored})
             findings = _all_findings(
@@ -1606,8 +1689,18 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
         #
         # Only the taxonomy planner runs here. It is the one that reads the
         # pictures rather than the findings, so it is the only one with anything
-        # to say when there are none.
-        _plan_fields(p, pol, [], llm, plan)
+        # to say when there are none — unless the image gate already re-filed it
+        # (`render_garment`), which is the answer the user chose for this case.
+        if not refiled:
+            _plan_fields(p, pol, [], llm, plan)
+
+    if refiled:
+        # The gate's garment wins over any other category the planners reached
+        # (the photo taxonomy pick, TAX.002's branch): one answer, not two.
+        plan[:] = [a for a in plan
+                   if not (a.get("field") in ("category", "subCategory")
+                           and a.get("kind") == "set_column"
+                           and a.get("basis") != "render")]
 
     writes = sum(1 for a in plan if a["kind"] in
                  ("set_column", "set_property", "create_size_chart",

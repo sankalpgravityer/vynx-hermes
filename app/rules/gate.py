@@ -163,6 +163,38 @@ _LABELS = {
 }
 
 
+_NO_BRAND_DEFAULT = {
+    "equals": ["boas", "brand", "unknown", "none", "na", "null", "tbd"],
+    "contains": ["nobrand"],
+}
+
+
+def _letters(value: Any) -> str:
+    return "".join(ch for ch in str(value).lower() if ch.isalpha())
+
+
+def no_brand_values(p: ProductSnapshot, pol: dict[str, Any] | None) -> list[str]:
+    """The stored brand values that say there is no brand (DATA.011), each once.
+
+    Read on the brand FIELD and the brand RECORD: either one saying "no brand"
+    is enough, because a person has to look either way. Matched on letters only
+    (`completeness.no_brand`): "MT NO BRAND", "Mt Nobrand" and "mk no-brand" are
+    all `contains: nobrand`; "BOAS", "Brand" and "Unknown" are `equals`. An
+    empty value is not this rule's — that is DATA.010.
+    """
+    cfg = ((pol or {}).get("completeness") or {}).get("no_brand") or _NO_BRAND_DEFAULT
+    equals = {_letters(v) for v in cfg.get("equals") or []}
+    contains = [_letters(v) for v in cfg.get("contains") or [] if _letters(v)]
+    out: list[str] = []
+    for value in (p.brand, p.brand_relation):
+        if _absent(value):
+            continue
+        n = _letters(value)
+        if (n in equals or any(c in n for c in contains)) and str(value).strip() not in out:
+            out.append(str(value).strip())
+    return out
+
+
 def _absent(value: Any) -> bool:
     """Nothing there at all.
 
@@ -606,6 +638,28 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
             needs_evidence=True,
         ))
 
+    # ---- DATA.011: the brand says there is no brand -------------------------
+    #
+    # 8 Oct 2026: 36 approved Midtex products were VERIFIED with brands like
+    # "MT NO BRAND", "NOBRAND", "MK No Brand" — a value is THERE, so DATA.010 is
+    # silent, the value is in the tenant's brand list, so ATTR.001 is too, and
+    # DATA.001's placeholder finding is MEDIUM, below the gate. A product whose
+    # brand says "no brand" has no brand, and a person decides what it is.
+    # Nothing repairs it: the label was already read for the brand, and an
+    # invented brand is worse than a held product.
+    said = no_brand_values(p, pol)
+    if said:
+        out.append(Finding(
+            rule_id="DATA.011", severity=Severity.HIGH, fields=["brand"],
+            message=(
+                "Brand is missing — stored as "
+                + " / ".join(f'"{v}"' for v in said)
+                + ", which says there is no brand. A person adds the real brand "
+                  "or confirms the garment is unbranded."
+            ),
+            detail={"values": said},
+        ))
+
     # ---- GENDER.001: gender is still undecided ------------------------------
     #
     # WHO OWNS THIS depends on one tenant setting, and the difference matters.
@@ -841,6 +895,24 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
                 "seed": seed,
             },
         ))
+
+    # ---- SIZE.015: the chart that covers it is not attached -----------------
+    #
+    # 8 Oct 2026, MID-000586: no sizing guide on the product at all, so the
+    # approval pre-flight refused it ("no sizing guide; no size chart on the
+    # product") — while SIZE.010 stayed silent, because a tenant chart (Men
+    # Uppers) DOES cover it. Covered and attached are different facts. When
+    # exactly one chart resolves, attaching it is a lookup: the guide-switch
+    # planner writes the name, vnyx-api resolves the id and syncs the size-chart
+    # image into the gallery, and both pre-flight problems clear.
+    if p.catalog is not None and _absent(p.sizing_guide):
+        covering = resolve_guide(p, pol)
+        if covering:
+            out.append(Finding(
+                rule_id="SIZE.015", severity=Severity.HIGH, fields=["sizing_guide"],
+                message=f"No sizing guide is attached; '{covering}' covers this product.",
+                detail={"suggested": [covering]},
+            ))
 
     out.extend(check_column_drift(p))
     return out

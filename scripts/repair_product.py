@@ -490,6 +490,12 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
     # --include-synced); without it only failed pushes are re-driven.
     if "--include-synced" in args:
         options["includeSynced"] = True
+    # The reconcile step's image-gate hints (8 Oct 2026): the lead render's model
+    # and the garment it shows. Sent only to a deployment whose /ping lists them.
+    if "--render-gender" in args:
+        options["renderGender"] = args[args.index("--render-gender") + 1]
+    if "--render-garment" in args:
+        options["renderGarment"] = args[args.index("--render-garment") + 1]
     if "--shots" in args:
         options["shots"] = [s.strip().lower()
                             for s in args[args.index("--shots") + 1].split(",") if s.strip()]
@@ -1909,10 +1915,47 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # A DRY RUN STILL RUNS IT, without --apply: the script reports the plan and
     # writes nothing, which is what makes `repair_product.py` without --apply
     # still a useful preview.
-    def _reconcile() -> str:
+    def _render_gender_hint() -> str | None:
+        """The lead render's model, when the product's gender and master disagree.
+
+        8 Oct 2026, the user: a gender/master conflict (TAX.004) is settled by the
+        on-model render — master and gender go to the render's gender, and the
+        chart, rig and branch follow (readiness.decide_master). Read HERE, before
+        reconcile, because reconcile would otherwise bring the gender to the
+        master and the conflict would be gone by the time the gate looks. One
+        look at the lead render, only for a product that has the conflict.
+        """
+        from app import approval
+        from app.imaging import quality_gate
+
+        if not remote_supports("renderGender"):
+            return None
+        fresh = needs(dsn, product_id)["loaded"]
+        gate = approval.run_gate({**fresh["record"], "media": fresh["media"]},
+                                 catalog=fresh.get("catalog"),
+                                 imagery_settings=fresh.get("imagery_settings"),
+                                 llm=None, severity_overrides=severity_overrides)
+        if not any(f.get("rule_id") == "TAX.004" for f in gate.get("blocking") or []):
+            return None
+        verdict = quality_gate.judge(
+            fresh["media"], gender=None,
+            category=fresh["record"].get("category"),
+            subcategory=fresh["record"].get("subCategory"), pol=policy())
+        seen = getattr(verdict, "gender_seen", None)
+        return seen if seen in ("men", "women") else None
+
+    def _reconcile(hints: dict[str, Any] | None = None) -> str:
+        if hints is None:
+            seen = _render_gender_hint()
+            hints = {"render_gender": seen} if seen else {}
         args = [*common]
         if apply:
             args.append("--apply")
+        if hints.get("render_gender"):
+            args += ["--render-gender", str(hints["render_gender"])]
+        if hints.get("render_garment"):
+            args += ["--render-garment",
+                     re.sub(r"[^A-Za-z_-]", "", str(hints["render_garment"]).replace(" ", "_"))[:60]]
         ok, _, payload = run_step(vnyx_api, "verify-and-repair.ts", args,
                                   timeout_s=600, quiet=quiet,
                                   results_name="verify.json")
@@ -1947,7 +1990,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             gate = approval.run_gate({**loaded["record"], "media": loaded["media"]},
                                      catalog=loaded.get("catalog"),
                                      imagery_settings=loaded.get("imagery_settings"),
-                                     llm=None, severity_overrides=severity_overrides)
+                                     llm=None, severity_overrides=severity_overrides,
+                                     hints=hints)
             would = [f'{a.get("field")}={a.get("value")!r} ({a.get("reason")})'
                      for a in gate["repair_plan"]
                      if a["kind"] in ("set_column", "set_property")]
@@ -1960,6 +2004,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 parts.append("a person decides " + ", ".join(held))
             if parts:
                 note = "; ".join(parts)
+        if hints.get("render_gender"):
+            note = f'render model is {hints["render_gender"]} — ' + note
         return note
 
     step("reconcile", "", _reconcile)
@@ -2075,7 +2121,24 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         note = (f'{state["renders_missing"]} of {state.get("renders_expected")} from '
                 f'{state["sequence"]} ({", ".join(state.get("missing_shots") or [])})'
                 if by_seq else f'{state["renders_missing"]} view(s)')
-        if render_report["failed"]:
+        # ONE MORE ATTEMPT AT WHAT CAME BACK EMPTY (8 Oct 2026, MID-000208: the
+        # full front came back with nothing, the product held as MISSING_RENDER
+        # for a person to press Regenerate). The render makes only what is still
+        # missing, so this pays for the failed shots alone. Not when the image
+        # model DECLINED the print — that answer does not change on a re-ask.
+        if apply and render_report["failed"] and not render_report["refused"]:
+            first_failed = list(render_report["failed"])
+            render_report["failed"] = []
+            ok2, out2, _ = run_step(vnyx_api, "backfill-imagery.ts",
+                                    [*common, *live, *(["--sequence"] if by_seq else [])],
+                                    timeout_s=1800, quiet=quiet)
+            _read_render(out2, render_report)
+            note += (f' — {", ".join(first_failed)} failed once; second attempt '
+                     + ("made it" if ok2 and not render_report["failed"]
+                        else f'still could not produce {", ".join(render_report["failed"] or first_failed)}'))
+            if not render_report["failed"] and not ok2:
+                render_report["failed"] = first_failed
+        elif render_report["failed"]:
             note += f' — could not produce {", ".join(render_report["failed"])}'
             if render_report["refused"]:
                 note += " (the image model declined the print)"
@@ -2183,6 +2246,34 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     else:
         gate_why = ""
     step("gate", gate_why, _gate)
+
+    # ---- 4b'. refile ------------------------------------------------------
+    #
+    # THE IMAGE GATE DECIDES THE GARMENT (8 Oct 2026, the user). A render that
+    # shows another garment than the category says (CATEGORY_IMAGE_MISMATCH —
+    # MID-000615 and MID-000803 render as tank tops, filed as dresses) was a
+    # person's call. Now reconcile runs again with the garment the gate saw, the
+    # gate re-files the product under the tenant's matching subcategory, and the
+    # lead render is judged again against where it now sits. The copy step
+    # downstream rewrites the title and description for the new category.
+    def _refile() -> str:
+        nonlocal gate_verdict
+        garment = str((gate_verdict.raw or {}).get("garment") or "").strip()
+        note = _reconcile({"render_garment": garment})
+        if not apply:
+            return f"image gate sees {garment!r} — {note}"
+        gate_verdict = _judge_lead()
+        return f"image gate sees {garment!r} — {note}; gate again: {gate_verdict.summary()}"
+
+    if (gate_verdict is None or gate_verdict.code != "CATEGORY_IMAGE_MISMATCH"
+            or not str((gate_verdict.raw or {}).get("garment") or "").strip()):
+        refile_why = "the image gate agrees with the category"
+    elif not remote_supports("renderGarment"):
+        refile_why = ("this vnyx-api cannot take the gate's garment yet "
+                      "(no `renderGarment`); deploy vnyx-api")
+    else:
+        refile_why = ""
+    step("refile", refile_why, _refile)
 
     # ---- 4c. photos -------------------------------------------------------
     #

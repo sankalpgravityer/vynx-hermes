@@ -251,6 +251,10 @@ class ProductSnapshot(BaseModel):
     length_size: str | None = None
     fit: str | None = None
     brand: str | None = None
+    # The product's Brand RECORD (`brandId` → Brand.name), beside `brand`, which
+    # prefers the product's own field. The two can disagree (MID-000137: field
+    # "UNIQLO", record "NOBRAND"), and DATA.011 reads both.
+    brand_relation: str | None = None
     model: str | None = None
     color: str | None = None
     material: str | None = None

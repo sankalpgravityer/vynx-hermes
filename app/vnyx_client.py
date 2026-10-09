@@ -248,6 +248,7 @@ def to_snapshot(
         length_size=_str(_first(raw, "lengthSize", "length_size")),
         fit=_str(raw.get("fit")),
         brand=_str(_first(raw, "brand", "brandRelation")),
+        brand_relation=_str(raw.get("brandRelation")),
         model=_str(raw.get("model")),
         color=_str(_first(raw, "color", "colour")),
         material=_str(raw.get("material")),

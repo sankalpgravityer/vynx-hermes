@@ -257,6 +257,40 @@ SCHEMA: dict[str, Any] = {
                             "are unsure, answer slight. Always none for a garment photograph."
                         ),
                     },
+                    # 8 Oct 2026, MID-000805 AI_CLOSEUP: an orange-and-black
+                    # half-object poking in at the bottom-left corner, the shirt
+                    # and arms washing out into a grey haze with scratch marks
+                    # before the bottom edge, a ghost smudge beside the neck —
+                    # and `ok: true`, scene `plain`, body `none`. `scene` asks
+                    # about a STUDIO (rigs, rooms, recognisable things) and
+                    # calls a faint smudge minor; `body_flaw` reads anything at
+                    # the edge as a crop. What the image GENERATOR leaves behind
+                    # was nobody's question. Measured like the others.
+                    "artefacts": {
+                        "type": "string",
+                        "enum": ["none", "slight", "clear"],
+                        "description": (
+                            "For an AI RENDER: what the image GENERATOR left in the picture "
+                            "that a real photograph would not have. none = clean. slight = a "
+                            "faint mark you would have to look for. clear = plainly visible "
+                            "at normal size: a FRAGMENT of an object poking in at an edge or "
+                            "corner (part of a bag, shoe, prop or another garment); the "
+                            "picture FADING, washing out or dissolving into a white or grey "
+                            "haze or mist before its edge, so the garment or body melts away "
+                            "instead of being cut cleanly by the edge; smears, ghost shapes, "
+                            "blotches, scratches, streaks or specks on the backdrop; a patch "
+                            "of a different colour or texture in the backdrop. When you are "
+                            "unsure, answer slight. Always none for a garment photograph."
+                        ),
+                    },
+                    "artefact": {
+                        "type": "string",
+                        "description": (
+                            "When artefacts is not none: what and where, in at most eight "
+                            "words — 'orange object in bottom-left corner', 'bottom fades into "
+                            "grey haze'. Empty otherwise."
+                        ),
+                    },
                     # 18 Sep 2026, BOA-006151 and BOA-006153: every render ever
                     # named in `odd_renders` falsely was one with no face in it
                     # (AI_BACK, AI_BACK_34, AI_CLOSEUP). Asked for "the same
@@ -278,7 +312,8 @@ SCHEMA: dict[str, Any] = {
                     },
                 },
                 "required": ["index", "ok", "issue", "missing_parts", "leftovers",
-                             "scene", "body_flaw", "framing", "face_visible"],
+                             "scene", "body_flaw", "artefacts", "artefact", "framing",
+                             "face_visible"],
             },
         },
         # Readiness phase 1: the master category is confirmed against the
@@ -414,6 +449,18 @@ SYSTEM = (
     "EDGE of the picture cuts off is never a flaw — a close-up ends at the "
     "chest, a three-quarter view may end at the thigh, and both are correct "
     "framing. Unsure is `slight`, and `slight` is not a defect.\n"
+    # MID-000805 AI_CLOSEUP (8 Oct 2026): a half-object in the corner and a
+    # bottom that dissolved into haze passed as plain and whole.
+    "`artefacts` — what the image GENERATOR left behind that a real photograph "
+    "would not have. Look at all four EDGES and CORNERS, then the backdrop. A "
+    "fragment of an object poking into the frame (part of a bag, a shoe, a prop, "
+    "another garment), the picture fading or washing out into a white or grey "
+    "haze before its edge so the garment or body melts away instead of being cut "
+    "cleanly, smears, ghost shapes, blotches, scratches, streaks or specks on the "
+    "backdrop, or a patch of a different colour or texture there: `clear`, and a "
+    "defect, with what and where in `artefact`. The platform's corner badge and "
+    "the model's own soft shadow are not artefacts. A mark you have to look for "
+    "is `slight`, and `slight` is not a defect.\n"
     "Finally, the person in the renders. For EVERY AI render say whether the "
     "model's FACE is visible in it (`face_visible`): a back view, a detail crop "
     "of the garment, a head out of frame or a face turned away is false. Then "
@@ -939,6 +986,11 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
             is_render = im.get("kind") == "render"
             scene_bad = is_render and str(entry.get("scene") or "").strip().lower() == "cluttered"
             body_bad = is_render and str(entry.get("body_flaw") or "").strip().lower() == "clear"
+            # GENERATION ARTEFACTS (8 Oct 2026, MID-000805 AI_CLOSEUP): a fragment
+            # at the edge, a bottom dissolving into haze, smears on the backdrop.
+            # Same discipline: only `clear` is a defect.
+            art_bad = is_render and str(entry.get("artefacts") or "").strip().lower() == "clear"
+            art_what = str(entry.get("artefact") or "").strip()[:60] if art_bad else ""
 
             # THE FRAMING, against what this view is for (21 Sep 2026).
             frame_bad = ""
@@ -968,7 +1020,8 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
                 # "hanger visible" / "hook at the collar" in the free text: accepted
                 # with the hanger itself (see `hangers_are_leftovers`).
                 issue = _without_clip_clauses(issue, only=_only_hanger)
-            if not missing and not clear_left and not scene_bad and not body_bad and not frame_bad:
+            if (not missing and not clear_left and not scene_bad and not body_bad
+                    and not art_bad and not frame_bad):
                 if entry.get("ok") is not False:
                     continue
                 if raw_issue and not issue:
@@ -992,6 +1045,13 @@ def decide(raw: dict[str, Any], *, images: list[dict[str, Any]],
                                           (body_bad, "the body is not whole", _BODY_SAID_RE)):
                 if flagged and not said.search(issue.lower()):
                     issue = (f"{issue}; " if issue else "") + phrase
+            if art_bad:
+                # Its own words when the model gave them — "orange object in
+                # bottom-left corner" tells whoever reads the run what was wrong
+                # — unless the issue line already says the same thing.
+                what = art_what or "generation artefacts in the picture"
+                if what.lower() not in issue.lower():
+                    issue = (f"{issue}; " if issue else "") + what
             if frame_bad:
                 # Always spelled out, unlike the two above: "cropped" in the
                 # model's own words does not say WHERE it ends or where it
