@@ -242,6 +242,9 @@ STEP_FOR_SCRIPT = {
     # The Brain's `activateShopifyDrafts` (8 Oct 2026): a Shopify draft of an
     # approved, passing product made Active. Called by the runner, not the chain.
     "activate-shopify-draft.ts": "golive",
+    # One garment, one unit (9 Oct 2026): the chain's `stock` step, before the
+    # product goes to Shopify.
+    "settle-stock.ts": "stock",
 }
 
 
@@ -490,6 +493,10 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
     # --include-synced); without it only failed pushes are re-driven.
     if "--include-synced" in args:
         options["includeSynced"] = True
+    # The `stock` step: close the loose bin row an approval placed beside the one
+    # LPN the garment is packed in. Sent only to a deployment whose /ping lists it.
+    if "--close-stale-loose" in args:
+        options["closeStaleLoose"] = True
     # The reconcile step's image-gate hints (8 Oct 2026): the lead render's model
     # and the garment it shows. Sent only to a deployment whose /ping lists them.
     if "--render-gender" in args:
@@ -1259,6 +1266,16 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            # manual/CLI run — approves exactly as it always has.
            publish_status: str | None = None,
            sync_changes: bool = False,
+           # ONE GARMENT, ONE UNIT (9 Oct 2026). Before the product goes to
+           # Shopify — published by this run's approval, or already on Shopify
+           # with the sync or go-live switch on — stock above 1 is brought to 1
+           # by the make-live sheet's rules and the count pushed to the listing.
+           # The agent's runs only; a CLI run leaves stock as it always did.
+           stock_to_one: bool = False,
+           # The Brain's go-live switch (`activateShopifyDrafts`). The runner
+           # makes a Shopify draft live AFTER this chain, so the stock step needs
+           # to know a push is coming.
+           activate_drafts: bool = False,
            ) -> dict[str, Any]:
     # SILENT SHADOWS THE BUILTIN, deliberately and only inside this function.
     #
@@ -2959,6 +2976,61 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     step("approve", "", _approve)
 
+    # ---- 5a. stock: one garment, one unit ---------------------------------
+    #
+    # Before the product goes to Shopify (9 Oct 2026). A garment counted twice —
+    # an LPN line typed as 2, or the loose default-bin row an approval places
+    # beside the LPN it is already packed in — went to the storefront as 2 and
+    # could be sold twice. The make-live sheet fixed that for the products it put
+    # live; the agent's own pushes did not. AFTER approve on purpose, since its
+    # default-bin placement is one of the places the second unit comes from; and
+    # before sync and the runner's go-live, so both carry the settled count.
+    #
+    # "Did this run write anything" is taken HERE, before the stock step: its own
+    # write (Product.inventoryQuantity) is pushed to the listing by the step
+    # itself, and must not make the sync step re-push the whole product.
+    wrote = bool(apply) and sync_changes and (
+        needs(dsn, product_id)["loaded"]["record"].get("updatedAt") != started_updated_at)
+    stock_report: dict[str, Any] = {"ran": False, "why": None}
+
+    def _stock() -> str:
+        args = [*common, *live]
+        if remote_supports("closeStaleLoose"):
+            # The make-live sheet's --close-stale-loose, as the sheet run used it.
+            args.append("--close-stale-loose")
+        ok, _, res = run_step(vnyx_api, "settle-stock.ts", args,
+                              timeout_s=180, quiet=quiet, results_name="stock.json")
+        if not isinstance(res, dict) or not res.get("outcome"):
+            raise StepFailed("settle-stock.ts returned no verdict"
+                             + ("" if ok else " and exited non-zero"))
+        stock_report.update(
+            ran=True, outcome=res.get("outcome"), before=res.get("stockBefore"),
+            after=res.get("stockAfter"), changes=res.get("changes") or [],
+            refused=res.get("refused") or [], shopify=res.get("shopifyStock"))
+        if res["outcome"] == "failed":
+            raise StepFailed(str(res.get("reason") or "settle-stock.ts failed"))
+        return str(res.get("reason") or res["outcome"])
+
+    published_now = (verdict.get("outcome") == "approved"
+                     and verdict.get("published", True))
+    would_publish = (not apply and approve and publish
+                     and verdict.get("outcome") == "would_approve")
+    if not stock_to_one:
+        stock_why = "off — only the Auto Approval agent's runs settle stock"
+    elif not remote_has_step("settle-stock.ts"):
+        stock_why = "this vnyx-api has no `stock` step yet — deploy vnyx-api"
+    elif published_now or would_publish:
+        stock_why = ""
+    elif not shopify_product_id(dsn, product_id):
+        stock_why = "not on Shopify, and this run does not publish it"
+    elif not (sync_changes or activate_drafts):
+        stock_why = ("this run sends nothing to Shopify — sync and go-live are both "
+                     "off in the Brain")
+    else:
+        stock_why = ""
+    stock_report["why"] = stock_why or None
+    step("stock", stock_why, _stock)
+
     # ---- 5b. sync ---------------------------------------------------------
     #
     # A REPAIR TO A PRODUCT THAT IS ALREADY LIVE, pushed to the storefront (the
@@ -3002,12 +3074,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                if "skipped —" in ln]
         return "NOT pushed — " + ("; ".join(why) or "the resync queued nothing")
 
-    # "Did this run change the product" from the ROW, not the step notes: every
-    # write lands through updateProduct or the media cache rebuild, and both
-    # move Product.updatedAt, whereas a step that ran can have written nothing
-    # (reconcile runs on every product).
-    wrote = bool(apply) and sync_changes and (
-        needs(dsn, product_id)["loaded"]["record"].get("updatedAt") != started_updated_at)
+    # "Did this run change the product" (`wrote`, taken before the stock step)
+    # from the ROW, not the step notes: every write lands through updateProduct
+    # or the media cache rebuild, and both move Product.updatedAt, whereas a step
+    # that ran can have written nothing (reconcile runs on every product).
     # "Just approved" FIRST: the approval has already pushed this product, so
     # the re-sync is not needed whatever the switch says — and naming the
     # switch instead read as though the product had not gone to Shopify.
@@ -3127,6 +3197,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         "copy": copy_report,
         # The Brain's re-push of an already-live product after its repairs.
         "sync": sync_report,
+        "stock": stock_report,
         # A defect no re-run can clear, with the reason a person would read; the
         # runner turns it into a rejection under `readiness.unfixable`.
         "unfixable": unfixable,
