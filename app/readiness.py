@@ -250,7 +250,8 @@ def roots_for_category(category: Any, categories: dict[str, dict[str, list[str]]
     return hits
 
 
-def decide_master(p: ProductSnapshot, pol: dict[str, Any] | None) -> dict[str, Any]:
+def decide_master(p: ProductSnapshot, pol: dict[str, Any] | None, *,
+                  render_gender: str | None = None) -> dict[str, Any]:
     """Which master category this product should carry, and why.
 
     Returns {action, master, basis, detail, rule}:
@@ -278,6 +279,30 @@ def decide_master(p: ProductSnapshot, pol: dict[str, Any] | None) -> dict[str, A
     roots = list(p.catalog.categories)
     current = (p.master_category or "").strip()
     hit = match_root(current, roots)
+
+    # A GENDER CONFLICT IS SETTLED BY THE RENDER (8 Oct 2026, the user). When the
+    # gender property says one gender and the master the other (TAX.004), the
+    # anchor alone used to win and the property was rewritten to it — on
+    # MID-000107/111/501 that left the mannequin, the size chart and the record's
+    # history all saying the other gender. The on-model render shows who the
+    # product is presented for, so it decides: master AND gender go to the
+    # render's gender, and the chart, rig and branch are re-planned against that
+    # master. `render_gender` is the image gate's read of the lead render (the
+    # reconcile step sends it); without it — or when the render agrees with the
+    # master — the master stands and the property follows it, as before.
+    seen = resolve_gender(render_gender) if render_gender else None
+    if hit is not None and seen:
+        own = resolve_gender(p.gender)
+        anchor = root_gender(hit, pol)
+        if own and anchor and own != anchor and seen != anchor:
+            target = next((r for r in roots if root_gender(r, pol) == seen), None)
+            if target:
+                return {"action": "set", "master": target, "basis": "render model",
+                        "detail": (f"gender {p.gender!r} disagrees with '{hit}'; the "
+                                   f"render's model is {seen}, so '{target}' and the "
+                                   f"gender follow it"),
+                        "rule": "TAX.004"}
+
     if hit is not None:
         if hit == current:
             return {"action": "keep", "master": hit, "basis": "column",

@@ -613,6 +613,11 @@ class ApprovalGateRequest(BaseModel):
     # gets policy.yaml, exactly as before.
     severity_overrides: dict[str, str] | None = None
     policy_overlay: dict[str, Any] | None = None
+    # What the image gate saw on the lead render, sent by the repair chain
+    # (8 Oct 2026): `render_gender` settles a gender/master conflict,
+    # `render_garment` re-files a product under the garment the render shows.
+    # Absent — every other caller — the gate plans exactly as before.
+    hints: dict[str, Any] | None = None
 
 
 @app.post("/v1/approval-gate")
@@ -638,6 +643,7 @@ def approval_gate(req: ApprovalGateRequest) -> dict[str, Any]:
             llm=make_llm() if req.use_llm else None,
             split_on_both_genders=req.split_on_both_genders,
             severity_overrides=req.severity_overrides,
+            hints=req.hints,
         )
 
 

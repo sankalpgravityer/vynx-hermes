@@ -134,6 +134,17 @@ completeness:
   # that will oversell). MEDIUM, so a multi-unit tenant is warned, not blocked;
   # set to null to switch the rule off for a wholesale catalogue.
   expected_inventory: 1
+  # DATA.011 — a brand that says there is NO brand is a missing brand, and the
+  # product is HELD FOR A PERSON (8 Oct 2026, the user: 36 approved Midtex
+  # products had passed as "MT NO BRAND", "NOBRAND", "MK No Brand"…). Compared
+  # on letters only, any case; `contains` also matches inside a longer value
+  # ("MT NO BRAND", "MK No Brand"). Read on the product's brand field AND its
+  # brand record. The empty placeholders are here too ("Unknown" passed as a
+  # brand on MID-000622): in Review a brand still missing after the care-label
+  # step is then rejected, as before; elsewhere it is held.
+  no_brand:
+    equals: ["boas", "brand", "unknown", "none", "na", "null", "tbd"]
+    contains: ["nobrand"]
 
 # ATTR.005 — the supplier a tenant's products should all name. The auditor
 # carried one canonical supplier per tenant; here it is keyed by tenant id and

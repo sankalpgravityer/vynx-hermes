@@ -306,18 +306,21 @@ def test_subcategory_not_guessed_when_the_tree_offers_several():
 
 def test_verified_shape():
     _, cat = snap()
+    # A REAL brand: "BOAS" is a no-brand placeholder since 8 Oct 2026 (DATA.011),
+    # and a product carrying it rightly needs a person.
+    cat = {**cat, "brands": ["Levi's"]}
     clean = {
         "id": "p1", "tenantId": "t1", "sku": "S1", "productCode": "PC1",
         "masterCategory": "Men",
         "category": "T-Shirts & Polos", "subCategory": "T-Shirts",
         "size": "S", "internationalSize": "S", "euSize": "46",
-        "sizingGuide": "Men Uppers", "brand": "BOAS", "color": "Burgundy",
+        "sizingGuide": "Men Uppers", "brand": "Levi's", "color": "Burgundy",
         "material": "Cotton", "condition": "As New", "gender": ["men"],
         "careLabelCount": 1, "priceAmount": 17.39,
         "retailPriceAmount": 28.99, "currency": "EUR", "grade": "A",
         "gradeLabel": "As New",
         "priceExpectation": {"priceFactor": 0.60, "expectedPrice": 17.39},
-        "title": "Vintage BOAS Burgundy T-Shirt Men S",
+        "title": "Vintage Levi's Burgundy T-Shirt Men S",
         "description": "A deep burgundy cotton jersey tee in as-new condition.",
     }
     out = approval.run_gate(clean, catalog=cat)
