@@ -622,6 +622,10 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                 # manual flow): which Shopify status the approval publishes with.
                 publish_status="active" if rs.publish_active else "draft",
                 sync_changes=rs.sync_changes,
+                # One garment, one unit before anything the agent sends to
+                # Shopify (9 Oct 2026) — the go-live below included.
+                stock_to_one=True,
+                activate_drafts=rs.activate_drafts,
                 approve=approve,
                 skip_bin=rs.skip_bin_placement,
                 # Frozen in the run's configSnapshot, so a mid-run Brain edit
