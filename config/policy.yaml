@@ -745,7 +745,11 @@ imagery:
     # wait for a slot; one that waits longer than `max_wait_s` is refused as busy (the
     # photo is not cut this run) — below vnyx-api's own 420 s timeout, so a refusal is
     # said rather than left to time out. 0 = no cap.
-    max_concurrent: 2
+    #
+    # 2 -> 4 (10 Oct 2026): the server went to 4 cores / 31 GB so two tenants can run
+    # at once (a second Celery worker), and each tenant's matte sends its photos in
+    # parallel. 4 cut-outs is ~3.5 GB on top of Hermes' ~3.5 GB. Back to 2 on an 8 GB box.
+    max_concurrent: 4
     max_wait_s: 300
     # PHOTOS HUNG ON THE WALL (1 Oct 2026; app/imaging/hanger_cutout.py, the
     # `hanger-isnet` strategy). IS-Net finds the whole garment, clips included;
