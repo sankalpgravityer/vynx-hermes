@@ -702,8 +702,16 @@ def config(pol: dict[str, Any] | None) -> dict[str, Any]:
 # Where a render may end, by view. `None` = not judged (the close-up, a view
 # nobody named, footwear and accessories). Pure, so the whole table is testable
 # without a model call.
+#
+# A THREE-QUARTER VIEW MAY END AT THE LOWER LEG (10 Oct 2026, the user). Refusing
+# it re-rendered AI_FRONT_34 / AI_BACK_34 round after round — the prompt asks for
+# an edge "just below the knees" and the generator lands mid-shin, most of all on
+# dresses and long coats whose hem is below the knee — while on a top the product
+# is whole wherever the legs end: KLE-000222 and KLE-000287 spent 7+ paid rounds
+# on it and KLE-000287 held anyway. The rules that protect the PRODUCT stand: a
+# bottom's three-quarter views and every AI_FRONT / AI_BACK must show the feet.
 _FULL_BODY = frozenset({"feet"})
-_HALF_BODY = frozenset({"feet", "thigh", "knee", "waist_up"})   # anything but a cut lower leg
+_HALF_BODY = frozenset({"feet", "lower_leg", "knee", "thigh", "waist_up"})   # anything but a detail crop
 
 
 def framing_rule(view: str, *, side: str | None, exempt: bool,
@@ -723,7 +731,7 @@ def framing_rule(view: str, *, side: str | None, exempt: bool,
         # and a picture that stops at the thigh is a picture of half the product.
         return _FULL_BODY, "this view must show the model head to feet"
     if view in half:
-        return _HALF_BODY, "the legs are cut through the middle — crop at the knee or show the feet"
+        return _HALF_BODY, "this view must show the model, not a detail crop"
     return None
 
 

@@ -1390,10 +1390,12 @@ photo_audit:
     # follows `render_defects` (regen). Costs one render per such view.
     framing: defect
     full_body_views: ["AI_FRONT", "AI_BACK"]
-    # Knee-up by design (nanobanana.py asks for exactly that), so only a cut
-    # THROUGH the lower leg is wrong here. A bottom is the exception and needs
-    # its hem: every body view of one must show the feet. Footwear and
-    # accessories are exempt whatever the view, as in the gate.
+    # Knee-up by design (nanobanana.py asks for exactly that). Since 10 Oct 2026 an
+    # edge through the lower leg is accepted here too (the user's call;
+    # photo_audit._HALF_BODY): it looped paid re-renders on dresses and long coats
+    # and never hid any of a top. Only a detail crop is wrong on these views. A
+    # bottom is the exception and needs its hem: every body view of one must show
+    # the feet. Footwear and accessories are exempt whatever the view, as in the gate.
     half_body_views: ["AI_FRONT_34", "AI_BACK_34"]
     # rematte | hold | soft — what a defective CUT-OUT becomes: a collar or
     # sleeve the mask cut away, a stand or hand left in (MID-000569: the
@@ -1475,7 +1477,12 @@ readiness:
   # fixed AI_FRONT_34, the second look refused AI_CLOSEUP, and one round was all
   # there was. 1 = the old single retry. 10 since 7 Oct 2026 (the user's call; was
   # 3 — a product held after 3 rounds of "a different model than the other renders").
-  regen_rounds: 10
+  # 2 since 10 Oct 2026 (the user's call, for speed): ~50 s and a paid render a
+  # round, and a render the same prompt got wrong twice came back wrong every time
+  # after it — KLE-000222 and KLE-000287 looped 7+ rounds (565 s, 765 s) and the
+  # second held anyway. Every product that passed did so within 3 rounds, and the
+  # three-quarter crop that caused the loops is no longer a defect.
+  regen_rounds: 2
   # A PRODUCT WITH NO CARE-LABEL PHOTOGRAPH (7 Oct 2026, the user's call): `hold`
   # keeps it in the Review tab, HELD_FOR_HUMAN ("care label is missing"), for a
   # person to add the label and run it again; `reject` moves it to the Rejected tab
@@ -1574,7 +1581,8 @@ readiness:
     # photograph's long side over the registered-scale x the cut-out's long
     # side. Over this factor, the cut-out is re-cut from the raw at full size.
     # Hermes' framed cut-outs measure ~1.0; the old render-size ones 3-4.5.
-    # 0 turns it off.
+    # 0 turns it off. Kept ON (10 Oct 2026, the user's call): the old low-resolution
+    # cut-outs are re-cut at full size, though it costs ~100 s a product.
     resolution_max: 1.6
     # WHEN THE TWO CANNOT BE LINED UP (7 Oct 2026) the garment's scale is unknown
     # and the test above said nothing — and 66 old 896x1195 cut-outs went to
