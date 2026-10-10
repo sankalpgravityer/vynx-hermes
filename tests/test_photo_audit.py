@@ -528,16 +528,22 @@ def _raw_framing(where, on=(5,)):
     return raw
 
 
-def test_a_three_quarter_view_cut_through_the_lower_leg_is_a_render_defect():
-    v = _decide(_raw_framing("lower_leg"), media=MEDIA_FIVE)              # 5 = AI_FRONT_34
+def test_a_three_quarter_view_may_end_anywhere_on_the_body():
+    """10 Oct 2026, the user: an edge through the lower leg is no longer a defect on
+    AI_FRONT_34 / AI_BACK_34. Refusing it looped paid re-renders (KLE-000222,
+    KLE-000287: 7+ rounds) while the top it shows was whole either way."""
+    # Knee-up and thigh-up are what that view is FOR, full body is not a thing
+    # missing from it, and mid-shin is accepted too.
+    for ok_where in ("lower_leg", "knee", "thigh", "waist_up", "feet"):
+        assert _decide(_raw_framing(ok_where), media=MEDIA_FIVE).action == "ok"   # 5 = AI_FRONT_34
+
+
+def test_a_three_quarter_view_cropped_to_a_detail_is_still_a_render_defect():
+    v = _decide(_raw_framing("detail"), media=MEDIA_FIVE)
     assert v.action == "regen" and v.code == "RENDER_DEFECT"
-    assert v.reasons == ["RENDER DEFECT — AI_FRONT_34 render: ends at lower leg — "
-                         "the legs are cut through the middle — crop at the knee or show the feet"]
+    assert v.reasons == ["RENDER DEFECT — AI_FRONT_34 render: ends at detail — "
+                         "this view must show the model, not a detail crop"]
     assert v.bad_views == ["AI_FRONT_34"]
-    # Knee-up and thigh-up are what that view is FOR, and full body is not a
-    # thing missing from it.
-    for ok_where in ("knee", "thigh", "waist_up", "feet"):
-        assert _decide(_raw_framing(ok_where), media=MEDIA_FIVE).action == "ok"
 
 
 def test_the_front_and_back_must_show_the_whole_figure():
@@ -588,12 +594,12 @@ def test_the_shipped_policy_re_renders_a_render_framed_wrongly():
 
 def test_framing_can_be_recorded_without_re_rendering_anything():
     soft = {**POL, "photo_audit": {"gallery": {"framing": "soft"}}}
-    v = _decide(_raw_framing("lower_leg"), media=MEDIA_FIVE, pol=soft)
+    v = _decide(_raw_framing("knee", on=(4,)), media=MEDIA_FIVE, pol=soft)     # 4 = AI_BACK
     assert v.action == "ok" and v.bad_views == []
-    assert v.soft == ["FRAMING — AI_FRONT_34 render ends at lower leg; the legs are cut "
-                      "through the middle — crop at the knee or show the feet"]
+    assert v.soft == ["FRAMING — AI_BACK render ends at knee; this view must show "
+                      "the model head to feet"]
     off = {**POL, "photo_audit": {"gallery": {"framing": "off"}}}
-    v = _decide(_raw_framing("lower_leg"), media=MEDIA_FIVE, pol=off)
+    v = _decide(_raw_framing("knee", on=(4,)), media=MEDIA_FIVE, pol=off)
     assert v.action == "ok" and v.soft == []
 
 

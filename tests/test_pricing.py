@@ -13,6 +13,8 @@ from app.resolver import resolve_pricing
 from app.rules import run_all
 from app.rules.pricing import assess, charm, verify_invariants, window_for
 
+from tests.conftest import prices_writable  # noqa: E402
+
 POL = policy()
 
 
@@ -155,15 +157,31 @@ def test_price_inside_window_is_still_rounded_to_99():
     assert a.change_required is True
     assert a.corrected_price == 45.99
 
-    # ...and it reaches the resolver as a patch, not just a report.
+    # ...and it reaches the resolver as a patch, not just a report. (Applied where
+    # the gate may write prices; the shipped policy escalates it since 10 Oct 2026.)
     p = levis(price=26.4, retail_price=66.99)   # Grade C window 21.99-32.99
-    patch = next(x for x in resolve_pricing(p, run_all(p, POL), Evidence(), POL)
+    priced = prices_writable(POL)
+    patch = next(x for x in resolve_pricing(p, run_all(p, priced), Evidence(), priced)
                  if x.field == "price")
     assert (patch.new_value, patch.rule_id) == (26.99, "PRICE.004")
     assert patch.action.value == "apply"
 
 
-def test_a_rounding_is_reported_on_the_verdict_not_as_a_finding():
+def test_the_shipped_gate_never_writes_a_price():
+    """10 Oct 2026, the user: the agent changes no price beyond the .99 rounding (the
+    Brain's price step). The gate had been lowering prices and replacing retail prices
+    on PRICE.001; every price patch is now an escalation — reported, never written."""
+    p = levis(price=26.4, retail_price=66.99)
+    patch = next(x for x in resolve_pricing(p, run_all(p, POL), Evidence(), POL)
+                 if x.field == "price")
+    assert patch.action.value == "escalate"
+    p = levis(price=78.0, retail_price=100.0)
+    assert all(x.action.value == "escalate"
+               for x in resolve_pricing(p, run_all(p, POL), Evidence(), POL)
+               if x.field in ("price", "retail_price"))
+
+
+def test_a_rounding_is_reported_on_the_verdict_not_as_a_finding(gate_writes_prices):
     """Two consumers make this the only workable shape.
 
     A finding would mark most of a correct catalog as incorrect. And vnyx-api's
@@ -262,7 +280,8 @@ def test_resolver_clamps_the_price_by_default():
 
 
 def test_provenance_mode_moves_the_anchor_instead():
-    pol = {**POL, "pricing": {**POL["pricing"], "anchor": "provenance"}}
+    priced = prices_writable(POL)
+    pol = {**priced, "pricing": {**priced["pricing"], "anchor": "provenance"}}
     p = levis(price=78.0, retail_price=100.0,
               provenance={"price": Provenance.MARKET, "retail_price": Provenance.DERIVED})
     patches = resolve_pricing(p, run_all(p, pol), Evidence(), pol)

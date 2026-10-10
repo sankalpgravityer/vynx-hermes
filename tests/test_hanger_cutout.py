@@ -256,7 +256,7 @@ def _paid(monkeypatch, calls, gemini=(None, "no image"), openai=(None, "no image
 REFUSED = "needs review: hanger mask covers a lot of garment"
 
 
-def test_a_hung_photo_isnet_cannot_cut_goes_to_gemini_once_before_v2(chain, monkeypatch):
+def test_a_hung_photo_isnet_cannot_cut_goes_to_gemini_once_before_v2(chain, monkeypatch, paid_cutout_methods):
     """A bar was found but IS-Net's cut was refused: Gemini, once, and only then v2,
     which keeps the bar and clips on these photos."""
     calls = chain["calls"]
@@ -270,7 +270,7 @@ def test_a_hung_photo_isnet_cannot_cut_goes_to_gemini_once_before_v2(chain, monk
     assert provider == "cloth-seg-ft"
 
 
-def test_gpt_image_comes_after_the_parsers_on_the_hanger_route(chain, monkeypatch):
+def test_gpt_image_comes_after_the_parsers_on_the_hanger_route(chain, monkeypatch, paid_cutout_methods):
     """It redrew every hung garment it was given (12 of 12, 1 Oct 2026)."""
     calls = chain["calls"]
     monkeypatch.setattr(cutout, "_hanger_isnet",

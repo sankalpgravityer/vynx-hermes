@@ -75,8 +75,9 @@ def test_reject_restores_the_move_to_the_rejected_tab(wired):
     assert (v.status, v.outcome) == ("FAILED", "NO_CARE_LABEL")
 
 
-def test_the_shipped_policy_holds_and_buys_ten_regen_rounds():
+def test_the_shipped_policy_holds_and_buys_two_regen_rounds():
+    """Two rounds since 10 Oct 2026 (was 10): a render wrong twice stayed wrong."""
     from app import readiness
 
     cfg = readiness.config(policy())
-    assert cfg["no_care_label"] == "hold" and cfg["regen_rounds"] == 10
+    assert cfg["no_care_label"] == "hold" and cfg["regen_rounds"] == 2

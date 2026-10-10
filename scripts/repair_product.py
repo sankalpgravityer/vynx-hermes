@@ -572,7 +572,12 @@ def _step_result(body: dict[str, Any], script: str, *, timeout_s: int,
 # How often a background step is asked "done yet?", and how many consecutive
 # failed polls (network blips, a 502/504 from the proxy) are tolerated before
 # the step is given up on. Each poll is a sub-second request.
-STEP_POLL_S = float(os.getenv("AUTO_APPROVAL_STEP_POLL_S", "5"))
+#
+# 1 s, not 5 (10 Oct 2026): every step's time was rounded UP to the next poll —
+# price, approve, stock and sync each read 5.1 s for about a second of work, and
+# reconcile landed on exact multiples of 5.1 s — ~15-25 s a product spent
+# waiting for the next "done yet?". The env var still overrides it.
+STEP_POLL_S = float(os.getenv("AUTO_APPROVAL_STEP_POLL_S", "1"))
 STEP_POLL_MAX_ERRORS = 12
 
 

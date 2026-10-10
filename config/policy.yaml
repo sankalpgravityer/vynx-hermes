@@ -301,6 +301,13 @@ guardrails:
     - bin_barcode
     - lpn_code
     - sku
+    # PRICES ARE NOT THE GATE'S TO WRITE (10 Oct 2026, the user's call): the agent
+    # changes no price beyond the .99 rounding (the Brain's price step). The gate
+    # had been lowering prices and replacing retail prices on PRICE.001 (KLE-000222,
+    # -000269, -000264, -000180: "reconcile: price"). A price finding is now
+    # escalated — reported, never written. PRICE.001 itself is ignored (severity_overrides).
+    - price
+    - retail_price
 
 # --------------------------------------------------------------------------- #
 # Rules that are reported but never decide anything.
@@ -333,6 +340,11 @@ rules:
     TEXT.005: ignore
     DATA.001:material: ignore
     DATA.010:material: ignore
+    # PRICE AT OR ABOVE RETAIL, 10 Oct 2026 — the user's call. The agent changes no
+    # price beyond the .99 rounding, so PRICE.001 could only hold the product for a
+    # person; it is no longer a finding (no hold, no lookup, no repair). This lets a
+    # used garment go live at or above 95% of its retail price. Remove to restore.
+    PRICE.001: ignore
 
 taxonomy:
   Men:
@@ -471,6 +483,11 @@ llm:
   timeout_s: 45
   # Only spend an LLM call when the rule engine actually asked for evidence.
   evidence_only: true
+  # THE RETAIL-PRICE LOOKUP (`model_reasoning`, Google-search grounded), asked when a
+  # PRICE rule fires. OFF since 10 Oct 2026 (the user's call): prices are not changed
+  # by the agent beyond the .99 rounding, and the lookup took 85-100 s a call — past
+  # vnyx-api's 120 s gate timeout on KLE-000261 / KLE-000292. true brings it back.
+  rrp_lookup: false
 
   # FAIL-FAST ON A PROVIDER OUTAGE — app/llm/health.py.
   #
@@ -662,7 +679,17 @@ imagery:
     # 6 Oct 2026 — SHOES AND BAGS, IS-NET AS AN OBJECT (`object-isnet`, block `object`
     # below). Runs only when the product's category is footwear or a bag, and then the
     # chain is object-isnet → gemini-paint → openai-paint: v2 and v1 are never asked.
-    strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    #
+    # 10 Oct 2026 — OUR OWN METHODS ONLY (the user's call, for speed and cost). The
+    # paid fallbacks are commented out here and in `url_strategies`, `hanger.then`,
+    # `object.then` and `readiness.cutouts.recut_strategies`: on the Klekt runs they
+    # failed every time they were asked (gemini-paint left the wall or the backdrop
+    # in, openai-paint re-drew the garment), at ~20-30 s and a paid call each — one
+    # matte ran 412 s and still held. When IS-Net and v2/v1 cannot cut a photo, the
+    # cut-out on file is kept (cropped and centred) and a bad one holds as before.
+    # To bring them back, restore the commented lists.
+    # strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup"]
     # When both fine-tuned parsers ("cloth-seg-ft" = v2, "cloth-seg-ft-backup"
     # = v1) are refused by the leftover check but their garments agree at
     # least this well, the v2 cut-out is accepted: the check misreads white and
@@ -671,7 +698,8 @@ imagery:
     # The chain POST /v1/imagery/cutout (image URL in, PNG out) uses. Separate
     # from `strategies`, so it changes nothing for vnyx-api's calls. The two
     # paid ones (each tried twice) run only when v2 and v1 are both refused.
-    url_strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    # url_strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    url_strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup"]
     # SHOES AND BAGS (6 Oct 2026; app/imaging/object_cutout.py, the `object-isnet`
     # strategy). v2 and v1 are CLOTHING parsers with no class for a shoe or a bag: on 18
     # shoe and bag photos (BOAS, Klekt) they found "no garment" or kept fragments of 11 of
@@ -704,7 +732,8 @@ imagery:
       families: ["footwear", "bags"]
       origins: []
       model: "isnet-general-use"
-      then: ["gemini-paint", "openai-paint"]
+      # then: ["gemini-paint", "openai-paint"]   # off since 10 Oct 2026 — see `strategies`
+      then: []
       min_kept: 0.003
       max_kept: 0.70
       edge_frac: 0.005
@@ -761,7 +790,8 @@ imagery:
       wall_open_px: 21
       wall_smooth_max: 4.0
       not_wall_dist: 60.0
-      then: ["gemini-paint"]
+      # then: ["gemini-paint"]   # off since 10 Oct 2026 — see `strategies`
+      then: []
       # The script's guided-filter edge refinement (3 Oct 2026 revision). OFF:
       # measured on BLM-001006 FRONT it WIDENED the soft edge (2.9 -> 4.3 px per
       # outline px) rather than sharpening it, and where the reference outputs
@@ -1390,10 +1420,12 @@ photo_audit:
     # follows `render_defects` (regen). Costs one render per such view.
     framing: defect
     full_body_views: ["AI_FRONT", "AI_BACK"]
-    # Knee-up by design (nanobanana.py asks for exactly that), so only a cut
-    # THROUGH the lower leg is wrong here. A bottom is the exception and needs
-    # its hem: every body view of one must show the feet. Footwear and
-    # accessories are exempt whatever the view, as in the gate.
+    # Knee-up by design (nanobanana.py asks for exactly that). Since 10 Oct 2026 an
+    # edge through the lower leg is accepted here too (the user's call;
+    # photo_audit._HALF_BODY): it looped paid re-renders on dresses and long coats
+    # and never hid any of a top. Only a detail crop is wrong on these views. A
+    # bottom is the exception and needs its hem: every body view of one must show
+    # the feet. Footwear and accessories are exempt whatever the view, as in the gate.
     half_body_views: ["AI_FRONT_34", "AI_BACK_34"]
     # rematte | hold | soft — what a defective CUT-OUT becomes: a collar or
     # sleeve the mask cut away, a stand or hand left in (MID-000569: the
@@ -1475,7 +1507,12 @@ readiness:
   # fixed AI_FRONT_34, the second look refused AI_CLOSEUP, and one round was all
   # there was. 1 = the old single retry. 10 since 7 Oct 2026 (the user's call; was
   # 3 — a product held after 3 rounds of "a different model than the other renders").
-  regen_rounds: 10
+  # 2 since 10 Oct 2026 (the user's call, for speed): ~50 s and a paid render a
+  # round, and a render the same prompt got wrong twice came back wrong every time
+  # after it — KLE-000222 and KLE-000287 looped 7+ rounds (565 s, 765 s) and the
+  # second held anyway. Every product that passed did so within 3 rounds, and the
+  # three-quarter crop that caused the loops is no longer a defect.
+  regen_rounds: 2
   # A PRODUCT WITH NO CARE-LABEL PHOTOGRAPH (7 Oct 2026, the user's call): `hold`
   # keeps it in the Review tab, HELD_FOR_HUMAN ("care label is missing"), for a
   # person to add the label and run it again; `reject` moves it to the Rejected tab
@@ -1574,7 +1611,8 @@ readiness:
     # photograph's long side over the registered-scale x the cut-out's long
     # side. Over this factor, the cut-out is re-cut from the raw at full size.
     # Hermes' framed cut-outs measure ~1.0; the old render-size ones 3-4.5.
-    # 0 turns it off.
+    # 0 turns it off. Kept ON (10 Oct 2026, the user's call): the old low-resolution
+    # cut-outs are re-cut at full size, though it costs ~100 s a product.
     resolution_max: 1.6
     # WHEN THE TWO CANNOT BE LINED UP (7 Oct 2026) the garment's scale is unknown
     # and the test above said nothing — and 66 old 896x1195 cut-outs went to
@@ -1639,7 +1677,10 @@ readiness:
     # photobooth photo it keeps the mannequin and the leftover check refuses it,
     # so the paid methods take over. Needs a vnyx-api that forwards
     # `--bg-strategies`. [] restores the skip.
-    recut_strategies: ["object-isnet", "gemini-paint", "openai-paint"]
+    #
+    # Paid methods off since 10 Oct 2026 (the user's call) — see imagery.cutout.strategies.
+    # recut_strategies: ["object-isnet", "gemini-paint", "openai-paint"]
+    recut_strategies: ["object-isnet"]
     # THE ZOOM TEST THAT NEEDS NO PHOTOGRAPH. One garment, one canvas, one
     # booth: two views should cover comparable fractions of their frames, so a
     # cut-out standing `max_area_ratio` times its smallest sibling was cropped

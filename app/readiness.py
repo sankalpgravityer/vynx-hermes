@@ -77,8 +77,8 @@ _DEFAULTS: dict[str, Any] = {
     "max_regenerations_per_run": 1,
     # How many rounds "on" buys (29 Sep 2026): re-render what was refused, look
     # again, repeat while something is still refused. Each round is paid.
-    # 10 since 7 Oct 2026 (the user's call; was 3).
-    "regen_rounds": 10,
+    # 2 since 10 Oct 2026, for speed (the user's call; was 10 from 7 Oct, 3 before).
+    "regen_rounds": 2,
     # A product with no care-label photograph (7 Oct 2026): `hold` keeps it in
     # Review, HELD_FOR_HUMAN; `reject` moves it to the Rejected tab as before.
     "no_care_label": "hold",

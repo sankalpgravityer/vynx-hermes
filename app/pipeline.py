@@ -52,7 +52,11 @@ def gather_evidence(p: ProductSnapshot, findings: list[Finding],
     ids = {f.rule_id for f in findings}
     fields_touched = {field for f in findings for field in f.fields}
 
-    if ids & {"PRICE.001", "PRICE.002", "PRICE.020", "PRICE.010"}:
+    # `llm.rrp_lookup: false` (10 Oct 2026, the user's call) skips the
+    # search-grounded retail-price lookup: 85-100 s a call on the Klekt runs, past
+    # vnyx-api's 120 s gate timeout more than once, for prices nobody here changes.
+    if (pol["llm"].get("rrp_lookup", True)
+            and ids & {"PRICE.001", "PRICE.002", "PRICE.020", "PRICE.010"}):
         currency = p.currency or pol["pricing"]["default_currency"]
         ev.rrp = llm.ground_rrp(p, currency)
 

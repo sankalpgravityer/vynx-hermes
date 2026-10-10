@@ -232,7 +232,7 @@ def test_a_shoe_is_cut_by_the_object_strategy_and_judged_as_an_object(chain):
     assert chain["calls"] == ["object"]
 
 
-def test_a_shoe_the_object_strategy_cannot_cut_goes_to_the_paid_ones_never_v2(chain, monkeypatch):
+def test_a_shoe_the_object_strategy_cannot_cut_goes_to_the_paid_ones_never_v2(chain, monkeypatch, paid_cutout_methods):
     monkeypatch.setattr(cutout, "_object_isnet",
                         lambda *a, **k: (chain["calls"].append("object"), (None, "no product found"))[1])
     out, err, provider = cutout.remove_background(
@@ -244,7 +244,7 @@ def test_a_shoe_the_object_strategy_cannot_cut_goes_to_the_paid_ones_never_v2(ch
     assert "garment" not in chain["prompts"][0]
 
 
-def test_a_paid_cut_out_of_a_shoe_is_judged_by_the_object_checks(chain, monkeypatch):
+def test_a_paid_cut_out_of_a_shoe_is_judged_by_the_object_checks(chain, monkeypatch, paid_cutout_methods):
     monkeypatch.setattr(cutout, "_object_isnet",
                         lambda *a, **k: (chain["calls"].append("object"), (None, "no product found"))[1])
     monkeypatch.setattr(cutout, "_gemini",
@@ -258,7 +258,7 @@ def test_a_paid_cut_out_of_a_shoe_is_judged_by_the_object_checks(chain, monkeypa
     assert provider == "gemini-paint" and seen == ["object checks"], err
 
 
-def test_an_object_cut_out_the_checks_refuse_moves_on(chain, monkeypatch):
+def test_an_object_cut_out_the_checks_refuse_moves_on(chain, monkeypatch, paid_cutout_methods):
     monkeypatch.setattr(oc, "checks", lambda *a, **k: (False, "the cut-out reaches the frame's edge"))
     out, err, provider = cutout.remove_background(
         chain["raw"], strategies=STRATS, garment="Shoes Boots", origin="WEB")

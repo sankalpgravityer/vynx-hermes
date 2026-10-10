@@ -558,7 +558,8 @@ def test_without_the_model_files_the_policy_chain_is_the_free_stock_parser(provi
     assert providers["calls"] == ["cloth-seg"], "and no paid call"
 
 
-def test_with_the_model_files_the_policy_chain_is_v2_v1_then_gemini(providers, monkeypatch, tmp_path):
+def test_with_the_model_files_the_policy_chain_is_v2_v1_then_gemini(providers, monkeypatch, tmp_path,
+                                                                    paid_cutout_methods):
     """What auto-approval's matte uses once the models are installed (30 Sep
     2026): v2, v1, then Gemini's background removal."""
     model = tmp_path / "cloth_seg_ft_v2.onnx"
@@ -571,7 +572,8 @@ def test_with_the_model_files_the_policy_chain_is_v2_v1_then_gemini(providers, m
     assert providers["calls"][:3] == ["cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint"]
 
 
-def test_when_gemini_cannot_openai_removes_the_background(providers, monkeypatch, tmp_path):
+def test_when_gemini_cannot_openai_removes_the_background(providers, monkeypatch, tmp_path,
+                                                          paid_cutout_methods):
     """The fourth method: gpt-image, asked for a transparent background."""
     model = tmp_path / "cloth_seg_ft_v2.onnx"
     model.write_bytes(b"x")
