@@ -1469,7 +1469,7 @@ def test_a_vnyx_api_without_bg_strategies_re_cuts_as_before(wired, monkeypatch):
     assert "--bg-strategies" not in a and a[a.index("--views") + 1] == "FRONT"
 
 
-def test_still_defective_after_the_matte_is_re_cut_with_the_paid_methods(wired, monkeypatch):
+def test_still_defective_after_the_matte_is_re_cut_with_the_paid_methods(wired, monkeypatch, paid_cutout_methods):
     """The matte step re-cut FRONT with the default chain; the audit still sees the
     mannequin below the hem. The rematte step used to skip it."""
     wired["verdicts"][:] = [BAD, OK]
@@ -1502,7 +1502,7 @@ def test_a_defect_on_a_cutout_this_run_did_not_touch_keeps_the_chains_own_answer
     assert recut[recut.index("--views") + 1] == "BACK"
 
 
-def test_still_wrong_after_the_default_chain_goes_to_the_paid_methods(wired):
+def test_still_wrong_after_the_default_chain_goes_to_the_paid_methods(wired, paid_cutout_methods):
     """MID-000053 FRONT, 6 Oct 2026: the re-matte returned the identical 'neckline cut
     away' and the step stopped at STILL WRONG. The default chain answering the same way
     twice is now the signal to escalate once — IS-Net's whole-product cut first (free),

@@ -12,6 +12,7 @@ from app import approval
 from app.config import policy
 from app.models import Finding, Severity
 from app.vnyx_client import to_snapshot
+from tests.conftest import prices_writable
 
 POL = policy()
 CONSIGN = {**POL, "pricing": {**POL["pricing"], "consignment_tenants": ["t-consign"]}}
@@ -64,17 +65,34 @@ def test_the_same_product_still_blocks_for_an_ordinary_tenant():
     assert any(f.rule_id == "PRICE.003" for f in approval._blocking(findings))
 
 
+def _price_001_on(pol: dict) -> dict:
+    """`pol` with PRICE.001 a finding again (the shipped policy ignores it since 10 Oct 2026)."""
+    rules = pol.get("rules") or {}
+    over = {k: v for k, v in (rules.get("severity_overrides") or {}).items() if k != "PRICE.001"}
+    return {**pol, "rules": {**rules, "severity_overrides": over}}
+
+
 def test_above_retail_keeps_blocking_even_on_consignment():
     p = snap(tenant="t-consign", price=120.0, retailPrice=100.0)
-    findings = approval._all_findings(p, CONSIGN)
+    findings = approval._all_findings(p, _price_001_on(CONSIGN))
     assert any(f.rule_id == "PRICE.001" for f in approval._blocking(findings))
 
 
+def test_the_shipped_policy_ignores_price_at_or_above_retail():
+    """10 Oct 2026, the user: the agent changes no price beyond the .99 rounding, so
+    PRICE.001 could only hold the product for a person — it is no longer a finding."""
+    p = snap(tenant="t1", price=120.0, retailPrice=100.0)
+    assert not any(f.rule_id == "PRICE.001" for f in approval._all_findings(p, POL))
+
+
 def test_a_price_repair_becomes_an_escalation_on_consignment():
+    # Where the gate may write prices at all (the shipped policy escalates every price
+    # since 10 Oct 2026 — see test_pricing.test_the_shipped_gate_never_writes_a_price).
+    consign = prices_writable(CONSIGN)
     p = snap(tenant="t-consign", price=60.0, retailPrice=100.0)   # inside auto-apply delta, outside window
-    findings = approval._all_findings(p, CONSIGN)
+    findings = approval._all_findings(p, consign)
     plan: list[dict] = []
-    approval._plan_fields(p, CONSIGN, findings, None, plan)
+    approval._plan_fields(p, consign, findings, None, plan)
     writes = [a for a in plan if a["kind"] in ("set_column", "set_property") and a["field"] == "price"]
     assert writes == []
     assert any(a["kind"] == "escalate" and a["field"] == "price"
@@ -82,11 +100,22 @@ def test_a_price_repair_becomes_an_escalation_on_consignment():
 
 
 def test_an_ordinary_tenant_still_gets_the_price_written():
+    priced = prices_writable(POL)
+    p = snap(tenant="t1", price=60.0, retailPrice=100.0)
+    findings = approval._all_findings(p, priced)
+    plan: list[dict] = []
+    approval._plan_fields(p, priced, findings, None, plan)
+    assert any(a["kind"] in ("set_column", "set_property") and a["field"] == "price" for a in plan)
+
+
+def test_the_shipped_policy_plans_no_price_write():
+    """10 Oct 2026, the user: the agent changes no price beyond the .99 rounding."""
     p = snap(tenant="t1", price=60.0, retailPrice=100.0)
     findings = approval._all_findings(p, POL)
     plan: list[dict] = []
     approval._plan_fields(p, POL, findings, None, plan)
-    assert any(a["kind"] in ("set_column", "set_property") and a["field"] == "price" for a in plan)
+    assert not any(a["kind"] in ("set_column", "set_property") and a["field"] in ("price", "retail_price")
+                   for a in plan)
 
 
 # ------------------------------------------------------------- tie-breaker

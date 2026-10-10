@@ -301,6 +301,13 @@ guardrails:
     - bin_barcode
     - lpn_code
     - sku
+    # PRICES ARE NOT THE GATE'S TO WRITE (10 Oct 2026, the user's call): the agent
+    # changes no price beyond the .99 rounding (the Brain's price step). The gate
+    # had been lowering prices and replacing retail prices on PRICE.001 (KLE-000222,
+    # -000269, -000264, -000180: "reconcile: price"). A price finding is now
+    # escalated — reported, never written. PRICE.001 itself is ignored (severity_overrides).
+    - price
+    - retail_price
 
 # --------------------------------------------------------------------------- #
 # Rules that are reported but never decide anything.
@@ -333,6 +340,11 @@ rules:
     TEXT.005: ignore
     DATA.001:material: ignore
     DATA.010:material: ignore
+    # PRICE AT OR ABOVE RETAIL, 10 Oct 2026 — the user's call. The agent changes no
+    # price beyond the .99 rounding, so PRICE.001 could only hold the product for a
+    # person; it is no longer a finding (no hold, no lookup, no repair). This lets a
+    # used garment go live at or above 95% of its retail price. Remove to restore.
+    PRICE.001: ignore
 
 taxonomy:
   Men:
@@ -471,6 +483,11 @@ llm:
   timeout_s: 45
   # Only spend an LLM call when the rule engine actually asked for evidence.
   evidence_only: true
+  # THE RETAIL-PRICE LOOKUP (`model_reasoning`, Google-search grounded), asked when a
+  # PRICE rule fires. OFF since 10 Oct 2026 (the user's call): prices are not changed
+  # by the agent beyond the .99 rounding, and the lookup took 85-100 s a call — past
+  # vnyx-api's 120 s gate timeout on KLE-000261 / KLE-000292. true brings it back.
+  rrp_lookup: false
 
   # FAIL-FAST ON A PROVIDER OUTAGE — app/llm/health.py.
   #
@@ -662,7 +679,17 @@ imagery:
     # 6 Oct 2026 — SHOES AND BAGS, IS-NET AS AN OBJECT (`object-isnet`, block `object`
     # below). Runs only when the product's category is footwear or a bag, and then the
     # chain is object-isnet → gemini-paint → openai-paint: v2 and v1 are never asked.
-    strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    #
+    # 10 Oct 2026 — OUR OWN METHODS ONLY (the user's call, for speed and cost). The
+    # paid fallbacks are commented out here and in `url_strategies`, `hanger.then`,
+    # `object.then` and `readiness.cutouts.recut_strategies`: on the Klekt runs they
+    # failed every time they were asked (gemini-paint left the wall or the backdrop
+    # in, openai-paint re-drew the garment), at ~20-30 s and a paid call each — one
+    # matte ran 412 s and still held. When IS-Net and v2/v1 cannot cut a photo, the
+    # cut-out on file is kept (cropped and centred) and a bad one holds as before.
+    # To bring them back, restore the commented lists.
+    # strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup"]
     # When both fine-tuned parsers ("cloth-seg-ft" = v2, "cloth-seg-ft-backup"
     # = v1) are refused by the leftover check but their garments agree at
     # least this well, the v2 cut-out is accepted: the check misreads white and
@@ -671,7 +698,8 @@ imagery:
     # The chain POST /v1/imagery/cutout (image URL in, PNG out) uses. Separate
     # from `strategies`, so it changes nothing for vnyx-api's calls. The two
     # paid ones (each tried twice) run only when v2 and v1 are both refused.
-    url_strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    # url_strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "gemini-paint", "openai-paint"]
+    url_strategies: ["object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup"]
     # SHOES AND BAGS (6 Oct 2026; app/imaging/object_cutout.py, the `object-isnet`
     # strategy). v2 and v1 are CLOTHING parsers with no class for a shoe or a bag: on 18
     # shoe and bag photos (BOAS, Klekt) they found "no garment" or kept fragments of 11 of
@@ -704,7 +732,8 @@ imagery:
       families: ["footwear", "bags"]
       origins: []
       model: "isnet-general-use"
-      then: ["gemini-paint", "openai-paint"]
+      # then: ["gemini-paint", "openai-paint"]   # off since 10 Oct 2026 — see `strategies`
+      then: []
       min_kept: 0.003
       max_kept: 0.70
       edge_frac: 0.005
@@ -761,7 +790,8 @@ imagery:
       wall_open_px: 21
       wall_smooth_max: 4.0
       not_wall_dist: 60.0
-      then: ["gemini-paint"]
+      # then: ["gemini-paint"]   # off since 10 Oct 2026 — see `strategies`
+      then: []
       # The script's guided-filter edge refinement (3 Oct 2026 revision). OFF:
       # measured on BLM-001006 FRONT it WIDENED the soft edge (2.9 -> 4.3 px per
       # outline px) rather than sharpening it, and where the reference outputs
@@ -1647,7 +1677,10 @@ readiness:
     # photobooth photo it keeps the mannequin and the leftover check refuses it,
     # so the paid methods take over. Needs a vnyx-api that forwards
     # `--bg-strategies`. [] restores the skip.
-    recut_strategies: ["object-isnet", "gemini-paint", "openai-paint"]
+    #
+    # Paid methods off since 10 Oct 2026 (the user's call) — see imagery.cutout.strategies.
+    # recut_strategies: ["object-isnet", "gemini-paint", "openai-paint"]
+    recut_strategies: ["object-isnet"]
     # THE ZOOM TEST THAT NEEDS NO PHOTOGRAPH. One garment, one canvas, one
     # booth: two views should cover comparable fractions of their frames, so a
     # cut-out standing `max_area_ratio` times its smallest sibling was cropped
