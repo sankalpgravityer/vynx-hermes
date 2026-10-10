@@ -96,9 +96,10 @@ def test_a_busy_hermes_says_so_instead_of_cutting(monkeypatch):
     assert cutout.remove_background(b"raw") == (b"png", None, "x")
 
 
-def test_the_shipped_policy_caps_at_two():
+def test_the_shipped_policy_caps_at_four():
+    """2 -> 4 on 10 Oct 2026, when the server went to 4 cores / 31 GB for two tenants at once."""
     cfg = cutout.config()
-    assert cfg["max_concurrent"] == 2 and 0 < cfg["max_wait_s"] < 420
+    assert cfg["max_concurrent"] == 4 and 0 < cfg["max_wait_s"] < 420
 
 
 def test_frame_only_cuts_nothing_and_takes_no_slot(monkeypatch):
