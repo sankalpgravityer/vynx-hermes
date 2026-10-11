@@ -121,13 +121,27 @@ def _create_scheduled_run(
 
     remote = _vnyx_snapshot(tenant_id)
     if remote is not None:
+        # THE MODE IS THE CALLER'S, the Brain is vnyx-api's (11 Oct 2026).
+        #
+        # vnyx-api's snapshot carries the tenant's stored mode. The sweep passes
+        # that same mode in cfg_row, so overlaying it changes nothing for the sweep.
+        # run_from_sheet.py is different: it puts the mode IT was asked for in
+        # cfg_row (LIVE only with --approve). Without the overlay, a run it opened
+        # took the tenant's LIVE instead. The first products then ran LIVE, approving
+        # and making drafts live with no --approve given, while the stored snapshot
+        # was rewritten to SHADOW a moment later. Klekt run 41820557 did this:
+        # 99 drafts went Active under a run labelled "shadow, recording only".
+        snap = {**remote, "openedBy": "hermes-sweep"}
+        for key in ("mode", "shadowWritesRepairs"):
+            if cfg_row.get(key) is not None:
+                snap[key] = cfg_row[key]
         row = db.write_returning(
             """
             INSERT INTO "AutoApprovalRun" ("tenantId", source, "configSnapshot")
             VALUES (%(t)s::uuid, %(src)s::"AutoApprovalRunSource", %(s)s::jsonb)
             RETURNING id
             """,
-            {"t": tenant_id, "src": source, "s": Jsonb({**remote, "openedBy": "hermes-sweep"})},
+            {"t": tenant_id, "src": source, "s": Jsonb(snap)},
         )
         return str(row["id"])
 

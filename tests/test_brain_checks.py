@@ -384,6 +384,30 @@ def test_a_hermes_opened_run_takes_vnyx_apis_snapshot_with_the_brain_compiled(op
     assert rs.sync_changes is True and rs.price_mode == "rounding_only"
 
 
+def test_the_callers_mode_wins_over_the_tenants(opened, monkeypatch):
+    """11 Oct 2026, Klekt run 41820557. vnyx-api's snapshot carries the tenant's LIVE.
+    run_from_sheet.py without --approve asks for SHADOW plus writes, and the run it
+    opens must say SHADOW from the first product. Otherwise it approves and makes
+    drafts live that nobody asked for."""
+    sweep, written = opened
+    _answer(monkeypatch, 200, {"snapshot": {
+        "mode": "LIVE", "shadowWritesRepairs": False,
+        "brain": {"compiled": {"chain": {"activateDrafts": True}, "policy": {}}}}})
+    sweep._create_scheduled_run(_TENANT, {**_CFG_ROW, "mode": "SHADOW", "shadowWritesRepairs": True},
+                                source="MANUAL_FULL_REVIEW")
+    rs = settings_from_snapshot(written["s"].obj)
+    assert rs.mode == "SHADOW" and rs.apply is True and rs.approve is False
+    assert rs.activate_drafts is True, "the Brain still comes from vnyx-api"
+
+
+def test_the_sweep_keeps_the_tenants_mode(opened, monkeypatch):
+    """The sweep passes the stored row, so the overlay is the same value."""
+    sweep, written = opened
+    _answer(monkeypatch, 200, {"snapshot": {"mode": "LIVE", "shadowWritesRepairs": False, "brain": {}}})
+    sweep._create_scheduled_run(_TENANT, {**_CFG_ROW, "mode": "LIVE", "shadowWritesRepairs": False})
+    assert settings_from_snapshot(written["s"].obj).approve is True
+
+
 def test_without_vnyx_api_the_run_is_built_here_as_before(opened, monkeypatch):
     sweep, written = opened
     _answer(monkeypatch, 404, {"error": "no config"})
