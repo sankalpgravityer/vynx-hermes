@@ -86,10 +86,15 @@ _DEFAULTS: dict[str, Any] = {
     # builder already does for the Kids rig), never held for being Kids.
     # `hold` leaves their renders to a person.
     "kids_renders": "generate",
+    # A product still without a brand or size after the care-label pass
+    # (11 Oct 2026, the user's call): `hold` keeps it in Review, HELD_FOR_HUMAN
+    # (NO_BRAND_OR_SIZE); `reject` moves it to the Rejected tab as before.
+    "missing_attrs": "hold",
     # Decision 8: a product nothing can repair — no garment photograph, every
-    # image model declining the print — is REJECTED with its reason rather
-    # than held. `hold` keeps the old behaviour.
-    "unfixable": "reject",
+    # image model declining the print. `hold` (11 Oct 2026, the user's call: the
+    # agent rejects nothing, a person decides) keeps it in Review with its
+    # reason; `reject` moves it to the Rejected tab as before.
+    "unfixable": "hold",
     # Roots that mean a child model. Judged against no adult build.
     "kids_roots": ["Kids", "Kid", "Children", "Child"],
 

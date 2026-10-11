@@ -359,7 +359,8 @@ def unfixable_rejection(result: dict[str, Any], verdict: Verdict,
     whether the agent acts on it, and it acts only when
 
       * the repairs were allowed to write — a shadow pass archives nothing;
-      * `readiness.unfixable` is `reject` (the default), not `hold`;
+      * `readiness.unfixable` is `reject` — `hold` is the shipped value since
+        11 Oct 2026 (the user's call: the agent rejects nothing);
       * the product is HELD — a VERIFIED product is approvable and is never
         archived over a picture the pre-flight was content with; a FAILED one
         already has its terminal verdict;
@@ -373,7 +374,7 @@ def unfixable_rejection(result: dict[str, Any], verdict: Verdict,
     code = str(unfix.get("code") or "").strip()
     if not (apply and code) or verdict.status != "HELD_FOR_HUMAN" or unavailable:
         return None
-    if str(readiness.config(pol if pol is not None else policy()).get("unfixable") or "reject") != "reject":
+    if str(readiness.config(pol if pol is not None else policy()).get("unfixable") or "hold") != "reject":
         return None
     reason = str(unfix.get("reason") or code)
     return code, reason
@@ -780,22 +781,39 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     # product — the exact incident the outage guard exists for. A product on
     # `vision_unavailable` has not had its chance; it is held above, not
     # rejected here.
+    #
+    # HELD IN REVIEW, NOT REJECTED (11 Oct 2026, the user's call, the same as the
+    # no-care-label rule): a person corrects the brand or size and runs it again.
+    # `readiness.missing_attrs: reject` restores the move to the Rejected tab.
     if (rs.apply and not settled and verdict.status == "HELD_FOR_HUMAN"
             and not unavailable and (missing := _missing_attrs(product_id))):
         why = f"{' and '.join(missing)} missing — not readable from the care label"
-        events.emit(tenant_id, "warn", f"{row['productSku']} — {why}, rejecting",
-                    run_id=row["runId"], run_product_id=row["id"],
-                    product_id=product_id)
-        if _archive(row, why):
-            _finish(
-                row,
-                Verdict("FAILED", "NO_BRAND_OR_SIZE", why, False, False),
-                blocking_rules=list(result.get("remaining") or []),
-                steps=steps,
-                duration_ms=duration,
-                expect_status=expect_status,
-            )
-            return abort
+        from app import readiness
+        from app.config import policy
+
+        if str(readiness.config(policy()).get("missing_attrs") or "hold").lower() != "reject":
+            events.emit(tenant_id, "warn",
+                        f"{row['productSku']} — {why}, held in Review for a person",
+                        run_id=row["runId"], run_product_id=row["id"],
+                        product_id=product_id)
+            verdict = Verdict("HELD_FOR_HUMAN", "NO_BRAND_OR_SIZE",
+                              f"{why} — add it and run it again"
+                              + (f"; {verdict.reason}" if verdict.reason else ""),
+                              False, False)
+        else:
+            events.emit(tenant_id, "warn", f"{row['productSku']} — {why}, rejecting",
+                        run_id=row["runId"], run_product_id=row["id"],
+                        product_id=product_id)
+            if _archive(row, why):
+                _finish(
+                    row,
+                    Verdict("FAILED", "NO_BRAND_OR_SIZE", why, False, False),
+                    blocking_rules=list(result.get("remaining") or []),
+                    steps=steps,
+                    duration_ms=duration,
+                    expect_status=expect_status,
+                )
+                return abort
 
     # UNFIXABLE BY ANY RE-RUN (readiness phase 4, decision 8). The chain has
     # named a defect no step can clear — no garment photograph to render
