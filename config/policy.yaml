@@ -1526,11 +1526,17 @@ readiness:
   # Decision 4: Kids products are rendered with a child model, never held for
   # being Kids. `hold` leaves their renders to a person.
   kids_renders: generate
+  # A PRODUCT STILL WITHOUT A BRAND OR SIZE after the care-label pass (11 Oct 2026,
+  # the user's call): `hold` keeps it in Review, HELD_FOR_HUMAN (NO_BRAND_OR_SIZE),
+  # for a person to correct it and run it again; `reject` moves it to the Rejected
+  # tab through the reject step, as before.
+  missing_attrs: hold
   # Decision 8: a product nothing can repair — no garment photograph
-  # (NO_GARMENT_PHOTO), every image model declining the print (RENDER_REFUSED)
-  # — is rejected with its reason through the reject step, which archives any
-  # listing. `hold` keeps it in Review for a person instead.
-  unfixable: reject
+  # (NO_GARMENT_PHOTO), every image model declining the print (RENDER_REFUSED).
+  # `hold` (11 Oct 2026, the user's call: the agent rejects nothing, a person
+  # decides) keeps it in Review with its reason; `reject` moves it to the Rejected
+  # tab through the reject step, which archives any listing.
+  unfixable: hold
   # Roots that mean a child model, judged against no adult build.
   kids_roots: [Kids, Kid, Children, Child]
   # The model's build against the garment's size. The gate's one call gains a

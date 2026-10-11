@@ -81,3 +81,40 @@ def test_the_shipped_policy_holds_and_buys_two_regen_rounds():
 
     cfg = readiness.config(policy())
     assert cfg["no_care_label"] == "hold" and cfg["regen_rounds"] == 2
+    # 11 Oct 2026, the user's call: the agent rejects nothing; a person decides.
+    assert cfg["missing_attrs"] == "hold" and cfg["unfixable"] == "hold"
+
+
+# --------------------------------------------------------------------------- #
+# No brand or size after the care-label pass (11 Oct 2026): held, not rejected
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def chained(monkeypatch, wired):
+    """The care label is there and the chain runs and holds; brand and size stay missing."""
+    from app.services.auto_approval.outcome import Verdict
+
+    monkeypatch.setattr(runner, "_has_care_label", lambda pid: True)
+    monkeypatch.setattr(runner, "_load_repair",
+                        lambda: lambda *a, **k: {"steps": [], "remaining": ["DATA.010"]})
+    monkeypatch.setattr(runner, "classify", lambda result: Verdict(
+        "HELD_FOR_HUMAN", "DATA.010", "Required field 'brand' is empty.", False, False))
+    monkeypatch.setattr(runner, "_missing_attrs", lambda pid: ["brand", "size"])
+    return wired
+
+
+def test_no_brand_or_size_is_held_in_review_not_rejected(chained):
+    _run()
+    assert chained["archived"] == []                     # never sent to the Rejected tab
+    (v,) = chained["finished"]
+    assert (v.status, v.outcome, v.approved, v.retryable) == (
+        "HELD_FOR_HUMAN", "NO_BRAND_OR_SIZE", False, False)
+    assert "brand and size missing" in v.reason and "brand' is empty" in v.reason
+
+
+def test_missing_attrs_reject_restores_the_move_to_the_rejected_tab(chained):
+    with policy_overlay({"readiness": {"missing_attrs": "reject"}}):
+        _run()
+    assert chained["archived"] == ["brand and size missing — not readable from the care label"]
+    (v,) = chained["finished"]
+    assert (v.status, v.outcome) == ("FAILED", "NO_BRAND_OR_SIZE")

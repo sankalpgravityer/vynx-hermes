@@ -888,20 +888,29 @@ HELD = Verdict("HELD_FOR_HUMAN", "IMG.003", "IMG.003", False, False)
 RESULT = {"unfixable": {"code": "NO_GARMENT_PHOTO", "reason": "NO_GARMENT_PHOTO — no garment photograph"}}
 
 
+def _rejecting() -> dict:
+    """The policy with `readiness.unfixable: reject` — the pre-11-Oct behaviour."""
+    pol = copy.deepcopy(POL)
+    pol["readiness"]["unfixable"] = "reject"
+    return pol
+
+
 def test_the_runner_rejects_only_a_held_product_under_apply_with_the_judge_present():
-    assert runner.unfixable_rejection(RESULT, HELD, [], apply=True, pol=POL) == (
+    rej = _rejecting()
+    assert runner.unfixable_rejection(RESULT, HELD, [], apply=True, pol=rej) == (
         "NO_GARMENT_PHOTO", "NO_GARMENT_PHOTO — no garment photograph")
-    assert runner.unfixable_rejection(RESULT, HELD, [], apply=False, pol=POL) is None
-    assert runner.unfixable_rejection(RESULT, HELD, ["gate"], apply=True, pol=POL) is None
+    assert runner.unfixable_rejection(RESULT, HELD, [], apply=False, pol=rej) is None
+    assert runner.unfixable_rejection(RESULT, HELD, ["gate"], apply=True, pol=rej) is None
     verified = Verdict("VERIFIED", "READY_NOT_MOVED", "ok", False, False)
-    assert runner.unfixable_rejection(RESULT, verified, [], apply=True, pol=POL) is None
-    assert runner.unfixable_rejection({"unfixable": None}, HELD, [], apply=True, pol=POL) is None
+    assert runner.unfixable_rejection(RESULT, verified, [], apply=True, pol=rej) is None
+    assert runner.unfixable_rejection({"unfixable": None}, HELD, [], apply=True, pol=rej) is None
 
 
-def test_the_runner_holds_instead_when_policy_says_hold():
-    hold = copy.deepcopy(POL)
-    hold["readiness"]["unfixable"] = "hold"
-    assert runner.unfixable_rejection(RESULT, HELD, [], apply=True, pol=hold) is None
+def test_the_shipped_policy_holds_an_unfixable_product():
+    """11 Oct 2026, the user's call: the agent rejects nothing; a person decides."""
+    assert runner.unfixable_rejection(RESULT, HELD, [], apply=True, pol=POL) is None
+    assert runner.unfixable_rejection(RESULT, HELD, [], apply=True, pol={}) is None, \
+        "the code default is hold too"
 
 
 def test_run_remote_sends_views_as_a_typed_list(monkeypatch):
