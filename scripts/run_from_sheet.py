@@ -126,6 +126,28 @@ APPROVABLE_STAGES = ("REVIEW", "LABEL", "MISSING_LABEL", "PHOTOBOOTH")
 SELECTABLE_STAGES = (*APPROVABLE_STAGES, "APPROVED")
 
 
+def section_of(row: dict[str, Any]) -> str:
+    """The products-list section a product sits in, as a UI run would name it.
+
+    11 Oct 2026. runner.verify_one has REVIEW-ONLY rules: it rejects a held product
+    with no brand or size, rejects an unfixable defect, and holds a product with no
+    care label. A run the Overview scopes to Approved passes section="APPROVED" so
+    those rules skip products that already carry a verdict. Rejecting an approved
+    product takes its live listing down. This script never passed a section, so
+    every product, --include-approved ones too, ran under the Review rules.
+
+    Read from reviewStatus, the column the app's tabs are built on (vnyx-api
+    enqueue.ts TAB_REVIEW_STATUS). An ACCEPTED product whose stage still reads
+    LABEL is in the Approved tab all the same.
+    """
+    review = str(row.get("reviewStatus") or "").upper()
+    if review == "ACCEPTED":
+        return "APPROVED"
+    if review == "REJECTED":
+        return "REJECTED"
+    return "REVIEW"
+
+
 class _Tee:
     """Write to the terminal AND a file, from inside the process.
 
@@ -285,6 +307,7 @@ def resolve(entry: dict[str, str], include_failed: bool,
         f"""
         SELECT p.id, p.sku, p.title, p."tenantId", t.name AS tenant,
                p."currentStage", p."generationStatus", p."verificationStatus",
+               p."reviewStatus"::text AS "reviewStatus",
                {checks}
           FROM "Product" p JOIN "Tenant" t ON t.id = p."tenantId"
          WHERE {where}
@@ -894,7 +917,7 @@ class Parallel:
                                       allow_stage=stages, expect_status="QUEUED",
                                       skip_matte=self.skip_matte,
                                       price_rounding_only=self.price_rounding_only,
-                                      silent=True)
+                                      silent=True, section=section_of(row))
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             with lock:
                 tally["failed"] += 1
@@ -913,7 +936,8 @@ class Parallel:
         # stall the other workers' output. Its two lines landed in the middle
         # of a different product's block otherwise, which is exactly the
         # interleaving the block was introduced to stop.
-        rejected = (st == "HELD_FOR_HUMAN" and reject_attrs
+        # Review only, like the agent's own rejections (section_of).
+        rejected = (st == "HELD_FOR_HUMAN" and reject_attrs and section_of(row) == "REVIEW"
                     and reject_missing_attrs(job["run_id"], row,
                                              str(row["tenantId"]), apply,
                                              quiet=True))
@@ -1457,7 +1481,7 @@ def main() -> int:
             continue
 
         # Foreclosed before the chain starts — see reject_missing_label.
-        if args.reject_missing_label and reject_missing_label(
+        if args.reject_missing_label and section_of(row) == "REVIEW" and reject_missing_label(
                 run_id, row, tenant_id, args.apply):
             failed += 1
             continue
@@ -1510,7 +1534,8 @@ def main() -> int:
         # guard protects against.
         abort = runner.verify_one(claimed, rs, ignore_stop=True, allow_stage=stages,
                                   skip_matte=args.no_matte,
-                                  price_rounding_only=args.price_rounding_only)
+                                  price_rounding_only=args.price_rounding_only,
+                                  section=section_of(row))
 
         after = db.fetch_one(
             'SELECT status, outcome, reason, approved FROM "AutoApprovalRunProduct"'
@@ -1549,7 +1574,7 @@ def main() -> int:
 
         # AFTER the chain, so the care-label and extract steps have had their
         # chance to supply what is missing. See reject_missing_attrs.
-        if (st == "HELD_FOR_HUMAN" and args.reject_missing_attrs
+        if (st == "HELD_FOR_HUMAN" and args.reject_missing_attrs and section_of(row) == "REVIEW"
                 and reject_missing_attrs(run_id, row, tenant_id, args.apply)):
             failed += 1
             continue
