@@ -33,6 +33,7 @@ Three rules, each answering a question the existing rule set does not:
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.models import Finding, ProductSnapshot, Severity
@@ -66,6 +67,10 @@ REQUIRED_FIELDS: tuple[str, ...] = (
 # 46 instead of 36. That is why sitting on a generic guide is worth reporting
 # even though the guide exists and is valid.
 _GENERIC_GUIDES = {"defaults", "default", "generic", "kids"}
+
+# Required fields whose placeholder ("Unknown") DATA.010 treats as empty — see
+# the rule.
+_PLACEHOLDER_IS_EMPTY = ("eu_size",)
 
 _MEN_WORDS = ("men", "mens", "man", "male")
 _WOMEN_WORDS = ("women", "womens", "woman", "female", "ladies")
@@ -232,6 +237,57 @@ def expected_guide_name(p: ProductSnapshot) -> str | None:
     return f"{str(p.master_category).strip()} {str(p.category).strip()}"
 
 
+# A LETTER SIZE WRITTEN AS A WORD (12 Oct 2026). The care-label pass and the
+# tenants' own imports store "Small", "X-Large", "2XL"; every chart is keyed
+# XS/S/M/L/XL/XXL. KLE-000514 ("Small", Men Bottoms) and its kind matched no
+# ladder at all, so the EU size could never be looked up. Keyed on the letters
+# and digits only, lowercase.
+_SIZE_WORDS = {
+    "extrasmall": "XS", "xsmall": "XS", "xsml": "XS",
+    "small": "S", "sml": "S", "sm": "S",
+    "medium": "M", "med": "M", "md": "M",
+    "large": "L", "lrg": "L", "lg": "L",
+    "extralarge": "XL", "xlarge": "XL",
+    "xxlarge": "XXL", "extraextralarge": "XXL", "2xl": "XXL", "2xlarge": "XXL",
+    "xxxlarge": "XXXL", "3xl": "XXXL", "3xlarge": "XXXL",
+    "xxsmall": "XXS", "2xs": "XXS",
+}
+
+
+# A WAIST WRITTEN WITH ITS LENGTH: "W28 L30", "W28/L30", "28/30", "28x30",
+# "28W 30L". The charts are keyed by the waist alone (BOA-006507, "W28 L30" on
+# a W21-W44 ladder, matched nothing). Two digits each side and an explicit
+# separator, so a kids' range like "11-12" is not read as one.
+_WAIST_LENGTH = (
+    re.compile(r"^w\s*(\d{2})\s*[/x ]?\s*l\s*\d{2}$", re.I),
+    re.compile(r"^(\d{2})\s*[/x]\s*\d{2}$", re.I),
+    re.compile(r"^(\d{2})\s*w\s*[/ ]?\s*\d{2}\s*l$", re.I),
+)
+
+
+def size_aliases(value: Any) -> list[str]:
+    """`value` as stored, then the chart spelling it stands for, if any.
+
+    "Small" -> ["Small", "S"]; "X-Large" -> ["X-Large", "XL"]; "M" -> ["M"];
+    "W28 L30" -> ["W28 L30", "W28", "28"]. The stored spelling stays first, so a
+    chart that really is keyed "Small" still answers on its own word.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+    flat = "".join(ch for ch in raw.lower() if ch.isalnum())
+    out = [raw]
+    letter = _SIZE_WORDS.get(flat)
+    if letter and letter.lower() != raw.lower():
+        out.append(letter)
+    for pattern in _WAIST_LENGTH:
+        m = pattern.match(raw)
+        if m:
+            out += [f"W{m.group(1)}", m.group(1)]
+            break
+    return out
+
+
 def _size_candidates(p: ProductSnapshot) -> list[str]:
     """The size spellings to look for in a chart. Stored data uses several.
 
@@ -243,12 +299,12 @@ def _size_candidates(p: ProductSnapshot) -> list[str]:
     waist = str(p.waist).strip() if p.waist else None
     if waist and not _num(waist):
         waist = None
-    return [
-        str(v).strip()
-        for v in (p.size, p.international_size, waist,
-                  f"W{waist}" if waist else None)
-        if v and str(v).strip()
-    ]
+    out: list[str] = []
+    for v in (p.size, p.international_size, waist, f"W{waist}" if waist else None):
+        for alias in size_aliases(v):
+            if alias not in out:
+                out.append(alias)
+    return out
 
 
 def _num(text: str) -> str | None:
@@ -277,6 +333,9 @@ def _size_key(text: str) -> tuple[str, str] | None:
     raw = str(text).strip().lower()
     if not raw:
         return None
+    word = _SIZE_WORDS.get("".join(ch for ch in raw if ch.isalnum()))
+    if word:
+        return ("alpha", word.lower())
     number = _num(raw)
     if number is not None:
         return ("num", number)
@@ -334,6 +393,19 @@ def candidate_guides(p: ProductSnapshot, *,
             if gg is not None and gg != want_gender:
                 continue
         hits.append(name)
+
+    # A CHART NAMED FOR THE PRODUCT'S GENDER BEATS ONE NAMED FOR NEITHER (12 Oct
+    # 2026). Unknown-gender charts are kept above so a name this module cannot
+    # parse is not lost — but when a chart that DOES name the gender also fits,
+    # the unparsed one is a weaker answer, not an equal one. Klekt's
+    # "Accesories" chart lists S/M/L, so every men's top in a letter size
+    # matched it AND "Men Uppers", SIZE.010 called it ambiguous, and nothing was
+    # attached (KLE-001072). Same filter shape as the two below: dropped when it
+    # would empty the list.
+    if want_gender is not None:
+        named = [n for n in hits if guide_gender(n) == want_gender]
+        if named:
+            hits = named
 
     # Narrow to the right HALF OF THE BODY when both sides can be read.
     #
@@ -625,13 +697,25 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
     out: list[Finding] = []
 
     # ---- DATA.010: required fields present ---------------------------------
+    #
+    # The EU size also counts as empty when it holds a PLACEHOLDER (12 Oct
+    # 2026). approve-products.ts refuses "Unknown" with "no EU size", and the
+    # gate called the same product verified — 124 held products sat between the
+    # two with nothing planned, though the chart paired their size. Only the EU
+    # size: for the other fields a placeholder stays DATA.001's business.
+    placeholders = {str(x).strip().lower()
+                    for x in ((pol or {}).get("confidence") or {}).get("placeholders") or []}
     for field in REQUIRED_FIELDS:
-        if not _absent(getattr(p, field, None)):
+        value = getattr(p, field, None)
+        stored = (field in _PLACEHOLDER_IS_EMPTY and value is not None
+                  and str(value).strip().lower() in placeholders)
+        if not (_absent(value) or stored):
             continue
         label = _LABELS.get(field, field.replace("_", " "))
         out.append(Finding(
             rule_id="DATA.010", severity=Severity.HIGH, fields=[field],
-            message=f"Required field '{label}' is empty.",
+            message=(f"Required field '{label}' is empty"
+                     + (f" (stored as {str(value).strip()!r})." if stored else ".")),
             detail={"field": field},
             # The evidence layer can fill several of these from the photographs,
             # which is the difference between escalating and repairing.
@@ -913,6 +997,39 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
                 message=f"No sizing guide is attached; '{covering}' covers this product.",
                 detail={"suggested": [covering]},
             ))
+
+    # ---- SIZE.016: the attached guide has no chart image to show -------------
+    #
+    # 12 Oct 2026, KLE-000986: on "Men Bottoms (auto)", EU size right, gate
+    # verified — and approve-products.ts refused it with "no size chart on the
+    # product", because "(auto)" has no chart image to put in the gallery. The
+    # guide that answers THROUGH it (`sizing.chart_preference`: Men Bottoms ->
+    # Men Bottoms (auto)) has one, and the EU size is checked against "(auto)"
+    # from either, so moving onto it changes no number and adds the chart.
+    #
+    # Only when the catalog says what images each guide carries (an older
+    # vnyx-api sends no `images`, and absence of the key is not "no image"), and
+    # only when exactly one guide prefers this one.
+    if p.catalog is not None and p.sizing_guide:
+        guides = p.catalog.sizing_guides or {}
+        mine = guides.get(p.sizing_guide)
+        if mine is not None and "images" in mine and not mine.get("images"):
+            prefer = (pol.get("sizing") or {}).get("chart_preference") or {}
+            parents = [
+                name for name, firsts in prefer.items()
+                if p.sizing_guide in (firsts or [])
+                and (guides.get(name) or {}).get("images")
+            ]
+            if len(parents) == 1:
+                out.append(Finding(
+                    rule_id="SIZE.016", severity=Severity.HIGH,
+                    fields=["sizing_guide"],
+                    message=(f"Sizing guide '{p.sizing_guide}' has no size-chart "
+                             f"image, so the product cannot show one; "
+                             f"'{parents[0]}' sizes it from the same numbers and "
+                             f"has one."),
+                    detail={"sizing_guide": p.sizing_guide, "suggested": parents},
+                ))
 
     out.extend(check_column_drift(p))
     return out
