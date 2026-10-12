@@ -84,6 +84,19 @@ def test_the_gate_holds_it_for_a_person_and_repairs_nothing():
     assert "DATA.011" in blob and "MT NO BRAND" in blob
 
 
+@pytest.mark.parametrize("brand", [
+    # The values found on 152 approved Klekt / BOAS / Midtex products on 12 Oct 2026.
+    "BOAS", "NOBRAND", "MT NO BRAND", "Unknown", "No-Brand", "NO BRAND", "No Brand",
+    "MK No Brand", "Nobrand", "NoBrands", "MT Nobrand", "No-brand",
+])
+def test_the_values_found_on_live_products_are_never_approved(brand):
+    """12 Oct 2026, the user: a product whose brand says any of these is not approved —
+    it is held for a person. The gate must say not verified, a person needed."""
+    out = approval.run_gate(raw(brand=brand), catalog={**CATALOG, "brands": [*CATALOG["brands"], brand]})
+    assert out["verified"] is False and out["human_intervention_needed"] is True
+    assert any(f.get("rule_id") == "DATA.011" for f in out["blocking"])
+
+
 def test_policy_can_change_the_list():
     pol = {**policy(), "completeness": {"no_brand": {"equals": ["generic"], "contains": []}}}
     p = to_snapshot(raw(brand="Generic"), catalog=CATALOG)

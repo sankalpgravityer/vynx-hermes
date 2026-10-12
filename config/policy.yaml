@@ -834,6 +834,24 @@ imagery:
     stand_check: true
     stand_bottom_max: 0.03
     stand_band: 0.005
+    # A GARMENT PARSER'S ANSWER WHERE A COLOUR TEST CANNOT JUDGE (12 Oct 2026). 368 held
+    # products kept their old 896x1195 cut-out because every new cut-out was refused by a
+    # false alarm, and Hermes re-framed the old one. Proven on two of them:
+    #  - KLE-002497, a hoodie on a hanger at the decision station, its cuff at the frame's
+    #    foot, refused as "kept the stand" — no pole, no podium. A parser's (cloth-seg)
+    #    cut-out reaching the foot is a stand only when under `stand_parser_garment_foot`
+    #    of what touches the foot is the garment's own colour.
+    #  - KLE-001856, light-grey joggers on a near-white wall, refused because 14% of the
+    #    cut-out is "the backdrop colour" — its own fabric. A parser's cut-out at least
+    #    `leftover_wall_coloured_garment` wall-coloured is a wall-coloured garment: the
+    #    source colour test abstains and the cut-out's own backdrop decides, as it already
+    #    does for a white shirt.
+    # Whole-object methods (IS-Net, the paints) keep the set by design and are judged as
+    # before. The photo audit still looks at every cut-out after this. 0 restores the old
+    # rule. Measured on the local DB lab: parser cut-outs cropped at the hem 0.74-1.0 garment-
+    # coloured at the foot; wall-coloured garments 14-48%, dark garments under 3%.
+    stand_parser_garment_foot: 0.6
+    leftover_wall_coloured_garment: 0.10
     # THE GARMENT PARSERS' EDGES (7 Oct 2026; cutout._cloth_score / _cloth_alpha /
     # _recover_trim). MID-000430: rembg resized the parser's 768x768 LABEL map to the
     # photograph, so every cloth-seg outline was a ~5 px staircase with wall in the

@@ -139,6 +139,14 @@ DEFAULTS: dict[str, Any] = {
     # Measured on the fix queue: 522 of 525 usable photos accepted this way had
     # been judged good by a person. See `agreed_cut` in remove_background.
     "agreement_min_iou": 0.98,
+    # --- a garment parser's answer where a colour test cannot judge (12 Oct 2026) ---
+    # A parser's cut-out reaching the frame's foot is a stand only when less than this
+    # share of the foot is the garment's own colour (_kept_stand). 0 = the old rule.
+    "stand_parser_garment_foot": 0.6,
+    # A parser's cut-out at least this share wall-coloured IS a wall-coloured garment;
+    # the source-backdrop colour test abstains and the cut-out's own backdrop decides
+    # (_source_backdrop). 0 = the old rule.
+    "leftover_wall_coloured_garment": 0.10,
     # THE CHAIN FOR POST /v1/imagery/cutout — the URL-in, PNG-out endpoint. Its
     # own list, so turning it on changes nothing for vnyx-api's calls to
     # /v1/imagery/remove-background, which follow `strategies` above.
@@ -1166,11 +1174,23 @@ def _cloth_seg(data: bytes, model: str | None = None) -> tuple[bytes | None, str
     return buf.getvalue(), None
 
 
-def _source_backdrop(source: bytes, result: bytes) -> tuple[bool | None, str]:
+def _source_backdrop(source: bytes, result: bytes, parser: bool = False,
+                     cfg: dict[str, Any] | None = None) -> tuple[bool | None, str]:
     """Did the cut-out keep part of the SOURCE's backdrop? (ok, why)
 
     `ok` is None when the question could not be put at all — the caller then
     asks the cut-out's own backdrop instead (item 7; see `_kept_backdrop`).
+
+    `parser`: the cut-out is a GARMENT PARSER's (cloth-seg). A colour test cannot tell a
+    garment that IS the wall's colour from the wall: KLE-001856's light-grey joggers on a
+    near-white wall (12 Oct 2026) came back "a single 14% region is the backdrop colour"
+    from every method, the old 896x1195 cut-out was re-framed, and the product held. On
+    the local lab such garments measured 14-48% wall-coloured, a parser's cut-out of a
+    dark garment under 3%. So when a parser's cut-out is at least
+    `leftover_wall_coloured_garment` wall-coloured, this abstains — exactly as
+    `_own_leftovers` already does for a garment the colour of its own backdrop — and the
+    cut-out's own backdrop decides. Whole-object methods keep the set by design and are
+    judged as before.
 
     THE HOLE THIS FILLS. `_is_cutout` asks the review rules' classifier, which
     looks at the FRAME BORDER — the right question for "has anything been
@@ -1282,6 +1302,13 @@ def _source_backdrop(source: bytes, result: bytes) -> tuple[bool | None, str]:
         return True, f"{total:.0%} backdrop-coloured (no cv2)"
 
     scattered = float(suspect.sum()) / float(opaque.sum())
+    if parser and largest > 0.01:
+        cfg = cfg if cfg is not None else config()
+        wall_coloured = float(cfg.get("leftover_wall_coloured_garment") or 0.0)
+        if wall_coloured > 0 and scattered >= wall_coloured:
+            return None, (f"the garment itself is {scattered:.0%} the wall's colour "
+                          f"rgb({backdrop[0]:.0f},{backdrop[1]:.0f},{backdrop[2]:.0f}) — a colour "
+                          f"test cannot tell its fabric from the wall")
     if largest > 0.01:
         return False, (f"a single {largest:.0%} region of the cut-out is the "
                        f"backdrop colour rgb({backdrop[0]:.0f},"
@@ -1479,7 +1506,7 @@ def _own_leftovers(result: bytes, cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def _kept_backdrop(source: bytes, result: bytes,
-                   cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
+                   cfg: dict[str, Any] | None = None, parser: bool = False) -> tuple[bool, str]:
     """Did the cut-out keep part of the set? (ok, why)
 
     TWO WAYS OF ASKING IT, and the second is item 7. The source's backdrop when
@@ -1495,7 +1522,8 @@ def _kept_backdrop(source: bytes, result: bytes,
     refuse.
     """
     cfg = cfg if cfg is not None else config()
-    src, src_why = _source_backdrop(source, result)
+    parser = parser or bool(cfg.get("_parser"))
+    src, src_why = _source_backdrop(source, result, parser=parser, cfg=cfg)
     if src is False:
         return False, src_why
 
@@ -2284,6 +2312,10 @@ def _intersect_alpha(mask_png: bytes, cloth_png: bytes) -> tuple[bytes | None, s
 # reaching into the chain below.
 STRATEGY_NAMES = ("object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg",
                   "gemini-mask", "openai-mask", "gemini-paint", "openai-paint")
+# The GARMENT PARSERS among them: trained to keep cloth and drop the stand and the wall,
+# so the stand and wall checks give their answers the benefit of the doubt where a colour
+# test cannot judge (`stand_parser_garment_foot`, `leftover_wall_coloured_garment`).
+PARSER_STRATEGIES = ("cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg")
 # The strategy for photographs HUNG ON THE WALL (app/imaging/hanger_cutout.py): IS-Net
 # keeps the whole garment, clips included, and only the thin hanger parts are
 # painted out. Runs first, and only when the caller says where the photo came from
@@ -2399,7 +2431,8 @@ def hanger_route(origin: str | None, hcfg: dict[str, Any]) -> bool:
                 and str(origin).upper() in {str(o).upper() for o in hcfg.get("origins") or []})
 
 
-def _kept_stand(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
+def _kept_stand(png: bytes, cfg: dict[str, Any] | None = None,
+                parser: bool = False) -> tuple[bool, str]:
     """Did a TOP's cut-out keep the mannequin's stand? (kept, why)
 
     MID-000442's FRONT and MID-000445's BACK (7 Oct 2026): photos the catalogue calls WEB
@@ -2408,24 +2441,86 @@ def _kept_stand(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bool, st
     colour) and the stand went to the listing. A top ends at its hem; a cut-out of one
     that reaches the photograph's FOOT across more than `stand_bottom_max` of its width is
     standing on something. The bottom `stand_band` of the frame is read, so a podium the
-    frame cuts one row short still counts. Never raises; (False, "") when unreadable."""
+    frame cuts one row short still counts. Never raises; (False, "") when unreadable.
+
+    `parser`: the cut-out is a GARMENT PARSER's (cloth-seg). 12 Oct 2026: KLE-002497's
+    decision-station photo is a hoodie on a hanger whose cuff reaches the frame's foot —
+    no pole, no podium — and both parsers' correct cut-outs were refused as "kept the
+    stand", so the old 896x1195 cut-out was re-framed and the product held for its
+    resolution. A parser is trained to drop the stand, and what it keeps at the foot in
+    the GARMENT'S OWN COLOUR is the garment, cut by the frame. So for a parser the foot
+    must also be mostly not-garment-coloured (`stand_parser_garment_foot`) to count as a
+    stand. Whole-object methods (IS-Net, the paints) keep the set by design and are judged
+    as before: on the local lab their podiums matched a white collar or the white form
+    (0.66, 0.70), which no colour rule can be trusted with."""
     import numpy as np
     from PIL import Image
 
     cfg = cfg if cfg is not None else config()
+    parser = parser or bool(cfg.get("_parser"))
     try:
-        a = np.asarray(Image.open(io.BytesIO(png)).convert("RGBA").getchannel("A"))
+        im = np.asarray(Image.open(io.BytesIO(png)).convert("RGBA"))
     except Exception:  # noqa: BLE001
         return False, ""
+    a = im[..., 3]
     h, w = a.shape
     band = max(2, int(round(float(cfg.get("stand_band") or 0.005) * h)))
     reach = float(((a[h - band:] >= 128).any(axis=0)).mean())
     limit = float(cfg.get("stand_bottom_max") or 0.03)
-    if reach > limit:
-        return True, (f"kept the stand: the cut-out runs off the foot of the photograph across "
-                      f"{reach:.0%} of its width (a top ends at its hem; at most {limit:.0%} may "
-                      f"touch it) — the mannequin's pole and podium were left in")
-    return False, ""
+    if reach <= limit:
+        return False, ""
+    if parser:
+        need = float(cfg.get("stand_parser_garment_foot") or 0.0)
+        like = _foot_garment_like(im, band) if need > 0 else None
+        if like is not None and like >= need:
+            return False, (f"reaches the foot of the photograph across {reach:.0%} of its width, "
+                           f"but {like:.0%} of it is the garment's own colour — cut by the frame "
+                           f"at the hem, not standing on anything")
+    return True, (f"kept the stand: the cut-out runs off the foot of the photograph across "
+                  f"{reach:.0%} of its width (a top ends at its hem; at most {limit:.0%} may "
+                  f"touch it) — the mannequin's pole and podium were left in")
+
+
+def _foot_garment_like(im: Any, band: int) -> float | None:
+    """Of the kept pixels in the frame's bottom `band` rows, the share in the garment's
+    own colours: a Lab histogram (8-level bins, one bin of slack) of the kept pixels in
+    the middle 30-70% of the cut-out's height, a bin counting when it holds >= 0.2% of
+    them. Only WIDE rows (at least 30% of the widest) make the reference: a pole is a
+    thin column, and with a short top it runs through the middle band and would make
+    the podium's colour "the garment's". None when there is nothing to compare."""
+    import numpy as np
+
+    try:
+        import cv2
+    except Exception:  # noqa: BLE001
+        return None
+    a = im[..., 3] >= 128
+    h = a.shape[0]
+    foot = a[h - band:]
+    rows = np.where(a.any(axis=1))[0]
+    if not foot.any() or rows.size < 10:
+        return None
+    y0, y1 = int(rows.min()), int(rows.max())
+    span = y1 - y0 + 1
+    width = a.sum(axis=1)
+    wide = width >= 0.3 * float(width.max())
+    body = np.zeros_like(a)
+    body[y0 + int(0.3 * span): y0 + int(0.7 * span)] = True
+    body &= a & wide[:, None]
+    if body.sum() < 100:
+        body = a & wide[:, None]
+    if body.sum() < 100:
+        return None
+    q = (cv2.cvtColor(np.ascontiguousarray(im[..., :3]), cv2.COLOR_RGB2LAB) // 8).astype(np.intp)
+    hist = np.zeros((32, 32, 32), np.float32)
+    b = q[body]
+    np.add.at(hist, (b[:, 0], b[:, 1], b[:, 2]), 1.0)
+    hist /= float(hist.sum())
+    # One bin of slack on each of L, a and b: JPEG and shading move a colour a bin.
+    for axis in range(3):
+        hist = np.maximum(hist, np.maximum(np.roll(hist, 1, axis), np.roll(hist, -1, axis)))
+    f = q[h - band:][foot]
+    return float((hist[f[:, 0], f[:, 1], f[:, 2]] >= 0.002).mean())
 
 
 def _drop_stray_pieces(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[bytes, int]:
@@ -3193,17 +3288,27 @@ def _remove_background(
                     continue
                 why = f"{why}; {obj_why}"
 
+            # A GARMENT PARSER'S OWN ANSWER (12 Oct 2026): the stand and the wall
+            # checks give it the benefit of the doubt where a colour test cannot
+            # judge — see _kept_stand and _source_backdrop. Not the paint ∩ parser
+            # merge (label carries "∩"): that is still the paint's outline.
+            # Carried in the settings (`_parser`) so both checks keep their (png, cfg)
+            # signature for every caller and stand-in.
+            ccfg = {**cfg, "_parser": name in PARSER_STRATEGIES and "∩" not in label}
+
             # A TOP THAT REACHES THE FLOOR KEPT ITS STAND (7 Oct 2026, _kept_stand).
             if not family and stand_checked:
-                stood, stand_why = _kept_stand(out, cfg)
+                stood, stand_why = _kept_stand(out, ccfg)
                 if stood:
                     log.info("bg-removal %s kept the stand in %.1fs: %s", label, took, stand_why)
                     attempts.append(f"{label}: {stand_why}")
                     continue
+                if stand_why:
+                    log.info("bg-removal %s: %s", label, stand_why)
 
             # The border says something was removed; this says whether what
             # remains is only the product. See _kept_backdrop.
-            clean, backdrop_why = (True, "") if family else _kept_backdrop(data, out, cfg)
+            clean, backdrop_why = (True, "") if family else _kept_backdrop(data, out, ccfg)
             if not clean:
                 log.info("bg-removal %s kept part of the set in %.1fs: %s",
                          label, took, backdrop_why)
