@@ -14,6 +14,9 @@ from app.models import Finding, ProductSnapshot, Severity
 
 _NUM = re.compile(r"(\d+)")
 
+# A rig value that means "none chosen" — approve-products.ts's PLACEHOLDER set.
+_RIG_PLACEHOLDERS = {"", "unknown", "n/a", "na", "none", "null", "-", "tbd"}
+
 
 def _int(value: str | None) -> int | None:
     if not value:
@@ -172,7 +175,29 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
     # product's taxonomy carries the side it needs. No category list required,
     # so it works on any tenant's tree.
     mannequin_flagged = False
-    if p.mannequin and p.master_category and p.category:
+    # SHOES CARRY `readiness.mannequin.footwear` ("Flatlay"), 13 Oct 2026, the
+    # user's call. vnyx-api stores the photobooth's "Footwear" as "None", which
+    # approve-products.ts reads as a blank placeholder: all 70 held Klekt shoes
+    # were refused "no mannequin selected" while this rule set saw a rig and said
+    # nothing. A shoe on anything else is planned onto the footwear rig, and the
+    # torso checks below (side, gender) never judge a shoe.
+    from app.readiness import footwear_rig
+
+    shoe_rig = footwear_rig(p.category, p.subcategory, pol)
+    if shoe_rig:
+        mannequin_flagged = True
+        have = str(p.mannequin or "").strip()
+        if have.lower() != shoe_rig.lower():
+            blank = have.lower() in _RIG_PLACEHOLDERS
+            out.append(Finding(
+                rule_id="TAX.007" if blank else "TAX.005", severity=Severity.HIGH,
+                fields=["mannequin"],
+                message=(f"{'No mannequin rig' if blank else f'Mannequin {have!r}'} on footwear "
+                         f"({p.category} > {p.subcategory or '?'}); shoes carry '{shoe_rig}'."),
+                detail={"suggested": shoe_rig, "mannequin": have or None, "basis": "footwear"},
+            ))
+
+    if not shoe_rig and p.mannequin and p.master_category and p.category:
         from app.readiness import derive_rig
 
         key = f"{p.master_category}|{p.category}"
@@ -256,7 +281,7 @@ def check_taxonomy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
     # derivation vnyx-api's inferMannequinType performs — so it is derived and
     # written rather than waited for. Silent when nothing can be derived, and
     # when readiness is switched off.
-    if not p.mannequin:
+    if not p.mannequin and not shoe_rig:
         from app.readiness import derive_rig, enabled as readiness_enabled
 
         if readiness_enabled(pol):

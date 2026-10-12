@@ -1507,6 +1507,10 @@ readiness:
     upper: {men: "Men Top", women: "Women Top", any: "Top"}
     bottom: "Bottom"
     kids: "Kids"
+    # Shoes carry "Flatlay" (13 Oct 2026, the user's call): approve-products.ts reads
+    # the "None" vnyx-api stores for footwear as a blank and refuses "no mannequin
+    # selected". "" turns the footwear rule off.
+    footwear: "Flatlay"
   # A house choice (a category, a guide) wins a tie only when the tenant uses it
   # at least this many times more often than the runner-up.
   usage_tiebreak_ratio: 2

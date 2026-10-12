@@ -303,6 +303,47 @@ def test_a_missing_rig_is_derived_and_written():
     assert r["plan_covers_blockers"] is True
 
 
+# Shoes carry "Flatlay" (13 Oct 2026): vnyx-api stores footwear as "None", which
+# approve-products.ts reads as a blank — every held Klekt shoe was refused
+# "no mannequin selected" (KLE-002827).
+SHOE_CATALOG = catalog(
+    categories={**TREE, "Men": {**TREE["Men"], "Shoes": ["Lifestyle", "Running"]}},
+    sizingGuides={**GUIDES, "Shoes": {"sizes": ["36.5", "42"], "euSizes": ["36.5", "42"]}})
+
+
+def shoe(**over: Any) -> dict[str, Any]:
+    return {"category": "Shoes", "subCategory": "Lifestyle", "size": "42", "euSize": "42",
+            "sizingGuide": "Shoes", "title": "Vintage Nike Black Lifestyle Men 42", **over}
+
+
+def test_a_shoe_on_none_is_planned_onto_flatlay():
+    r = gate(SHOE_CATALOG, **shoe(mannequinType="None"))
+    assert writes(r, "mannequinType") == [{
+        "kind": "set_column", "field": "mannequinType", "value": "Flatlay",
+        "reason": "TAX.007", "detail": "was 'None'",
+    }]
+    r = gate(SHOE_CATALOG, **shoe(mannequinType=None))
+    assert [a["value"] for a in writes(r, "mannequinType")] == ["Flatlay"]
+
+
+def test_a_shoe_on_flatlay_passes_and_a_torso_rig_on_a_shoe_is_replaced():
+    ok = snap(SHOE_CATALOG, **shoe(mannequinType="Flatlay"))
+    assert [f.rule_id for f in check_taxonomy(ok, POL) if f.rule_id in ("TAX.005", "TAX.007")] == []
+    torso = snap(SHOE_CATALOG, **shoe(mannequinType="Men Top"))
+    found = [f for f in check_taxonomy(torso, POL) if f.rule_id in ("TAX.005", "TAX.007")]
+    assert [(f.rule_id, f.detail["suggested"]) for f in found] == [("TAX.005", "Flatlay")]
+
+
+def test_derive_rig_for_footwear_and_bootcut_jeans_are_not_shoes():
+    d = readiness.derive_rig
+    assert d("Men", ["men"], "Shoes", "Lifestyle", POL) == "Flatlay"
+    assert d("Kids", None, "Footwear", "Sneakers", POL) == "Flatlay"
+    assert d("Women", None, "Bottoms", "Bootcut Jeans", POL) == "Bottom"
+    off = copy.deepcopy(POL)
+    off.setdefault("readiness", {}).setdefault("mannequin", {})["footwear"] = ""
+    assert d("Men", ["men"], "Shoes", "Lifestyle", off) == "Men Top"
+
+
 def test_a_bottom_rig_on_bottoms_is_accepted_by_both_forms_of_tax005():
     p = snap(category="Bottoms", subCategory="Jeans", size="W32", euSize="48",
              sizingGuide="Men Bottoms", mannequinType="Bottom")
