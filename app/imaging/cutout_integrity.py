@@ -14,16 +14,22 @@ So this asks one narrow question per view, with the evidence to answer it:
   C  the top of the original, enlarged   (where the hanger, the hook and the clips are)
   D  the top of the cut-out, enlarged
 
-and answers, per view: the defects found — `missing_part`, `broken_edge`,
-`fragment` (a hanger, hook or clip only PARTLY removed), `background`, `unclear` —
-each `minor` or `clear`. A WHOLE hanger or whole clips kept on the garment are not
-a defect (the rule: keep the hanger rather than cut cloth).
+and answers, per view, the user's three defects (12 Oct 2026) — each `minor` or
+`clear`:
 
-`failing()` decides: any `missing_part` or `broken_edge`, whatever its severity —
-fabric the garment has and the listing does not is never acceptable — and a
-`background` or `unclear` the model calls `clear`. A `fragment` alone never fails:
-the user's rule (7 Oct 2026) is to keep the hanger rather than cut cloth, and a
-hanger or clip stub is not a defect. It is reported, so a person can still look.
+  cloth_broken  fabric missing, cut away or torn; a hole; a notched outline
+  background    anything that is not the garment left OUTSIDE its outline
+  colour        the garment's colour lost or changed against the photograph
+
+and NOT, by name: the dress form's neck seen inside the neck opening (KLE-000398 —
+it keeps the garment from looking hollow, and the first prompt called it
+"background above the collar"), the back collar above the front neckline, a hanger
+or clip kept or left as a stub (keep the hanger rather than cut cloth), a missing
+shop tag.
+
+`failing()` decides: `cloth_broken` at any severity — fabric the garment has and
+the listing does not is never acceptable — and `background` / `colour` the model
+calls `clear`.
 
 Cached by image URLs + prompt, so a re-run is free. Never raises.
 """
@@ -31,6 +37,7 @@ from __future__ import annotations
 
 import io
 import logging
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import httpx
@@ -41,33 +48,42 @@ from app.llm import cache, health
 log = logging.getLogger("hermes.cutout-integrity")
 
 SYSTEM = (
-    "You are a strict quality inspector for second-hand clothing listings. A cut-out is "
-    "the garment photograph with the background removed. You compare each cut-out with "
-    "the original photograph, region by region, and report every difference in the "
-    "garment itself. You never excuse a defect because the rest of the picture is good."
+    "You are a quality inspector for second-hand clothing listings. A cut-out is the "
+    "garment photograph with the background removed. You compare each cut-out with the "
+    "original photograph and report only what makes the listing look wrong to a shopper: "
+    "cloth that is broken, something of the background left in, or colour that is lost. "
+    "You do not report what is normal for a garment photographed on a hanger or a dress form."
 )
 
 _ASK = """For each view you get four images, in this order:
-  A — the ORIGINAL photograph (the garment on a hanger or clips, on the wall)
+  A — the ORIGINAL photograph (the garment on a hanger, on clips, or on a dress form)
   B — the CUT-OUT made from it
   C — the TOP of the original, enlarged
   D — the TOP of the cut-out, enlarged
 
-Compare B with A, and D with C. Report in the cut-out:
-  missing_part — any part of the GARMENT that is in the original but missing or cut away
-                 in the cut-out: collar, neckline, hood, shoulder, sleeve, cuff, waistband,
-                 belt loop, strap, hem, pocket, zip pull, sewn-in label. Look hardest where
-                 the hanger hook or the clips touch the garment: removing them must not take
-                 fabric with them. A shop tag, price ticket, swing tag or anything else that
-                 is not the garment itself is NOT a garment part — its absence is no defect.
-  broken_edge  — the garment's outline is notched, bitten, jagged, or has gaps or holes
-                 the original does not have.
-  fragment     — a hanger, hook or clip only PARTLY removed, leaving a cut-off piece.
-                 A WHOLE hanger, hook or clip kept intact is NOT a defect.
-  background   — wall, floor, stand, tape or anything else of the background left in.
-  unclear      — the cut-out is blurry, smeared, or the garment looks distorted.
+Compare B with A, and D with C. Report ONLY these three kinds of defect:
+  cloth_broken — garment fabric that is in the original but missing, cut away or torn in
+                 the cut-out: a piece of the collar, neckline, hood, shoulder, sleeve, cuff,
+                 waistband, belt loop, strap, hem or pocket gone; a hole the original does
+                 not have; the outline notched or bitten (often where a hanger hook or clips
+                 touched the garment).
+  background   — something that is NOT the garment, left OUTSIDE its outline: wall, floor,
+                 ceiling, rail, the dress form's stand, pole or base, the form showing below
+                 the hem or beside the garment, tape, a hand, other objects.
+  colour       — the garment's colour lost or changed compared with the original: an area
+                 washed out, turned white, grey or see-through, a print, patch or logo that
+                 lost its colour, a clearly different shade.
+
+These are NOT defects — never report them:
+  * the dress form's neck or body seen INSIDE the neck opening, armholes or other openings,
+    enclosed by the garment (it keeps the garment from looking hollow);
+  * the inside back of the collar or neckline visible above the front neckline;
+  * a hanger, hook or clips kept on the garment, whole or as a small stub;
+  * a missing shop tag, price ticket or swing tag (not part of the garment);
+  * slightly soft edges, or lighting that is a little different but the same colour.
+
 Severity: `clear` when a shopper would notice it at normal size, else `minor`.
-Answer ok=true for a view only when it has no defect at all."""
+Answer ok=true for a view only when it has none of the three defects."""
 
 SCHEMA = {
     "type": "object",
@@ -85,7 +101,7 @@ SCHEMA = {
                             "type": "object",
                             "properties": {
                                 "type": {"type": "string", "enum": [
-                                    "missing_part", "broken_edge", "fragment", "background", "unclear"]},
+                                    "cloth_broken", "background", "colour"]},
                                 "part": {"type": "string"},
                                 "severity": {"type": "string", "enum": ["minor", "clear"]},
                                 "where": {"type": "string"},
@@ -208,16 +224,24 @@ def _sentence(view: Any, d: dict[str, Any]) -> str:
             + f" [{d.get('severity')}]")
 
 
+def _fails(d: dict[str, Any]) -> bool:
+    """The user's three (12 Oct 2026): broken cloth at any severity; background or
+    lost colour when clear."""
+    kind, sev = str(d.get("type") or ""), str(d.get("severity") or "")
+    return kind == "cloth_broken" or (kind in ("background", "colour") and sev == "clear")
+
+
 def failing(answer: dict[str, Any] | None) -> list[str]:
-    """The defects that fail a cut-out, as sentences. Fabric the listing lacks
-    (missing_part, broken_edge) fails at any severity; background and unclear only
-    when clear; a hanger or clip fragment never (see the module note)."""
-    out: list[str] = []
-    for v in (answer or {}).get("views") or []:
-        for d in v.get("defects") or []:
-            kind, sev = str(d.get("type") or ""), str(d.get("severity") or "")
-            if kind in ("missing_part", "broken_edge") or (kind in ("background", "unclear") and sev == "clear"):
-                out.append(_sentence(v.get("view"), d))
+    """The defects that hold a product, as sentences."""
+    out = [_sentence(v.get("view"), d) for v in (answer or {}).get("views") or []
+           for d in v.get("defects") or [] if _fails(d)]
+    return list(dict.fromkeys(out))
+
+
+def failing_views(answer: dict[str, Any] | None) -> list[str]:
+    """The views (as named in the pairs) with a defect that holds."""
+    out = [str(v.get("view") or "") for v in (answer or {}).get("views") or []
+           if any(_fails(d) for d in v.get("defects") or [])]
     return list(dict.fromkeys(out))
 
 
@@ -227,3 +251,100 @@ def noted(answer: dict[str, Any] | None) -> list[str]:
     out = [_sentence(v.get("view"), d) for v in (answer or {}).get("views") or []
            for d in v.get("defects") or []]
     return [x for x in dict.fromkeys(out) if x not in fails]
+
+
+# --------------------------------------------------------------------------- #
+# the repair chain's step (scripts/repair_product.py `cutcheck`)
+# --------------------------------------------------------------------------- #
+CODE = "CUTOUT_DEFECT"
+
+# `readiness.cutouts.integrity`, with its defaults. Whether a defect HOLDS follows
+# `readiness.cutouts.hold`, like every other cut-out finding.
+DEFAULTS: dict[str, Any] = {
+    "enabled": True,
+    # A FRONT/BACK view that fails is re-cut once from the raw photograph and
+    # looked at again; still failing holds.
+    "recut": True,
+    # The AI could not answer: hold (retried by the runner as VISION_UNAVAILABLE)
+    # rather than let a cut-out through unlooked-at.
+    "required": True,
+    # The photo audit judges each cut-out ALONE; once this check — the cut-out
+    # against its photograph, held only for the user's three defects — has
+    # answered, the audit's CUTOUT DEFECT findings no longer hold on their own
+    # (they still drive the rematte step's re-cut).
+    "photo_audit_defers": True,
+}
+
+
+def config(pol: dict[str, Any] | None) -> dict[str, Any]:
+    from app.imaging import cutouts
+
+    return {**DEFAULTS, **(cutouts.config(pol or {}).get("integrity") or {})}
+
+
+@dataclass
+class IntegrityVerdict:
+    action: str                                   # ok | bad | pending | unknown | skipped
+    reasons: list[str] = field(default_factory=list)       # the defects that hold
+    soft: list[str] = field(default_factory=list)          # seen, holding nothing
+    bad_views: list[str] = field(default_factory=list)     # FRONT / BACK / OTHER …
+    hold: bool = True                             # readiness.cutouts.hold == block
+    required: bool = True
+    unavailable: bool = False
+    note: str = ""
+    code: str = CODE
+
+    @property
+    def blocks(self) -> bool:
+        if self.action == "bad":
+            return self.hold
+        return self.action == "unknown" and self.unavailable and self.required
+
+    def as_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "blocks": self.blocks}
+
+
+def check(rows: list[dict[str, Any]], sent: list[str], *, category: str | None,
+          pol: dict[str, Any] | None = None, model: str | None = None) -> IntegrityVerdict:
+    """Every cut-out the listing shows, against the photograph it was cut from.
+
+    `rows` are the product's ProductMedia rows (id, url, view, origin, processing,
+    derivedFromId, deletedAt, createdAt); `sent` is Product.images. Never raises.
+    """
+    from app.imaging import cutouts
+    from app.imaging import gallery_cleanup as gc
+
+    cfg = config(pol)
+    hold = str(cutouts.config(pol or {}).get("hold") or "soft").lower() == "block"
+    by_id = {r["id"]: r for r in rows}
+    cuts = gc.listing_cutouts(rows, sent)
+    if not cuts:
+        return IntegrityVerdict("skipped", hold=hold, required=bool(cfg["required"]),
+                                note="no cut-out to look at")
+    seen: dict[str, int] = {}
+    pairs = []
+    for r in cuts:
+        view = str(r.get("view") or "OTHER")
+        seen[view] = seen.get(view, 0) + 1
+        pairs.append({"view": view if seen[view] == 1 else f"{view} {seen[view]}",
+                      "cutout": r["url"],
+                      "original": gc.root_of(r, by_id)["url"] if r.get("derivedFromId") else None})
+    answer, note = judge(pairs, category=category, model=model)
+    if answer is None:
+        return IntegrityVerdict("unknown", hold=hold, required=bool(cfg["required"]),
+                                unavailable=True, note=note)
+    reasons = failing(answer)
+    return IntegrityVerdict("bad" if reasons else "ok", reasons=reasons, soft=noted(answer),
+                            bad_views=failing_views(answer), hold=hold,
+                            required=bool(cfg["required"]), note=note)
+
+
+def summary(v: IntegrityVerdict) -> str:
+    if v.action == "ok":
+        return ("every cut-out whole, background clear, colour kept"
+                + (f" (also seen: {'; '.join(v.soft)})" if v.soft else ""))
+    if v.action == "skipped":
+        return v.note
+    if v.action == "unknown":
+        return f"could not look — {v.note}"
+    return "; ".join(v.reasons)

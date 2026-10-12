@@ -1239,6 +1239,32 @@ def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
     return verdict
 
 
+# The code a photo-audit verdict holds under once its CUTOUT DEFECT findings are set
+# aside — the prefix each kind of finding is written with (app/imaging/photo_audit).
+_AUDIT_CODES = (("IMAGE DEFECT", "IMAGE_DEFECT"), ("MASTER CATEGORY", "MASTER_CATEGORY_MISMATCH"),
+                ("RENDER DEFECT", "RENDER_DEFECT"))
+
+
+def _without_cutout_defects(v: Any) -> Any:
+    """The photo-audit verdict with its CUTOUT DEFECT findings moved to `soft` —
+    for when the cut-out check (cutcheck) has answered the same question against
+    the photograph. Whatever else the audit found still holds."""
+    import dataclasses
+
+    cut = [r for r in v.reasons if str(r).startswith("CUTOUT DEFECT")]
+    if not cut:
+        return v
+    rest = [r for r in v.reasons if r not in cut]
+    soft = [*v.soft, *cut]
+    if not rest:
+        return dataclasses.replace(v, action="ok", code=None, reasons=[], soft=soft)
+    code = v.code
+    if code == "CUTOUT_DEFECT":
+        code = next((c for p, c in _AUDIT_CODES if str(rest[0]).startswith(p)), code)
+    return dataclasses.replace(v, action="regen" if code == "RENDER_DEFECT" else v.action,
+                               code=code, reasons=rest, soft=soft)
+
+
 def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            infer: bool, min_confidence: int, skip_render: bool,
            approve: bool, skip_bin: bool,
@@ -2597,6 +2623,132 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         dedupe_why = f"could not read the gallery ({type(exc).__name__})"
     step("dedupe", dedupe_why, _dedupe)
 
+    # ---- 4b'''. cutcheck: the AI looks at every cut-out the listing shows ---
+    #
+    # THE USER'S RULE (12 Oct 2026): whenever a cut-out is made, the AI confirms
+    # it — the cloth whole, nothing of the background left, the colour kept. A
+    # hanger kept on the garment is fine; a hanger or clip REMOVED with the fabric
+    # around it is the defect, because the garment then looks torn (BOA-002039's
+    # collar, BOA-002833's waistband). The photo audit judges each cut-out alone
+    # and passed both; this compares each with the photograph it was cut from
+    # (app/imaging/cutout_integrity). Every cut-out the listing shows, not only
+    # this run's: a product held for a cut-out defect is re-checked here, and one
+    # that was never looked at is.
+    #
+    # A failing FRONT/BACK view is re-cut ONCE — by the default chain when it has
+    # not cut that view this run, else by `recut_strategies` — and looked at again.
+    # Still failing holds (CUTOUT_DEFECT, under `readiness.cutouts.hold`).
+    from app.imaging import cutout_integrity as _ci
+
+    integrity_verdict: Any = None
+    cutcheck_report: dict[str, Any] = {"recut": None, "before": None, "after": None}
+
+    def _integrity_now() -> Any:
+        from app.services.auto_approval import db as _db
+
+        try:
+            prod = _db.fetch_one('SELECT images, category, "subCategory" AS sub FROM "Product"'
+                                 ' WHERE id = %(p)s::uuid', {"p": product_id}) or {}
+            rows = _media_rows()
+        except Exception as exc:  # noqa: BLE001 — not read is not looked at: retried, never passed
+            cfg = _ci.config(policy())
+            return _ci.IntegrityVerdict("unknown", unavailable=True, required=bool(cfg["required"]),
+                                        note=f"could not read the cut-outs ({type(exc).__name__})")
+        category = " > ".join(x for x in (prod.get("category"), prod.get("sub")) if x) or None
+        return _ci.check(rows, list(prod.get("images") or []), category=category, pol=policy())
+
+    def _cutcheck() -> str:
+        nonlocal integrity_verdict
+
+        first = _integrity_now()
+        integrity_verdict = first
+        cutcheck_report["before"] = first.as_dict()
+        if first.action == "unknown":
+            vision_unavailable.append("cutcheck")
+            raise StepFailed("the AI could not look at the cut-outs — " + first.note)
+        if first.action != "bad":
+            return _ci.summary(first)
+
+        views = [v for v in dict.fromkeys(b.split()[0] for b in first.bad_views) if v in ("FRONT", "BACK")]
+        cfg = _ci.config(policy())
+        found = "; ".join(first.reasons)
+        why_not = ""
+        if not cfg.get("recut"):
+            why_not = "re-cut off (readiness.cutouts.integrity.recut)"
+        elif skip_matte:
+            why_not = "--no-matte"
+        elif not views:
+            why_not = "no FRONT/BACK view to re-cut"
+        elif not remote_supports("keepBetter"):
+            why_not = "this vnyx-api cannot take --keep-better"
+        if why_not:
+            return f"{found} — not re-cut: {why_not}"
+
+        # Which segmenter. The default chain has not cut these views this run →
+        # it is asked (the current chain may well fix an older cut-out); it has →
+        # `recut_strategies`, unless those were asked this run too.
+        cut_by_default = set(matte_state.get("recut_views") or [])
+        if rematte_report.get("attempted") and not rematte_report.get("strategies"):
+            cut_by_default |= set(rematte_report.get("views") or [])
+        plan: list[str] | None = None
+        if set(views) & cut_by_default:
+            plan = _recut_after()
+            alt_asked = set(matte_state.get("escalated") or []) | (
+                set(rematte_report.get("views") or []) if rematte_report.get("strategies") else set())
+            if not plan or not remote_supports("bgStrategies") or set(views) <= alt_asked:
+                return (f"{found} — not re-cut: every segmenter configured has cut "
+                        f"{', '.join(views)} this run already")
+        if not apply:
+            # A dry run never holds on what it would fix (the matte step's rule).
+            integrity_verdict = _ci.IntegrityVerdict(
+                "pending", reasons=first.reasons, soft=first.soft, bad_views=first.bad_views,
+                hold=first.hold, required=first.required)
+            return (f"{found} — would re-cut {', '.join(views)}"
+                    + (f" with {', '.join(plan)}" if plan else "") + " and look again")
+
+        provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
+        args = [*common, *live, *(["--provider", provider] if provider else []),
+                "--replace", "--keep-better"]
+        if remote_supports("matteViews"):
+            args.extend(["--views", ",".join(views)])
+        if plan:
+            args.extend(["--bg-strategies", ",".join(plan)])
+        ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args, timeout_s=600, quiet=quiet)
+        if not ok:
+            raise StepFailed(f"{found} — the re-cut returned non-zero")
+        written = kept = None
+        for line in (out or "").splitlines():
+            low = line.lower()
+            if "cut-outs written" in low:
+                written = _trailing_int(line)
+            elif "kept" in low and ":" in line:
+                kept = _trailing_int(line)
+        cutcheck_report["recut"] = {"views": views, "strategies": plan, "written": written, "kept": kept}
+        note = (f"{found} — re-cut {', '.join(views)}"
+                + (f" with {', '.join(plan)}" if plan else "")
+                + (f" ({kept} kept: the new cut-out had less garment)" if kept else ""))
+        # A re-cut replaces, it does not add: the duplicate it may leave goes first.
+        if _gc.classify(_media_rows(), [])["duplicates"]:
+            _dedupe()
+        second = _integrity_now()
+        integrity_verdict = second
+        cutcheck_report["after"] = second.as_dict()
+        if second.action == "unknown":
+            vision_unavailable.append("cutcheck")
+            raise StepFailed(note + " — the AI could not look again: " + second.note)
+        if second.action == "bad":
+            return note + " — STILL: " + "; ".join(second.reasons) + (
+                " (holds as CUTOUT_DEFECT)" if second.blocks else " (soft — readiness.cutouts.hold)")
+        return note + " — looked again: " + _ci.summary(second)
+
+    if not _ci.config(policy()).get("enabled", True):
+        cutcheck_why = "off in policy (readiness.cutouts.integrity.enabled)"
+    elif not cutouts_on:
+        cutcheck_why = "cut-out checks off in policy (readiness.cutouts.enabled)"
+    else:
+        cutcheck_why = ""
+    step("cutcheck", cutcheck_why, _cutcheck)
+
     # ---- 4c. regen --------------------------------------------------------
     #
     # THE ONE PAID RETRY (readiness phase 4, docs/READINESS-PLAN.md §4 step 5).
@@ -3027,9 +3179,20 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # Review"; the photo audit is evidence added to it; the cut-outs
         # (readiness phase 3) refuse only once `readiness.cutouts.hold` is
         # block, and only for a defect the re-matte did not clear.
+        # THE CUT-OUT CHECK DECIDES CUT-OUT DEFECTS once it has answered (12 Oct
+        # 2026): the photo audit judges each cut-out alone and held KLE-000398 for
+        # the dress form seen inside the neck opening — the very thing the user
+        # calls correct. Its other findings (a photograph, a render, the master)
+        # still hold.
+        audit = photo_verdict
+        if (audit is not None and integrity_verdict is not None
+                and integrity_verdict.action in ("ok", "bad", "pending")
+                and _ci.config(policy()).get("photo_audit_defers", True)):
+            audit = _without_cutout_defects(audit)
         refusing = [(label, v) for label, v in (("image gate", gate_verdict),
-                                                ("photo audit", photo_verdict),
-                                                ("cut-outs", cutout_verdict))
+                                                ("photo audit", audit),
+                                                ("cut-outs", cutout_verdict),
+                                                ("cut-out check", integrity_verdict))
                     if v is not None and v.blocks]
         blocked = bool(refusing)
         # Only ever passes --apply when BOTH flags are set. `--apply` alone
@@ -3309,6 +3472,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # A cut-out the photo audit refused, re-cut from the raw archive, and
         # what the audit said afterwards.
         "rematte": rematte_report,
+        # The AI's look at every cut-out against its photograph (cutcheck), the
+        # re-cut it asked for, and the look after it.
+        "cutcheck": {**cutcheck_report,
+                     "verdict": integrity_verdict.as_dict() if integrity_verdict is not None else None},
         # Readiness phase 5: the gallery order as checked and rebuilt, and the
         # copy regeneration with its triggers.
         "order": order_report,

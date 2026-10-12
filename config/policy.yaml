@@ -1709,6 +1709,24 @@ readiness:
     # Paid methods off since 10 Oct 2026 (the user's call) — see imagery.cutout.strategies.
     # recut_strategies: ["object-isnet", "gemini-paint", "openai-paint"]
     recut_strategies: ["object-isnet"]
+    # THE AI LOOK AT EVERY CUT-OUT THE LISTING SHOWS (12 Oct 2026, the user's rule).
+    # The chain's `cutcheck` step, after matte / rematte / dedupe: Gemini compares
+    # each cut-out with the photograph it was cut from (app/imaging/cutout_integrity)
+    # and holds only for broken cloth (a hanger or clip removed with the fabric
+    # around it), background left in, or colour lost. A hanger kept on the garment,
+    # or the dress form seen inside the neck opening, is not a defect. The hold
+    # itself follows `hold` above (CUTOUT_DEFECT).
+    integrity:
+      enabled: true
+      # a failing FRONT/BACK view is re-cut ONCE (the default chain, or
+      # recut_strategies when the default chain already cut it this run) and
+      # looked at again; --keep-better still refuses a cut-out with less garment
+      recut: true
+      # the AI could not answer → held as VISION_UNAVAILABLE (retried), never passed unlooked-at
+      required: true
+      # the photo audit's own CUTOUT DEFECT (each cut-out judged alone) stops holding
+      # once this check has answered; it still drives the rematte re-cut
+      photo_audit_defers: true
     # THE ZOOM TEST THAT NEEDS NO PHOTOGRAPH. One garment, one canvas, one
     # booth: two views should cover comparable fractions of their frames, so a
     # cut-out standing `max_area_ratio` times its smallest sibling was cropped

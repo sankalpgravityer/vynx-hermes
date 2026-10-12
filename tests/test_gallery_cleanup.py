@@ -197,23 +197,23 @@ def test_a_product_checked_but_unchanged_is_not_pushed(fixer, monkeypatch):
 # --------------------------------------------------------------------------- #
 # what fails a cut-out
 # --------------------------------------------------------------------------- #
-def test_fabric_missing_fails_at_any_severity_and_a_stub_never_does():
+def test_broken_cloth_fails_at_any_severity_background_and_colour_only_when_clear():
     from app.imaging import cutout_integrity as ci
 
     answer = {"views": [
         {"view": "FRONT", "ok": False, "summary": "", "defects": [
-            {"type": "missing_part", "part": "collar", "severity": "minor", "where": "back neckline"},
-            {"type": "fragment", "part": "hanger", "severity": "clear", "where": "above the collar"}]},
+            {"type": "cloth_broken", "part": "collar", "severity": "minor", "where": "back neckline"},
+            {"type": "colour", "part": "logo", "severity": "minor", "where": "chest"}]},
         {"view": "BACK", "ok": False, "summary": "", "defects": [
-            {"type": "broken_edge", "part": "waistband", "severity": "clear", "where": "where the clips were"},
+            {"type": "background", "part": "stand", "severity": "clear", "where": "below the hem"},
             {"type": "background", "part": "wall", "severity": "minor", "where": "under the arm"},
-            {"type": "unclear", "part": "", "severity": "clear", "where": "whole cut-out"}]},
+            {"type": "colour", "part": "print", "severity": "clear", "where": "turned white"}]},
     ]}
     fails = ci.failing(answer)
-    assert any("missing part (collar)" in f for f in fails)
-    assert any("broken edge (waistband)" in f for f in fails)
-    assert any("unclear" in f for f in fails)
-    assert not any("fragment" in f for f in fails)          # keep the hanger rather than cut cloth
-    assert not any("background" in f for f in fails)        # minor background: noted only
-    assert any("fragment" in n for n in ci.noted(answer))
+    assert any("cloth broken (collar)" in f for f in fails)
+    assert any("background (stand)" in f for f in fails)
+    assert any("colour (print)" in f for f in fails)
+    assert not any("(wall)" in f for f in fails)            # minor background: noted only
+    assert not any("(logo)" in f for f in fails)            # minor colour: noted only
+    assert any("(wall)" in n for n in ci.noted(answer))
     assert ci.failing({"views": [{"view": "FRONT", "ok": True, "defects": [], "summary": ""}]}) == []

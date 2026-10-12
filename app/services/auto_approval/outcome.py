@@ -76,6 +76,9 @@ def _preflight_code(blockers: list[str]) -> str:
         ("missing ai_", "MISSING_RENDER"),
         ("stage is ", "NOT_IN_REVIEW"),
         ("mannequin ", "MANNEQUIN_MISMATCH"),
+        # the repair chain's cutcheck step on an approved product (12 Oct 2026):
+        # the same code the Shopify cut-out check holds under
+        ("cut-out check: ", "CUTOUT_DEFECT"),
     ):
         if first.startswith(prefix):
             return code

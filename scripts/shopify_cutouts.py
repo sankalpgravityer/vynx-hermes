@@ -34,16 +34,36 @@ THE FIX, per product, in this order:
      `reorder` step (rebuild-media-cache.ts) — the same step the repair chain uses;
   2. Gemini compares each cut-out the listing will show with the photograph it was
      cut from, the top enlarged where the hanger and clips are
-     (app/imaging/cutout_integrity) — fabric missing or cut away (a collar taken
-     with the hanger hook, a waistband notched by the clips), a broken outline,
-     background left in, an unclear cut-out. A hanger or clip stub alone is noted,
-     never failed (keep the hanger rather than cut cloth);
+     (app/imaging/cutout_integrity) — broken cloth (a collar taken with the hanger
+     hook, a waistband notched by the clips), background left in, colour lost
+     against the photograph. A hanger or clip stub, or the dress form seen inside
+     the neck opening, is never a defect;
   3. the push, through the `resync` step (resync-listings.ts --include-synced) —
      queued on the backend behind VNYX_API_URL, whose Shopify worker sends it —
      when the gallery changed;
   4. a cut-out the AI calls defective puts the product's verification to
      HELD_FOR_HUMAN, outcome CUTOUT_DEFECT, the reason naming the cut-out defect,
      and logs a `hold` event — so a person re-does the cut-out. The listing stays live.
+
+RE-CHECK THE HELD ONES (--recheck-held) — after the cut-out check changes. No
+duplicates removed, no gallery rebuilt, nothing pushed to Shopify: only the
+verification. Only a product the cut-out check itself held (HELD_FOR_HUMAN,
+CUTOUT_DEFECT) whose last agent verdict was VERIFIED — one held for anything else
+is never released by this.
+
+    python scripts/shopify_cutouts.py --recheck-held \
+        --sheet "reports/shopify cutouts/verified_now_held.xlsx" --workers 5 \
+        --out "reports/shopify cutouts/recheck_held.xlsx"            # read-only: what WOULD change
+    ... --apply                                                       # WRITES the verification
+
+  * passes  → VERIFIED again, its last agent verdict's outcome back (APPROVED /
+              ALREADY_APPROVED), the reason "Cut-out re-check passed …" + that verdict's;
+              a `pass` event;
+  * fails   → stays HELD_FOR_HUMAN, the reason rewritten with the new findings;
+  * no answer from the AI, or no cut-out → left as it is.
+A row a person changed since the hold (no longer HELD_FOR_HUMAN / CUTOUT_DEFECT)
+is left alone — the update is guarded on both. The read-only run's AI answers are
+cached, so the --apply run after it asks Gemini nothing new.
 """
 from __future__ import annotations
 
@@ -70,10 +90,16 @@ from app.services.auto_approval import db, events  # noqa: E402
 
 SCOPE_SQL = """
 SELECT p.id::text AS id, t.name AS tenant, p."tenantId"::text AS tenant_id, p.sku, p.title,
-       p."verificationStatus"::text AS vs, p.images, p.category, p."subCategory" AS subcategory,
+       p."verificationStatus"::text AS vs, p."verificationOutcome" AS oc,
+       p.images, p.category, p."subCategory" AS subcategory,
        p."shopifyProductId" AS shopify_id,
-       (SELECT max(l."lastSyncAt") FROM "MarketplaceListing" l WHERE l."productId" = p.id) AS last_sync
+       (SELECT max(l."lastSyncAt") FROM "MarketplaceListing" l WHERE l."productId" = p.id) AS last_sync,
+       -- the verdict the product's last agent run wrote (the cut-out check leaves
+       -- verificationRunId alone, so this is the verdict before its hold)
+       rp.status::text AS prev_status, rp.outcome AS prev_outcome, rp.reason AS prev_reason
   FROM "Product" p JOIN "Tenant" t ON t.id = p."tenantId"
+  LEFT JOIN "AutoApprovalRunProduct" rp
+         ON rp."runId" = p."verificationRunId" AND rp."productId" = p.id
  WHERE t.name = ANY(%(tenants)s)
    AND p."isDeleted" = false AND p."isArchived" = false
    AND p."reviewStatus"::text = 'ACCEPTED'
@@ -141,10 +167,9 @@ def ai_check(product: dict[str, Any], cutouts: list[dict[str, Any]],
     from (app/imaging/cutout_integrity) — the whole picture and its top enlarged,
     where the hanger and the clips are.
 
-    Returns (defects, note, seen). `defects` fail the product: garment fabric
-    missing or cut away, a broken outline, background or an unclear cut-out the AI
-    calls clear. `seen` is everything else it noticed (a hanger or clip stub) —
-    reported, failing nothing. `note` says when the AI could not answer, in which
+    Returns (defects, note, seen). `defects` fail the product: broken cloth, or
+    background left in or colour lost that the AI calls clear (cutout_integrity.
+    failing). `seen` is everything else it noticed — reported, failing nothing. `note` says when the AI could not answer, in which
     case nothing is concluded.
 
     It replaced the photo audit here (12 Oct 2026): judging each cut-out alone, the
@@ -240,6 +265,132 @@ def fix(product: dict[str, Any], cls: dict[str, Any], *, dsn: str, push: bool, a
     else:
         res["status"] = product["vs"]
     return res
+
+
+# --------------------------------------------------------------------------- #
+# the re-check of the products the cut-out check held
+# --------------------------------------------------------------------------- #
+RECHECK_PASSED = "Cut-out re-check passed (cut-out check: broken cloth, background, colour)."
+# Only a row still as the cut-out check left it: a person who handled it since wins.
+_STILL_HELD = """ AND "verificationStatus" = 'HELD_FOR_HUMAN'::"VerificationStatus"
+                  AND "verificationOutcome" = 'CUTOUT_DEFECT'"""
+
+
+def recheck_eligible(product: dict[str, Any]) -> str:
+    """Why a product is NOT re-checked, or "" when it is."""
+    if product["vs"] != "HELD_FOR_HUMAN" or product.get("oc") != "CUTOUT_DEFECT":
+        return f"not held by the cut-out check (now {product['vs']} / {product.get('oc') or '-'})"
+    if product.get("prev_status") != "VERIFIED":
+        return f"its last agent verdict was {product.get('prev_status') or 'not found'}, not VERIFIED"
+    return ""
+
+
+def recheck(product: dict[str, Any], cls: dict[str, Any], *, apply: bool) -> dict[str, Any]:
+    """The cut-out check again on what the listing shows; the verification follows it.
+    Nothing else — no gallery change, no push."""
+    res: dict[str, Any] = {"done": [], "defects": [], "ai_note": "", "seen": [],
+                           "status": product["vs"], "reason": ""}
+    defects, note, seen = ai_check(product, cls["sent_cutouts"], cls["by_id"])
+    res.update(defects=defects, ai_note=note, seen=seen)
+    if note.startswith("AI check could not") or note == "no cut-out to look at":
+        res["done"].append(f"left as it is — {note}")
+        return res
+
+    if defects:
+        status, outcome = "HELD_FOR_HUMAN", "CUTOUT_DEFECT"
+        reason = "; ".join(defects)[:500]
+    else:
+        status, outcome = "VERIFIED", product.get("prev_outcome") or "ALREADY_APPROVED"
+        reason = f"{RECHECK_PASSED} {product.get('prev_reason') or ''}".strip()[:500]
+    res["reason"] = reason
+    if not apply:
+        res["status"] = status
+        res["done"].append("would be verified" if status == "VERIFIED" else "would stay held, reason updated")
+        return res
+
+    n = db.execute(
+        """UPDATE "Product"
+              SET "verificationStatus" = %(st)s::"VerificationStatus",
+                  "verificationOutcome" = %(oc)s,
+                  "verificationReason" = %(r)s,
+                  "verificationCheckedAt" = now()
+            WHERE id = %(p)s::uuid""" + _STILL_HELD,
+        {"p": product["id"], "st": status, "oc": outcome, "r": reason})
+    if not n:
+        res["done"].append("changed since the hold — left as it is")
+        return res
+    res["status"] = status
+    if status == "VERIFIED":
+        res["done"].append("verified")
+        events.emit(product["tenant_id"], "pass",
+                    f"{product['sku']} → verified · cut-out re-check passed (Shopify cut-out check)",
+                    product_id=product["id"],
+                    detail={"seen": seen, "outcome": outcome, "by": "shopify_cutouts.py --recheck-held"})
+    else:
+        res["done"].append("still held, reason updated")
+    return res
+
+
+def write_recheck(out: Path, rows: list[dict[str, Any]], applied: bool) -> None:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Results"
+    ws.append(["Tenant", "SKU", "Title", "Verification before", "Verification now" if applied else "Would be",
+               "Cut-out defects (AI) — hold", "Also seen (AI) — not holding", "Reason written",
+               "Earlier agent verdict", "What was done", "AI note", "Open in VNYX"])
+    for r in rows:
+        p = r["product"]
+        ws.append([p["tenant"], p["sku"], p["title"], p["vs"], r["status"], "; ".join(r["defects"]),
+                   "; ".join(r.get("seen") or []), r.get("reason", ""), p.get("prev_outcome") or "",
+                   "; ".join(r["done"]), r["ai_note"],
+                   f"https://try.vnyx.ai/product/{p['id']}/edit?tenantId={p['tenant_id']}"])
+    _style(ws, [9, 13, 40, 16, 16, 60, 45, 60, 18, 30, 24, 40])
+    green, red = PatternFill("solid", fgColor="C6EFCE"), PatternFill("solid", fgColor="F8CBAD")
+    for row in ws.iter_rows(min_row=2):
+        row[4].fill = green if row[4].value == "VERIFIED" else red if row[4].value == "HELD_FOR_HUMAN" else row[4].fill
+    last = ws.max_row
+
+    s = wb.create_sheet("Summary", 0)
+    s["A1"] = "Cut-out re-check of the products the cut-out check held"
+    s["A1"].font = Font(name="Arial", bold=True, size=13)
+    s["A2"] = (f"Built {datetime.now():%d %b %Y %H:%M} from production. "
+               + ("APPLIED: the verification was written. " if applied else
+                  "READ-ONLY: nothing written — 'Would be' is what --apply writes. ")
+               + "The check holds only for broken cloth, background left in, or colour lost "
+                 "against the raw photo. Nothing was pushed to Shopify.")
+    s["A2"].font = Font(name="Arial", italic=True, size=9)
+    s["A2"].alignment = Alignment(wrap_text=True, vertical="top")
+    s.merge_cells("A2:E2")
+    s.row_dimensions[2].height = 48
+    col = "Verification now" if applied else "Would be"
+    for j, h in enumerate(["Tenant", "Re-checked", "Verified", "Still held", "Not checked"], 1):
+        s.cell(row=4, column=j, value=h).font = Font(name="Arial", bold=True)
+    tenants = sorted({r["product"]["tenant"] for r in rows})
+    for i, t in enumerate(tenants, 5):
+        rng = f"Results!$A$2:$A${last}"
+        vals = [t, f'=COUNTIF({rng},A{i})',
+                f'=COUNTIFS({rng},A{i},Results!$E$2:$E${last},"VERIFIED")',
+                f'=COUNTIFS({rng},A{i},Results!$E$2:$E${last},"HELD_FOR_HUMAN",Results!$F$2:$F${last},"<>")',
+                f"=B{i}-C{i}-D{i}"]
+        for j, v in enumerate(vals, 1):
+            s.cell(row=i, column=j, value=v).font = Font(name="Arial")
+    tot = 5 + len(tenants)
+    s.cell(row=tot, column=1, value="Total").font = Font(name="Arial", bold=True)
+    for j, c in zip(range(2, 6), "BCDE"):
+        s.cell(row=tot, column=j, value=f"=SUM({c}5:{c}{tot - 1})").font = Font(name="Arial", bold=True)
+    s.cell(row=tot + 2, column=1,
+           value=f"'{col}' column of Results: VERIFIED = passes the new check; HELD_FOR_HUMAN with "
+                 "defects = still held; anything else = not checked (AI gave no answer, no cut-out, "
+                 "or changed since the hold).").font = Font(name="Arial", italic=True, size=9)
+    for c, w in zip("ABCDE", (12, 12, 10, 11, 12)):
+        s.column_dimensions[c].width = w
+    wb.calculation.fullCalcOnLoad = True
+    out.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(out)
+    print("wrote", out)
 
 
 # --------------------------------------------------------------------------- #
@@ -380,9 +531,17 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--model", help="the Gemini model for the cut-out check (default llm.model_fast)")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation")
+    ap.add_argument("--recheck-held", action="store_true",
+                    help="re-check the products the cut-out check held; verification only, no push")
     args = ap.parse_args()
     global AI_MODEL
     AI_MODEL = args.model
+    # A Windows console piped to a file is cp1252: an "→" in a progress line must
+    # not stop an --apply run half way.
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
 
     dsn = db.dsn()
     skus = [s.strip() for s in (args.skus or "").split(",") if s.strip()]
@@ -394,6 +553,8 @@ def main() -> None:
     by_t = Counter(p["tenant"] for p in products)
     print(f"{len(products)} approved, verified-at-least-once product(s) on Shopify "
           f"({', '.join(f'{t} {n}' for t, n in sorted(by_t.items()))})")
+    if args.recheck_held:
+        return run_recheck(args, products, classes)
     def stale(p: dict[str, Any]) -> bool:
         rows = list(classes[p["id"]]["by_id"].values())
         live_urls = {r["url"] for r in gc.live(rows)}
@@ -461,6 +622,54 @@ def main() -> None:
     print(f"\ndone in {time.time() - t0:.0f}s — {len(rows)} product(s); {held} held for human for a cut-out defect")
     if args.out:
         write_results(args.out, rows)
+
+
+def run_recheck(args: argparse.Namespace, products: list[dict[str, Any]],
+                classes: dict[str, dict[str, Any]]) -> None:
+    todo, skipped = [], []
+    for p in products:
+        why = recheck_eligible(p)
+        (skipped.append((p, why)) if why else todo.append(p))
+    if args.limit:
+        todo = todo[: args.limit]
+    print(f"to re-check: {len(todo)} held by the cut-out check · skipped: {len(skipped)}")
+    for p, why in skipped[:20]:
+        print(f"  skip {p['sku']}: {why}")
+    if not todo:
+        return
+    if args.apply:
+        print(f"\nRE-CHECK: {len(todo)} product(s) · verification WRITTEN (verified / reason updated) · "
+              f"NOT pushed to Shopify")
+        if not args.yes and input("  Type APPLY to continue: ").strip() != "APPLY":
+            sys.exit("not applied")
+    else:
+        print("read-only — the AI looks, nothing is written. Add --apply to write the verification.")
+
+    rows: list[dict[str, Any]] = []
+    t0 = time.time()
+
+    def one(p: dict[str, Any]) -> dict[str, Any]:
+        try:
+            res = recheck(p, classes[p["id"]], apply=args.apply)
+        except Exception as exc:  # noqa: BLE001 — one product's failure is a row, not a stop
+            res = {"done": [f"FAILED: {type(exc).__name__}: {exc}"[:200]], "defects": [],
+                   "ai_note": "", "seen": [], "status": p["vs"], "reason": ""}
+        return {"product": p, **res}
+
+    with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        for n, r in enumerate(pool.map(one, todo), 1):
+            rows.append(r)
+            say(f"  [{n}/{len(todo)}] {r['product']['sku']}: {'; '.join(r['done'])}"
+                + (f"  → {'; '.join(r['defects'])[:160]}" if r["defects"] else ""))
+    verified = sum(1 for r in rows if r["status"] == "VERIFIED")
+    held = sum(1 for r in rows if r["status"] == "HELD_FOR_HUMAN" and r["defects"])
+    by_t = Counter(r["product"]["tenant"] for r in rows if r["status"] == "VERIFIED")
+    print(f"\ndone in {time.time() - t0:.0f}s — {len(rows)} re-checked: "
+          f"{verified} {'verified' if args.apply else 'would be verified'} "
+          f"({', '.join(f'{t} {n}' for t, n in sorted(by_t.items()))}) · {held} still held · "
+          f"{len(rows) - verified - held} not checked")
+    if args.out:
+        write_recheck(args.out, rows, args.apply)
 
 
 if __name__ == "__main__":
