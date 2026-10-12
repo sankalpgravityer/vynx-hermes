@@ -262,11 +262,10 @@ def read_sheet(path: Path, reason_col: str | None = None) -> list[dict[str, str]
     return out
 
 
-def resolve(entry: dict[str, str], include_failed: bool,
-            retry: bool = False,
-            stages: list[str] | None = None) -> dict[str, Any] | None:
-    """The product row, plus which eligibility clauses it fails."""
-    where = 'p.id = %(id)s::uuid' if entry["id"] else 'p.sku = %(sku)s'
+def eligibility_clauses(retry: bool = False,
+                        stages: list[str] | None = None) -> list[tuple[str, str]]:
+    """The eligibility predicate as (name, SQL) pairs, widened for the flags —
+    what `resolve` tests, and what scripts/held_products.py counts a run with."""
     clauses = [c for c in CLAUSES if not (retry and c[0] == "never verified")]
     if stages and any(s not in SELECTABLE_STAGES for s in stages):
         # These names are interpolated into SQL below, so they are checked
@@ -300,6 +299,15 @@ def resolve(entry: dict[str, str], include_failed: bool,
                 if name == "review status pending" else (name, sql)
                 for name, sql in clauses
             ]
+    return clauses
+
+
+def resolve(entry: dict[str, str], include_failed: bool,
+            retry: bool = False,
+            stages: list[str] | None = None) -> dict[str, Any] | None:
+    """The product row, plus which eligibility clauses it fails."""
+    where = 'p.id = %(id)s::uuid' if entry["id"] else 'p.sku = %(sku)s'
+    clauses = eligibility_clauses(retry, stages)
     checks = ",\n               ".join(
         f'({sql}) AS "chk_{i}"' for i, (_, sql) in enumerate(clauses)
     )

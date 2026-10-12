@@ -130,6 +130,25 @@ def same_photo_duplicates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def listing_cutouts(rows: list[dict[str, Any]], sent: list[str]) -> list[dict[str, Any]]:
+    """The cut-outs the listing shows, for the repair chain's AI look (12 Oct 2026).
+
+    The live, non-decision, non-duplicate cut-outs in the gallery cache — plus a
+    live FRONT/BACK cut-out of a view the cache does not cover yet: a re-cut made
+    this run supersedes the row the cache still lists until the gallery is rebuilt.
+    """
+    by_id = {r["id"]: r for r in rows}
+    gone = {r["id"] for r in [*legacy_duplicates(rows), *same_photo_duplicates(rows)]}
+    keep = [r for r in live(rows) if is_cutout(r) and not is_decision(r, by_id)
+            and r["id"] not in gone and "/size-charts/" not in str(r.get("url") or "")]
+    in_cache = set(sent or [])
+    shown = [r for r in keep if r.get("url") in in_cache]
+    covered = {r.get("view") for r in shown}
+    extra = [r for r in keep if r not in shown and r.get("view") in ("FRONT", "BACK")
+             and r.get("view") not in covered]
+    return [*shown, *extra]
+
+
 def classify(rows: list[dict[str, Any]], sent: list[str]) -> dict[str, Any]:
     """One product: its decision images, its duplicates, and the cut-outs it sends.
 
