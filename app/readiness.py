@@ -67,6 +67,13 @@ _DEFAULTS: dict[str, Any] = {
         "upper": {"men": "Men Top", "women": "Women Top", "any": "Top"},
         "bottom": "Bottom",
         "kids": "Kids",
+        # SHOES (13 Oct 2026, the user's call). vnyx-api stores the photobooth's
+        # "Footwear" as "None", and approve-products.ts reads "None" as a blank
+        # placeholder — every Klekt shoe was refused "no mannequin selected".
+        # "Flatlay" is in the dropdown, nothing keys behaviour off it (renders
+        # follow the category and the shot sequence), and the pre-flight accepts
+        # it, so a shoe carries it. Empty string turns the footwear rule off.
+        "footwear": "Flatlay",
     },
     # A house choice (a category, a guide) wins a tie only when the tenant uses
     # it at least this many times more often than the runner-up.
@@ -357,6 +364,18 @@ def decide_master(p: ProductSnapshot, pol: dict[str, Any] | None, *,
 # The rig, derived
 # --------------------------------------------------------------------------- #
 
+def footwear_rig(category: Any, subcategory: Any, pol: dict[str, Any] | None) -> str | None:
+    """The rig a SHOE carries (`readiness.mannequin.footwear`), or None when the
+    product is not footwear or the rule is off. Footwear by the same word-boundary
+    test as vnyx-api's isFootwearCategory (app/rules/imagery.is_footwear)."""
+    from app.rules.imagery import is_footwear
+
+    rig = str(config(pol)["mannequin"].get("footwear") or "").strip()
+    if rig and is_footwear(str(category or ""), str(subcategory or "")):
+        return rig
+    return None
+
+
 def derive_rig(master: Any, gender: Any, category: Any, subcategory: Any,
                pol: dict[str, Any] | None) -> str | None:
     """The mannequin rig the product should carry, from the master and the side.
@@ -373,6 +392,9 @@ def derive_rig(master: Any, gender: Any, category: Any, subcategory: Any,
     None only when there is nothing to derive from at all.
     """
     cfg = config(pol)["mannequin"]
+    footwear = footwear_rig(category, subcategory, pol)
+    if footwear:
+        return footwear
     if master and flat(master) in {flat(r) for r in ("kids", "kid", "children")}:
         return str(cfg.get("kids") or "Kids")
     side = _side_of(subcategory, pol or {}) or _side_of(category, pol or {})
