@@ -394,6 +394,15 @@ def candidate_guides(p: ProductSnapshot, *,
                 continue
         hits.append(name)
 
+    # A SHOE CHART NEVER SIZES A GARMENT, NOR A GARMENT CHART A SHOE (13 Oct
+    # 2026). A hard filter, never dropped: Klekt had 47 tops, dresses and trousers
+    # on "Shoes" — its EU 35–50 ladder lists the numeric sizes a garment carries
+    # too — and once that guide had a chart image they would have been approved
+    # with a shoe size chart. A guide named for neither (a generic one) stays.
+    feet = is_footwear_product(p)
+    hits = [n for n in hits
+            if (is_footwear_guide(n) == feet) or (feet and not _side_named(n))]
+
     # A CHART NAMED FOR THE PRODUCT'S GENDER BEATS ONE NAMED FOR NEITHER (12 Oct
     # 2026). Unknown-gender charts are kept above so a name this module cannot
     # parse is not lost — but when a chart that DOES name the gender also fits,
@@ -543,13 +552,38 @@ def _garment_words(text: str | None, pol: dict[str, Any]) -> set[str]:
     }
 
 
+def is_footwear_product(p: ProductSnapshot) -> bool:
+    """A shoe, by vnyx-api's isFootwearCategory word test (app/rules/imagery)."""
+    from app.rules.imagery import is_footwear
+
+    return bool(is_footwear(str(p.category or ""), str(p.subcategory or "")))
+
+
+def is_footwear_guide(name: str | None) -> bool:
+    """A chart named for footwear ("Shoes", "Women Shoes", "Footwear")."""
+    from app.rules.imagery import is_footwear
+
+    return bool(name) and not is_generic_guide(name) and bool(is_footwear(str(name)))
+
+
+def _side_named(name: str | None) -> bool:
+    """Whether a guide's name says what it measures — a garment side or footwear."""
+    from app.config import policy
+
+    return is_footwear_guide(name) or _side_of(name, policy()) is not None
+
+
 def category_side(p: ProductSnapshot, pol: dict[str, Any]) -> str | None:
-    """Which half of the body this product is, from its taxonomy.
+    """Which part of the body this product is, from its taxonomy:
+    'upper' | 'bottom' | 'feet' | None.
 
     Sub-category first: it is the more specific name, so a "Shorts" leaf under a
     "Bottoms" branch and a "Denim Jacket" leaf under "Jackets" both resolve
-    correctly. Falls back to the category.
+    correctly. Falls back to the category. Footwear first of all (13 Oct 2026),
+    so a shoe on a garment chart — or a garment on "Shoes" — is SIZE.014.
     """
+    if is_footwear_product(p):
+        return "feet"
     return (
         _side_of(p.subcategory, pol)
         or _side_of(p.category, pol)
@@ -557,14 +591,48 @@ def category_side(p: ProductSnapshot, pol: dict[str, Any]) -> str | None:
 
 
 def guide_side(name: str | None, pol: dict[str, Any]) -> str | None:
-    """Which half of the body a guide measures, from its name.
+    """Which part of the body a guide measures, from its name:
+    'upper' | 'bottom' | 'feet' | None.
 
     Generic guides ("Defaults") deliberately resolve to None — they cover both,
     so comparing them against a category would report a mismatch that is not one.
     """
     if is_generic_guide(name):
         return None
+    if is_footwear_guide(name):
+        return "feet"
     return _side_of(name, pol)
+
+
+def gendered_twin(p: ProductSnapshot, current: str | None, gender: str) -> str | None:
+    """The tenant's chart that is `current` named for `gender` — "Women Shoes" for
+    "Shoes" — when it lists the product's size. None otherwise.
+
+    The name with its gender word taken out must BE the current guide's name, so
+    only a gendered copy of the same chart qualifies; "Women Uppers" is never the
+    twin of "Accesories" however their ladders overlap.
+    """
+    if not current or not p.catalog or is_generic_guide(current):
+        return None
+    words = set(_MEN_WORDS) | set(_WOMEN_WORDS)
+
+    def bare(name: str) -> str:
+        toks = re.findall(r"[a-z0-9]+", name.lower())
+        return " ".join(t for t in toks if t not in words)
+
+    base = bare(current)
+    if not base or base != " ".join(re.findall(r"[a-z0-9]+", current.lower())):
+        return None     # the current guide already names a gender
+    for name in sorted(p.catalog.sizing_guides or {}):
+        if name == current or guide_gender(name) != gender or bare(name) != base:
+            continue
+        if guide_contains_size(p, name) is not False:
+            return name
+    return None
+
+
+def _side_label(side: str | None) -> str:
+    return {"feet": "footwear", "garment": "clothing"}.get(str(side), f"{side}-body")
 
 
 def guide_contains_size(p: ProductSnapshot, guide: str | None = None) -> bool | None:
@@ -804,6 +872,11 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
         want_side = category_side(p, pol)
         have_side = guide_side(current, pol)
         holds_size = guide_contains_size(p)
+        # A SHOE CHART ON ANYTHING BUT A SHOE (13 Oct 2026): wrong whatever side
+        # the garment's own name reads — a dress or a skirt this module cannot
+        # place on a side is still not a shoe (KLE-002806, a dress on "Shoes").
+        if have_side == "feet" and want_side != "feet":
+            want_side = want_side or "garment"
 
         if want_side and have_side and want_side != have_side:
             fits = candidate_guides(p, pol=pol)
@@ -811,8 +884,8 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
                 rule_id="SIZE.014", severity=Severity.HIGH,
                 fields=["sizing_guide"],
                 message=(
-                    f"Sizing guide '{current}' is a {have_side}-body chart but "
-                    f"this is a {want_side}-body product "
+                    f"Sizing guide '{current}' is a {_side_label(have_side)} chart but "
+                    f"this is a {_side_label(want_side)} product "
                     f"({p.master_category} > {p.category})."
                     + (f" '{fits[0]}' is the match." if len(fits) == 1 else "")
                 ),
@@ -857,6 +930,21 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
                 detail={"sizing_guide": current, "guide_gender": have,
                         "product_gender": want,
                         "suggested": candidate_guides(p)},
+            ))
+        elif want and not have and (twin := gendered_twin(p, current, want)):
+            # SIZE.017 — the tenant keeps a chart for THIS gender of the very guide
+            # the product is on (13 Oct 2026): Klekt's women's shoes on "Shoes"
+            # while "Women Shoes" carries the women's chart. Same ladder, so the
+            # move changes nothing about the size; it puts the right chart image on
+            # the listing. HIGH so a product is not approved with the other
+            # gender's chart when the move cannot be written.
+            out.append(Finding(
+                rule_id="SIZE.017", severity=Severity.HIGH,
+                fields=["sizing_guide"],
+                message=(f"Sizing guide '{current}' has a {want}'s version, '{twin}', "
+                         f"for this {want}'s product."),
+                detail={"sizing_guide": current, "product_gender": want,
+                        "suggested": [twin]},
             ))
         elif is_generic_guide(current) and want:
             # SIZE.012 — on a generic chart while specific ones fit.

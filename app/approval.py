@@ -459,7 +459,7 @@ def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
     finding = next(
         (f for f in findings
          if f.rule_id in ("SIZE.014", "SIZE.013", "SIZE.011", "SIZE.012",
-                          "SIZE.015", "SIZE.016")), None
+                          "SIZE.015", "SIZE.016", "SIZE.017")), None
     )
     if finding is None:
         return
