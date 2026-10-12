@@ -518,8 +518,11 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
     catalog = {
         "categories": categories,
         "sizingGuides": {
-            name: {"sizes": list(sizes or []), "euSizes": list(eu or [])}
-            for _gid, name, sizes, eu, _n, _urls in guides
+            # `images`: the chart's pictures, read when its data lacks the
+            # product's size (approval._eu_lookup).
+            name: {"sizes": list(sizes or []), "euSizes": list(eu or []),
+                   "images": list(urls or [])}
+            for _gid, name, sizes, eu, _n, urls in guides
         },
         "colors": options["colors"],
         "materials": options["materials"],

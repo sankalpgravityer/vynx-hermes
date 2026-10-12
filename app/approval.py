@@ -459,7 +459,7 @@ def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
     finding = next(
         (f for f in findings
          if f.rule_id in ("SIZE.014", "SIZE.013", "SIZE.011", "SIZE.012",
-                          "SIZE.015")), None
+                          "SIZE.015", "SIZE.016")), None
     )
     if finding is None:
         return
@@ -470,7 +470,7 @@ def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
         if len(suggested) != 1:
             # Try to resolve it before handing it to a person — see _pick_guide.
             chosen = _pick_guide(p, suggested) if suggested else None
-            if chosen:
+            if chosen and str(chosen).strip().lower() != str(p.sizing_guide or "").strip().lower():
                 plan.append({
                     "kind": "set_column", "field": "sizingGuide", "value": chosen,
                     "reason": finding.rule_id,
@@ -493,6 +493,12 @@ def _plan_guide_switch(p: ProductSnapshot, findings: list[Finding],
             })
             return None
         suggested = suggested[0]
+
+    # A "switch" to the guide already attached is no repair (12 Oct 2026):
+    # KLE-002304, an XXXL skirt on Women Uppers, matched only the chart it is on,
+    # planned it as the fix, and the same SIZE.014 came back every run.
+    if suggested and str(suggested).strip().lower() == str(p.sizing_guide or "").strip().lower():
+        suggested = None
 
     if not suggested:
         plan.append({
@@ -897,10 +903,22 @@ def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
     size, and computing it from the old one would pair the new size with the old
     EU number.
     """
+    placeholders = {str(x).strip().lower()
+                    for x in (pol.get("confidence") or {}).get("placeholders") or []}
+
+    def _placeholder(value: Any) -> bool:
+        return value is not None and str(value).strip().lower() in placeholders
+
+    # "UNKNOWN" IS NO EU SIZE (12 Oct 2026). vnyx-api's feed passes the stored
+    # property through as-is, so a product whose EU size reads the literal word
+    # "Unknown" reached this gate PRESENT — DATA.010 is for a field nobody
+    # wrote — while approve-products.ts counts the same word as blank and
+    # refuses it with "no EU size". 124 held products sat between the two: the
+    # chart paired their size, and nothing ever asked it to.
     absent = any(
         f.rule_id == "DATA.010" and "eu_size" in (f.fields or [])
         for f in findings
-    )
+    ) or _placeholder(p.eu_size)
     # A WRONG EU SIZE IS ALSO REPAIRABLE (22 Sep 2026), and until now was not:
     # this planner ran only for an ABSENT one, so SIZE.002 was detected on every
     # pass, reported, and never written. KLE-000025 sat at EU 42 against a chart
@@ -952,23 +970,108 @@ def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
          and a["kind"] in ("set_property", "set_column")),
         None,
     )
-    # Through the same resolver the rule uses, preference and all: filling an
-    # absent EU size from one chart while SIZE.002 validates it against another
-    # would write a value and report it wrong in the same pass.
-    from app.rules.consistency import eu_from_charts
+    sizes = [s for s in (planned_size, p.size, p.international_size)
+             if s and str(s).strip() and not _placeholder(s)]
+    found = _eu_lookup(p, sizes, pol)
+    if found:
+        eu, detail = found
+        plan.append({
+            "kind": "set_property", "field": "eu_size", "value": eu,
+            "reason": "DATA.010", "detail": detail,
+        })
 
-    for candidate in (planned_size, p.size, p.international_size):
-        if not candidate:
-            continue
+
+def _has_digit(value: Any) -> bool:
+    return any(ch.isdigit() for ch in str(value or ""))
+
+
+def _eu_lookup(p: ProductSnapshot, sizes: list[Any],
+               pol: dict[str, Any]) -> tuple[str, str] | None:
+    """The EU size for the first of `sizes` an answer exists for, and why.
+
+    Four sources, best first (12 Oct 2026, at the operator's direction: "take it
+    from the chart data, and if the size is not there read the size-chart image
+    and pick the best one"):
+
+      1. The attached chart's DATA — `eu_from_charts`, the same resolver SIZE.002
+         validates with, preference and all, so the value written is the value
+         the rule then checks against.
+      2. The attached chart's IMAGE, read once per picture
+         (app/llm/size_chart.py). Klekt's "Men Bottoms" data lists W21-W40 only;
+         its image prints S = 46, M = 48. Where the image prints a size twice
+         (the women's charts: S = 36 and S = 38) the value another chart of the
+         product's gender agrees with is chosen, else the first row.
+      3. Another chart of the product's GENDER whose data pairs the size with a
+         number — and only when every such chart gives the same number. A men's
+         "Small" is EU 46 on Men Uppers and on the Men Bottoms image alike.
+      4. The attached chart's own non-numeric pairing (Women Bottoms maps S to
+         the EU value "S"), as before this change — the tenant's word, used
+         only when nothing printed a number.
+    """
+    from app.rules.consistency import eu_from_charts
+    from app.rules.gate import guide_gender, is_generic_guide, product_gender, size_aliases
+
+    # No guide, no lookup: the chart is attached first (SIZE.015) and the EU size
+    # follows from it, so the two can never come from different tables.
+    if not sizes or not p.catalog or not p.sizing_guide:
+        return None
+    guides = p.catalog.sizing_guides or {}
+    spelled = [a for s in sizes for a in (size_aliases(s) or [s])]
+
+    letter_answer: tuple[str, str] | None = None
+    for candidate in sizes:
         eu, chart = eu_from_charts(p.catalog, p.sizing_guide, [candidate], pol)
-        if eu:
-            plan.append({
-                "kind": "set_property", "field": "eu_size", "value": eu,
-                "reason": "DATA.010",
-                "detail": (f"the '{chart}' chart pairs "
-                           f"{candidate!r} with EU {eu}"),
-            })
-            return
+        if eu and _has_digit(eu):
+            return str(eu), f"the '{chart}' chart pairs {candidate!r} with EU {eu}"
+        if eu and letter_answer is None:
+            letter_answer = (str(eu), f"the '{chart}' chart pairs {candidate!r} "
+                                      f"with EU {eu}")
+
+    # What the other charts of this gender say — the tie-breaker for an image
+    # that prints a size twice, and source 3 on its own.
+    gender = product_gender(p)
+    others: dict[str, str] = {}
+    if gender:
+        for name in guides:
+            if name == p.sizing_guide or is_generic_guide(name):
+                continue
+            if guide_gender(name) != gender:
+                continue
+            for candidate in spelled:
+                eu = p.catalog.eu_for_size(name, candidate)
+                if eu and _has_digit(eu):
+                    others[name] = str(eu)
+                    break
+
+    if ((pol.get("sizing") or {}).get("eu_from_chart_image", True)
+            and p.sizing_guide):
+        from app.llm import size_chart
+
+        urls = list((guides.get(p.sizing_guide) or {}).get("images") or [])
+        urls += [m.url for m in p.media
+                 if (m.view or "").upper() == "SIZE_CHART" and m.url
+                 and not m.deleted_at and m.url not in urls]
+        for url in urls[:3]:
+            read = size_chart.read_chart(url, pol)
+            options = size_chart.eu_options((read or {}).get("rows") or [], spelled)
+            if not options:
+                continue
+            agreed = [o for o in options if o in set(others.values())]
+            pick = (agreed or options)[0]
+            why = (f"the '{p.sizing_guide}' chart image prints "
+                   f"{sizes[0]!r} with EU {' / '.join(dict.fromkeys(options))}")
+            if len(set(options)) > 1:
+                why += (f"; {pick} agrees with "
+                        + ", ".join(f"'{n}'" for n, v in others.items() if v == pick)
+                        if agreed else f"; {pick} is the first row")
+            return pick, why
+
+    if others and len(set(others.values())) == 1:
+        eu = next(iter(others.values()))
+        named = ", ".join(f"'{n}'" for n in others)
+        return eu, (f"'{p.sizing_guide}' does not list {sizes[0]!r}; "
+                    f"{named} pair{'s' if len(others) == 1 else ''} it with EU {eu}")
+    return letter_answer
 
 
 def _plan_mannequin(findings: list[Finding],

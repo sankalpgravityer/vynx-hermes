@@ -1545,6 +1545,70 @@ def test_the_rematte_step_does_not_pay_twice_for_the_escalated_views(wired, monk
     assert step["ran"] is False and "this run already" in step["why"]
 
 
+def test_a_view_the_matte_step_only_framed_is_asked_the_default_chain(wired, monkeypatch):
+    """KLE-000758, 12 Oct 2026: the matte step re-cut FRONT and only FRAMED BACK; the
+    audit then flagged BACK, and BACK went straight to the re-cut methods as if the
+    default chain had already answered about it — it had not been asked at all."""
+    wired["verdicts"][:] = [_verdict({"FRONT": [NECK], "BACK": [FRAMING]}, {"BACK"}), OK]
+    flagged = GateVerdict("ok", soft=["CUTOUT DEFECT — BACK cut-out: collar missing"],
+                          bad_cutouts=["BACK"])
+    looks = iter([flagged, GateVerdict("ok")])
+    monkeypatch.setattr(pa, "judge", lambda media, **kw: next(looks))
+    r = _repair(apply=True)
+    rematte = wired["calls"]["matte_args"][-1]
+    assert rematte[rematte.index("--views") + 1] == "BACK"
+    assert "--bg-strategies" not in rematte
+    assert next(s for s in r["steps"] if s["step"] == "rematte")["ran"]
+
+
+def _gate_saying(blocking: list[str], plan: list[dict[str, Any]]):
+    return lambda *a, **k: {"verified": not blocking, "advisory": [], "repair_plan": plan,
+                            "blocking": [{"rule_id": r} for r in blocking]}
+
+
+def test_settle_runs_reconcile_again_when_the_rig_still_disagrees(wired, monkeypatch):
+    """BOA-004227 / KLE-002313, 12 Oct 2026: the master moved, the renders followed, and
+    the rig and the chart were left on the old gender. When the record still has such a
+    disagreement and the gate has a write for it, reconcile runs once more."""
+    from app import approval
+
+    seen: list[list[str]] = []
+    real = rp.run_step
+
+    def run_step(vnyx_api, script, args, **kw):
+        if script == "verify-and-repair.ts":
+            seen.append(list(args))
+        return real(vnyx_api, script, args, **kw)
+
+    monkeypatch.setattr(rp, "run_step", run_step)
+    monkeypatch.setattr(approval, "run_gate", _gate_saying(
+        ["TAX.005"], [{"kind": "set_column", "field": "mannequinType", "value": "Men Top",
+                       "reason": "TAX.005"}]))
+    r = _repair(apply=True)
+    step = next(s for s in r["steps"] if s["step"] == "settle")
+    assert step["ran"] and "TAX.005" in step["note"]
+    assert len(seen) == 2                                  # reconcile, then settle
+    assert not any("--render-gender" in a for a in seen[1:])
+
+
+def test_settle_stays_out_of_the_way_when_nothing_is_left(wired, monkeypatch):
+    from app import approval
+
+    monkeypatch.setattr(approval, "run_gate", _gate_saying([], []))
+    r = _repair(apply=True)
+    step = next(s for s in r["steps"] if s["step"] == "settle")
+    assert step["ran"] is False and "agree" in step["why"]
+
+
+def test_settle_does_not_chase_a_blocker_it_cannot_write(wired, monkeypatch):
+    from app import approval
+
+    monkeypatch.setattr(approval, "run_gate", _gate_saying(
+        ["TAX.005"], [{"kind": "escalate", "field": "mannequinType", "reason": "TAX.005"}]))
+    r = _repair(apply=True)
+    assert next(s for s in r["steps"] if s["step"] == "settle")["ran"] is False
+
+
 # --- the photograph's resolution is the cut-out's to keep (7 Oct 2026) ------------------
 
 def _detailed(w: int, h: int) -> Image.Image:

@@ -85,6 +85,23 @@ def gate_writes_prices():
 
 
 @pytest.fixture(autouse=True)
+def _no_chart_image_reads(monkeypatch):
+    """NO TEST READS A SIZE-CHART IMAGE unless it says what the image holds.
+
+    The EU-size planner reads the chart picture when the chart data lacks the
+    size (app/llm/size_chart.py). With a real GEMINI_API_KEY in the
+    environment that would be a paid call per fixture URL; tests that cover it
+    patch `read_chart` themselves.
+    """
+    from app.llm import size_chart
+
+    size_chart.reset()
+    monkeypatch.setattr(size_chart, "read_chart", lambda url, pol=None: None)
+    yield
+    size_chart.reset()
+
+
+@pytest.fixture(autouse=True)
 def _vision_cache_off(monkeypatch):
     monkeypatch.setenv("HERMES_VISION_CACHE", "0")
     monkeypatch.delenv("HERMES_VISION_CACHE_REDIS", raising=False)

@@ -313,10 +313,14 @@ def eu_from_charts(catalog: Any, guide: str | None, candidates: list[Any],
     """
     if not catalog or not guide:
         return None, guide
+    from app.rules.gate import size_aliases
+
+    # "Small" is looked up as "S" too (gate.size_aliases), after its own spelling.
+    spelled = [a for c in candidates for a in (size_aliases(c) or [c])]
     prefer = ((pol.get("sizing") or {}).get("chart_preference") or {}).get(guide) or []
     seen: set[str] = set()
     for chart in [*prefer, guide]:
-        for candidate in candidates:
+        for candidate in spelled:
             key = str(candidate).strip().lower() if candidate else ""
             if not key or (chart, key) in seen:
                 continue

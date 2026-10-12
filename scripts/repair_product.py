@@ -1453,7 +1453,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     cutout_verdict: Any = None    # what _approve enforces
     # Whether this run's matte step re-cut the product's cut-outs (or would,
     # in a dry run) — the rematte step below asks before cutting them again.
-    matte_state: dict[str, Any] = {"replaced": False, "escalated": []}
+    matte_state: dict[str, Any] = {"replaced": False, "escalated": [], "recut_views": []}
 
     def _cutouts_now() -> Any:
         """Measure the live cut-outs against their originals and the backdrop."""
@@ -1621,6 +1621,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             extra = ["--views", ",".join(recut_views)] if (recut_views and remote_supports("matteViews")) else []
             w, f, k = _run_matte(extra)
             written, failed, kept = _add(written, w), _add(failed, f), _add(kept, k)
+            # Which views the DEFAULT chain re-cut this run. The rematte step asks
+            # a different segmenter only about these; a view this step merely
+            # framed was never put to the default chain (12 Oct 2026). Without
+            # `--views` every covered view was redone.
+            if replace:
+                matte_state["recut_views"] = list(recut_views if extra else replace)
         if frame_views and not recut_views:
             parts.append(f"framed {', '.join(frame_views)} without cutting again (the cut-out on "
                          f"file was right, only its framing was not)")
@@ -2398,8 +2404,19 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # methods); `--keep-better` still refuses one with less garment. When the
         # matte step did NOT re-cut this run, the chain's own answer (`plan`)
         # stands: the current chain may well fix a cut-out an older one made.
+        #
+        # PER VIEW, NOT PER PRODUCT (12 Oct 2026). KLE-000758: the matte step
+        # re-cut FRONT and only FRAMED BACK, the audit then saw the mannequin
+        # below BACK's hem — on the old cut-out — and BACK went to object-isnet
+        # alone, which keeps a booth mannequin, so --keep-better kept the old
+        # one. The fine-tuned parser was never asked about BACK at all. A view
+        # the default chain has not answered this run is asked it now, alone.
+        unasked = [v for v in views if v not in (matte_state.get("recut_views") or [])]
         if matte_state["replaced"] and _recut_after():
-            plan = _recut_after()
+            if unasked:
+                views = unasked
+            else:
+                plan = _recut_after()
 
         # A LEFTOVER WITH NOTHING CONFIGURED TO REMOVE IT IS LEFT ALONE.
         #
@@ -2521,12 +2538,64 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # these views this run; asking them again answers the same way and bills twice.
         rematte_why = ("the paid methods re-cut these views this run already (the matte "
                        "step's escalation)")
-    elif matte_state["replaced"] and not (_recut_after() and remote_supports("bgStrategies")):
+    elif (matte_state["replaced"]
+          and set(_pa.rematte_views(photo_verdict, policy())) <= set(matte_state.get("recut_views") or [])
+          and not (_recut_after() and remote_supports("bgStrategies"))):
         rematte_why = ("the matte step re-cut this product this run already — the same "
                        "segmenter would return the same cut")
     else:
         rematte_why = ""
     step("rematte", rematte_why, _rematte)
+
+    # ---- 4b''. dedupe -------------------------------------------------------
+    #
+    # A RE-CUT REPLACES, IT DOES NOT ADD (12 Oct 2026). Products imported before
+    # the media model carry their cut-outs as OTHER photos with no link to the
+    # photo they were cut from, so a re-cut superseded the photograph and the old
+    # cut-out stayed live beside the new one — BOA-000314 went to Shopify with
+    # four. After the matte and re-cut steps, any cut-out a newer cut-out of the
+    # SAME photo has made redundant is soft-deleted (app/imaging/gallery_cleanup:
+    # decided per photo, by lineage) and the gallery cache rebuilt; the rebuild
+    # moves updatedAt, so the sync step pushes the cleaner gallery. Decision
+    # images are left alone — the Image Sequence keeps them off Shopify.
+    from app.imaging import gallery_cleanup as _gc
+
+    def _media_rows() -> list[dict[str, Any]]:
+        from app.services.auto_approval import db as _db
+
+        return _db.fetch_all(
+            'SELECT id::text, url, view::text, origin::text, processing::text,'
+            ' "derivedFromId"::text AS "derivedFromId", "deletedAt", "createdAt"'
+            ' FROM "ProductMedia" WHERE "productId" = %(p)s::uuid AND "mediaType"::text = \'IMAGE\'',
+            {"p": product_id})
+
+    def _dedupe() -> str:
+        from app.rules import imagery as _im
+        from app.services.auto_approval import db as _db
+
+        dupes = _gc.classify(_media_rows(), [])["duplicates"]
+        names = ", ".join(_gc.base(d["url"]) for d in dupes)
+        if not dupes:
+            return "no duplicate cut-out left"
+        if not apply:
+            return f"would remove {len(dupes)} duplicate cut-out(s): {names}"
+        n = _db.execute(
+            'UPDATE "ProductMedia" SET "deletedAt" = now(), "deletedById" = NULL'
+            ' WHERE "productId" = %(p)s::uuid AND id::text = ANY(%(ids)s) AND "deletedAt" IS NULL',
+            {"p": product_id, "ids": [d["id"] for d in dupes]})
+        respect = bool(_im.gallery_config(policy()).get("respect_manual", True))
+        ok, _, _ = run_step(vnyx_api, "rebuild-media-cache.ts",
+                            [*common, *([] if respect else ["--include-manual"]), *live],
+                            timeout_s=120, quiet=quiet)
+        if not ok:
+            raise StepFailed(f"removed {n} duplicate cut-out(s) but the gallery rebuild failed")
+        return f"removed {n} duplicate cut-out(s) of re-cut photo(s): {names}"
+
+    try:
+        dedupe_why = "" if _gc.classify(_media_rows(), [])["duplicates"] else "no duplicate cut-out"
+    except Exception as exc:  # noqa: BLE001 — a failed look is not a reason to fail the chain
+        dedupe_why = f"could not read the gallery ({type(exc).__name__})"
+    step("dedupe", dedupe_why, _dedupe)
 
     # ---- 4c. regen --------------------------------------------------------
     #
@@ -2731,6 +2800,50 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     else:
         regen_why = ""
     step("regen", regen_why, _regen)
+
+    # ---- 4c'''. settle ----------------------------------------------------
+    #
+    # THE FIELDS THAT FOLLOW THE MASTER, SETTLED ONCE MORE (12 Oct 2026). On
+    # BOA-004227 and KLE-002313 reconcile moved the master category to Women, the
+    # image gate re-rendered the set for it, and the product was then held because
+    # the gender, the size chart and the mannequin still said Men (TAX.004, SIZE.011,
+    # TAX.005) — 36 products held for "a Women mannequin on a Men product" and its
+    # mirror. The gate plans all of them correctly from the record as it stands; it
+    # was simply never asked again after the renders and the steps between changed
+    # that record. So when the record NOW still has one of these disagreements and
+    # the gate has a write for it, reconcile runs once more — no render hint, so the
+    # master stands and everything else follows it.
+    SETTLE_RULES = {"TAX.003", "TAX.004", "TAX.005", "TAX.007", "SIZE.002", "SIZE.011",
+                    "SIZE.013", "SIZE.014", "SIZE.015", "SIZE.016", "DRIFT.001", "DATA.010"}
+    settle_rules: list[str] = []
+
+    def _settle_needed() -> list[str]:
+        from app import approval
+
+        fresh = needs(dsn, product_id)["loaded"]
+        gate = approval.run_gate({**fresh["record"], "media": fresh["media"]},
+                                 catalog=fresh.get("catalog"),
+                                 imagery_settings=fresh.get("imagery_settings"),
+                                 llm=None, severity_overrides=severity_overrides)
+        blocking = {f.get("rule_id") for f in gate.get("blocking") or []}
+        writes = {a.get("reason") for a in gate.get("repair_plan") or []
+                  if a.get("kind") in ("set_column", "set_property", "create_size_chart")}
+        return sorted(blocking & SETTLE_RULES & writes)
+
+    def _settle() -> str:
+        return f"{', '.join(settle_rules)} still open after the renders — {_reconcile({})}"
+
+    if not apply:
+        settle_why = "dry run — reconcile already said what it would write"
+    elif "reconcile" not in [s.get("step") for s in steps if s.get("ran")]:
+        settle_why = "reconcile did not run this pass"
+    else:
+        try:
+            settle_rules = _settle_needed()
+            settle_why = "" if settle_rules else "the master, gender, chart and rig agree"
+        except Exception as exc:  # noqa: BLE001 — a failed look is not a reason to fail the chain
+            settle_why = f"could not re-read the record ({type(exc).__name__}: {exc})"[:200]
+    step("settle", settle_why, _settle)
 
     def _snapshot_now() -> Any:
         """The product as the rules see it, on the rows as they are NOW."""
