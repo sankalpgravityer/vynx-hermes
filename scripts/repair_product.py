@@ -2966,7 +2966,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # the gate has a write for it, reconcile runs once more — no render hint, so the
     # master stands and everything else follows it.
     SETTLE_RULES = {"TAX.003", "TAX.004", "TAX.005", "TAX.007", "SIZE.002", "SIZE.011",
-                    "SIZE.013", "SIZE.014", "SIZE.015", "SIZE.016", "DRIFT.001", "DATA.010"}
+                    "SIZE.013", "SIZE.014", "SIZE.015", "SIZE.016", "SIZE.017", "DRIFT.001",
+                    "DATA.010"}
     settle_rules: list[str] = []
 
     def _settle_needed() -> list[str]:

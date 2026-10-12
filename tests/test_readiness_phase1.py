@@ -307,8 +307,10 @@ def test_a_missing_rig_is_derived_and_written():
 # approve-products.ts reads as a blank — every held Klekt shoe was refused
 # "no mannequin selected" (KLE-002827).
 SHOE_CATALOG = catalog(
-    categories={**TREE, "Men": {**TREE["Men"], "Shoes": ["Lifestyle", "Running"]}},
-    sizingGuides={**GUIDES, "Shoes": {"sizes": ["36.5", "42"], "euSizes": ["36.5", "42"]}})
+    categories={**TREE, "Men": {**TREE["Men"], "Shoes": ["Lifestyle", "Running"]},
+                "Women": {**TREE["Women"], "Shoes": ["Lifestyle", "Heels"]}},
+    sizingGuides={**GUIDES, "Shoes": {"sizes": ["36.5", "38", "42"], "euSizes": ["36.5", "38", "42"]},
+                  "Women Shoes": {"sizes": ["36.5", "38", "42"], "euSizes": ["36.5", "38", "42"]}})
 
 
 def shoe(**over: Any) -> dict[str, Any]:
@@ -332,6 +334,64 @@ def test_a_shoe_on_flatlay_passes_and_a_torso_rig_on_a_shoe_is_replaced():
     torso = snap(SHOE_CATALOG, **shoe(mannequinType="Men Top"))
     found = [f for f in check_taxonomy(torso, POL) if f.rule_id in ("TAX.005", "TAX.007")]
     assert [(f.rule_id, f.detail["suggested"]) for f in found] == [("TAX.005", "Flatlay")]
+
+
+def test_a_garment_on_a_shoe_chart_is_moved_off_it():
+    # 47 Klekt tops, dresses and trousers sat on "Shoes" (13 Oct 2026); with a chart
+    # image on that guide they would have been approved with a shoe size chart.
+    r = gate(SHOE_CATALOG, category="T-Shirts & Polos", subCategory="T-Shirts",
+             size="M", euSize="48", sizingGuide="Shoes")
+    assert "SIZE.014" in [f["rule_id"] for f in r["blocking"]]
+    moved = writes(r, "sizingGuide")
+    assert moved and moved[0]["value"] != "Shoes" and moved[0]["reason"] == "SIZE.014"
+
+
+def test_a_shoe_chart_is_never_a_candidate_for_a_garment_with_a_numeric_size():
+    from app.rules.gate import candidate_guides
+
+    trousers = snap(SHOE_CATALOG, category="Bottoms", subCategory="Jeans", size="42",
+                    euSize="42", sizingGuide="Shoes")
+    assert "Shoes" not in candidate_guides(trousers, pol=POL)
+    r = gate(SHOE_CATALOG, category="Bottoms", subCategory="Jeans", size="42", euSize="42",
+             sizingGuide="Shoes")
+    assert "SIZE.014" in [f["rule_id"] for f in r["blocking"]]
+    assert writes(r, "sizingGuide") == [] and escalations(r, "sizingGuide")     # a person picks
+
+
+def test_a_shoe_on_a_garment_chart_is_moved_to_the_shoe_chart_and_a_shoe_on_it_passes():
+    r = gate(SHOE_CATALOG, **shoe(mannequinType="Flatlay", sizingGuide="Men Uppers"))
+    assert "SIZE.014" in [f["rule_id"] for f in r["blocking"]]
+    assert [a["value"] for a in writes(r, "sizingGuide")] == ["Shoes"]
+    ok = gate(SHOE_CATALOG, **shoe(mannequinType="Flatlay"))
+    assert "SIZE.014" not in [f["rule_id"] for f in ok["blocking"]]
+
+
+def test_a_womens_shoe_moves_to_the_womens_copy_of_its_guide_and_a_mens_stays():
+    # Klekt (13 Oct 2026): "Women Shoes" is "Shoes" with the women's chart image.
+    women = gate(SHOE_CATALOG, **shoe(masterCategory="Women", gender=["women"], size="38",
+                                      euSize="38", mannequinType="Flatlay",
+                                      title="Vintage Nike Black Lifestyle Women 38"))
+    assert "SIZE.017" in [f["rule_id"] for f in women["blocking"]]
+    assert writes(women, "sizingGuide") == [{
+        "kind": "set_column", "field": "sizingGuide", "value": "Women Shoes",
+        "reason": "SIZE.017", "detail": "was 'Shoes'",
+    }]
+    men = gate(SHOE_CATALOG, **shoe(mannequinType="Flatlay"))     # no "Men Shoes": stays
+    assert "SIZE.017" not in [f["rule_id"] for f in men["blocking"]]
+    assert writes(men, "sizingGuide") == []
+
+
+def test_a_gendered_twin_must_be_the_same_chart_and_list_the_size():
+    from app.rules.gate import gendered_twin
+
+    p = snap(SHOE_CATALOG, **shoe(masterCategory="Women", gender=["women"], size="38", euSize="38"))
+    assert gendered_twin(p, "Shoes", "women") == "Women Shoes"
+    assert gendered_twin(p, "Women Shoes", "women") is None        # already gendered
+    odd = snap(SHOE_CATALOG, **shoe(masterCategory="Women", gender=["women"], size="44", euSize="44"))
+    assert gendered_twin(odd, "Shoes", "women") is None             # 44 not on its ladder
+    top = snap(SHOE_CATALOG, masterCategory="Women", gender=["women"], category="Jackets",
+               subCategory="Sports Jackets", size="M", sizingGuide="Defaults")
+    assert gendered_twin(top, "Defaults", "women") is None           # generic: SIZE.012's case
 
 
 def test_derive_rig_for_footwear_and_bootcut_jeans_are_not_shoes():
