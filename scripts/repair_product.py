@@ -131,6 +131,7 @@ import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1263,6 +1264,48 @@ def _without_cutout_defects(v: Any) -> Any:
         code = next((c for p, c in _AUDIT_CODES if str(rest[0]).startswith(p)), code)
     return dataclasses.replace(v, action="regen" if code == "RENDER_DEFECT" else v.action,
                                code=code, reasons=rest, soft=soft)
+
+
+# THE RECORD MUST AGREE WITH ITSELF BEFORE IT IS APPROVED (13 Oct 2026, the user's
+# call). approve-products.ts checks that each field is PRESENT; it cannot see that
+# the master category, gender, size chart and mannequin name different genders.
+# VIN-000010 and VIN-000014 went live as Women products on "Men Uppers" with
+# SIZE.011 still open. So once settle has had its turn, whatever of these still
+# blocks — after the tenant's Brain overrides — holds the product in Review.
+CONFLICT_RULES = frozenset({"TAX.004", "TAX.005", "SIZE.011", "SIZE.014", "SIZE.017"})
+CONFLICT_LABEL = "size chart / gender conflict"
+
+
+@dataclass
+class RecordConflict:
+    """A refusal shaped like the picture verdicts `_approve` already weighs."""
+    reasons: list[str]
+    code: str = "GENDER_CHART_CONFLICT"
+    unavailable: bool = False
+
+    @property
+    def blocks(self) -> bool:
+        return bool(self.reasons)
+
+
+def record_conflicts(gate: dict[str, Any], *, skip: frozenset[str] = frozenset()) -> RecordConflict:
+    """What in a run_gate() answer still sets the record against itself.
+
+    The blocking CONFLICT_RULES, plus DRIFT.001 on the master category in any
+    severity: its two copies naming different genders is the same conflict, and a
+    tie the product's gender settles is repaired by reconcile before this looks.
+    `skip` names rules to leave out — a dry run's, whose plan would write them.
+    """
+    reasons = [f'{f.get("rule_id")} {f.get("message") or ""}'.strip()
+               for f in gate.get("blocking") or []
+               if f.get("rule_id") in CONFLICT_RULES and f.get("rule_id") not in skip]
+    if "DRIFT.001" not in skip:
+        drift = next((f for f in [*(gate.get("blocking") or []), *(gate.get("advisory") or [])]
+                      if f.get("rule_id") == "DRIFT.001"
+                      and "master_category" in (f.get("fields") or [])), None)
+        if drift is not None:
+            reasons.append(f'DRIFT.001 {drift.get("message") or ""}'.strip())
+    return RecordConflict(reasons=reasons)
 
 
 def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
@@ -3192,10 +3235,29 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 and integrity_verdict.action in ("ok", "bad", "pending")
                 and _ci.config(policy()).get("photo_audit_defers", True)):
             audit = _without_cutout_defects(audit)
+        # THE RECORD AGAINST ITSELF, after reconcile and settle (see
+        # CONFLICT_RULES). Read from the stored rows; a failed read does not hold.
+        conflict: RecordConflict | None = None
+        try:
+            from app import approval as _gate_mod
+
+            fresh = needs(dsn, product_id)["loaded"]
+            gate_now = _gate_mod.run_gate({**fresh["record"], "media": fresh["media"]},
+                                          catalog=fresh.get("catalog"),
+                                          imagery_settings=fresh.get("imagery_settings"),
+                                          llm=None, severity_overrides=severity_overrides)
+            planned = frozenset(
+                a.get("reason") for a in gate_now.get("repair_plan") or []
+                if a.get("kind") in ("set_column", "set_property", "create_size_chart"))
+            conflict = record_conflicts(gate_now, skip=frozenset() if apply else planned)
+        except Exception as exc:  # noqa: BLE001 — a failed look is not a verdict
+            if not quiet:
+                print(f"    record conflict check could not run: {type(exc).__name__}: {exc}"[:200])
         refusing = [(label, v) for label, v in (("image gate", gate_verdict),
                                                 ("photo audit", audit),
                                                 ("cut-outs", cutout_verdict),
-                                                ("cut-out check", integrity_verdict))
+                                                ("cut-out check", integrity_verdict),
+                                                (CONFLICT_LABEL, conflict))
                     if v is not None and v.blocks]
         blocked = bool(refusing)
         # Only ever passes --apply when BOTH flags are set. `--apply` alone
@@ -3251,7 +3313,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         if outcome == "would_approve":
             return "ready — pass --approve to move it"
         if outcome == "gate_blocked":
-            return "NOT approved — refused on the pictures: " + "; ".join(problems)
+            on = ("the record" if all(label == CONFLICT_LABEL for label, _ in refusing)
+                  else "the pictures and the record" if any(label == CONFLICT_LABEL for label, _ in refusing)
+                  else "the pictures")
+            return f"NOT approved — refused on {on}: " + "; ".join(problems)
         if outcome == "gate_unavailable":
             return "NOT approved — the picture check could not run: " + "; ".join(problems)
         if outcome == "skipped_preflight":

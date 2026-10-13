@@ -897,7 +897,8 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
                 },
             ))
         elif holds_size is False:
-            fits = candidate_guides(p)
+            # pol= for the half-of-the-body filter, as SIZE.014 above: see SIZE.011.
+            fits = candidate_guides(p, pol=pol)
             out.append(Finding(
                 rule_id="SIZE.013", severity=Severity.HIGH,
                 fields=["sizing_guide"],
@@ -920,6 +921,13 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
             # The chart contradicts the garment. This is the case that produces
             # wrong sizes: the men's letter table maps S to EU 46, the women's to
             # 36, so a men's product on a women's chart is off by ten EU sizes.
+            #
+            # THE SUGGESTIONS ARE SIDE-MATCHED (13 Oct 2026). Without pol= a women's
+            # T-shirt on "Men Uppers" suggested "Women Uppers" AND "Women Bottoms"
+            # (both list M). Hermes' own loader breaks that tie with the tenant's
+            # guide_usage; vnyx-api's catalog carries no usage, so reconcile — the
+            # step that writes — escalated "2 charts fit; pick one" and wrote
+            # nothing. VIN-000010 and VIN-000014 were approved on the men's chart.
             out.append(Finding(
                 rule_id="SIZE.011", severity=Severity.HIGH,
                 fields=["sizing_guide"],
@@ -929,7 +937,7 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
                 ),
                 detail={"sizing_guide": current, "guide_gender": have,
                         "product_gender": want,
-                        "suggested": candidate_guides(p)},
+                        "suggested": candidate_guides(p, pol=pol)},
             ))
         elif want and not have and (twin := gendered_twin(p, current, want)):
             # SIZE.017 — the tenant keeps a chart for THIS gender of the very guide
@@ -1302,17 +1310,36 @@ def check_column_drift(p: ProductSnapshot) -> list[Finding]:
                 },
             ))
         else:
+            # THE GENDER BREAKS A MASTER-CATEGORY TIE (13 Oct 2026). Both copies
+            # real is a judgement in general — but for the master category the
+            # product's own `gender` is independent evidence. When it names the
+            # column's gender and not the property's, the property is the stray
+            # copy (245 Vinted products: column Women, gender women, property Men)
+            # and is brought to the column. Never the other way: moving the COLUMN
+            # is a taxonomy move with categoryId behind it, and a gender that
+            # disagrees with the column is TAX.004's, settled by the render.
+            tie = None
+            if field == "master_category" and _tree_holds(p, field, col_value):
+                said = resolve_gender(p.gender)
+                if (said and resolve_gender(col_value) == said
+                        and resolve_gender(prop_value) != said):
+                    tie = col_value
             out.append(Finding(
                 rule_id="DRIFT.001", severity=Severity.MEDIUM, fields=[field],
                 message=(
                     f"'{column}' holds {col_value!r} but "
-                    f"'properties.{prop_key}' holds {prop_value!r}. Both are real "
-                    f"values, so which is correct is a judgement."
+                    f"'properties.{prop_key}' holds {prop_value!r}. "
+                    + (f"The product's gender ({p.gender!r}) agrees with the column, "
+                       f"so the property follows it."
+                       if tie is not None else
+                       "Both are real values, so which is correct is a judgement.")
                 ),
                 detail={
                     "column": column, "column_value": col_value,
                     "property": prop_key, "property_value": prop_value,
-                    "repair_to": None,
+                    "repair_to": tie,
+                    **({"repair_side": "properties", "decided_by": "gender"}
+                       if tie is not None else {}),
                 },
             ))
     return out

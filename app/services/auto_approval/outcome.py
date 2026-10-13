@@ -79,6 +79,8 @@ def _preflight_code(blockers: list[str]) -> str:
         # the repair chain's cutcheck step on an approved product (12 Oct 2026):
         # the same code the Shopify cut-out check holds under
         ("cut-out check: ", "CUTOUT_DEFECT"),
+        # repair_product.CONFLICT_RULES still open after settle (13 Oct 2026)
+        ("size chart / gender conflict: ", "GENDER_CHART_CONFLICT"),
     ):
         if first.startswith(prefix):
             return code
