@@ -37,7 +37,9 @@ class RunSettings:
     policy_overlay: dict[str, Any] = field(default_factory=dict)
     matte: bool = True
     gate: bool = True
-    price_mode: str = "full"          # full | window_only | rounding_only | off
+    # rounding_only | off — the agent never moves a price by the grade window
+    # (13 Oct 2026): see agent_price_mode.
+    price_mode: str = "rounding_only"
     publish_on_approve: bool = True
     # The Brain's `publishActiveOnApprove`: the agent's approvals go to Shopify
     # as ACTIVE (live) instead of draft, and the product's status follows what
@@ -96,11 +98,7 @@ def settings_from_snapshot(snapshot: Any, fallback_max_attempts: int = 3) -> Run
     execution = _as_dict(snap.get("execution"))
     compiled = _as_dict(brain.get("compiled"))
     chain = _as_dict(compiled.get("chain"))
-    price_mode = str(chain.get("priceMode") or "full")
-    if price_mode not in _PRICE_MODES:
-        # A mode this worker does not know is a newer API talking to an older
-        # worker. The full step is what ran before the modes existed.
-        price_mode = "full"
+    price_mode = agent_price_mode(chain.get("priceMode"))
 
     return RunSettings(
         mode=str(snap.get("mode") or "SHADOW"),
@@ -126,7 +124,23 @@ def settings_from_snapshot(snapshot: Any, fallback_max_attempts: int = 3) -> Run
     )
 
 
-_PRICE_MODES = frozenset({"full", "window_only", "rounding_only", "off"})
+def agent_price_mode(requested: Any) -> str:
+    """The price step's mode for an agent run: `rounding_only` or `off`, never more.
+
+    13 Oct 2026. The grade-window modes (`full`, `window_only`) clamp a price into
+    retailPrice x the grade's priceFactor (± 20%) — a client-approved 55.99 became
+    30.99 — and the client's rule is that the agent never moves an approved price.
+    So the window half of a mode is dropped and only the .99 half survives:
+
+        full          -> rounding_only
+        window_only   -> off            (its rounding was off: never widened)
+        rounding_only -> rounding_only
+        off           -> off
+
+    A mode this worker does not know, or none, is read as rounding_only.
+    """
+    mode = str(requested or "").strip()
+    return "off" if mode in ("off", "window_only") else "rounding_only"
 
 
 def enabled_configs() -> list[dict[str, Any]]:

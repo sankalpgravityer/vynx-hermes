@@ -103,7 +103,7 @@ def test_cache_clear_still_reaches_the_file_cache():
 def test_a_snapshot_without_checks_runs_the_chain_as_before():
     rs = settings_from_snapshot({"mode": "LIVE", "brain": {"useLlm": True}})
     assert (rs.matte, rs.gate, rs.price_mode, rs.publish_on_approve, rs.sync_changes) == \
-        (True, True, "full", True, False)
+        (True, True, "rounding_only", True, False)     # never the grade window (13 Oct)
     assert rs.policy_overlay == {}
 
 
@@ -129,9 +129,19 @@ def test_publish_active_is_off_unless_the_brain_says_so():
     assert rs.publish_active is True
 
 
-def test_an_unknown_price_mode_falls_back_to_the_full_step():
+def test_an_unknown_price_mode_falls_back_to_rounding_only():
     rs = settings_from_snapshot({"brain": {"compiled": {"chain": {"priceMode": "later"}}}})
-    assert rs.price_mode == "full"
+    assert rs.price_mode == "rounding_only"
+
+
+@pytest.mark.parametrize("brain, agent", [
+    ("full", "rounding_only"), ("window_only", "off"), ("rounding_only", "rounding_only"),
+    ("off", "off"), (None, "rounding_only"),
+])
+def test_the_agent_never_runs_the_grade_window(brain, agent):
+    # 13 Oct 2026: the window clamped client-approved prices to retail x factor.
+    chain = {"priceMode": brain} if brain else {}
+    assert settings_from_snapshot({"brain": {"compiled": {"chain": chain}}}).price_mode == agent
 
 
 # --------------------------------------------------------------------------- #
@@ -220,20 +230,19 @@ def price_args(wired) -> list[str]:
     return next(a for s, a in wired["calls"]["scripts"] if s == "fix-selling-price.ts")
 
 
-@pytest.mark.parametrize("mode, flag", [
-    ("full", None), ("window_only", "--skip-rounding"), ("rounding_only", "--rounding-only"),
-])
-def test_the_price_step_runs_in_the_brains_mode(wired, mode, flag):
+@pytest.mark.parametrize("mode", ["full", "rounding_only", None])
+def test_the_price_step_only_ever_rounds(wired, mode):
+    # 13 Oct 2026: no chain run clamps a price to the grade window.
     _repair(price_mode=mode)
     args = price_args(wired)
-    for f in ("--skip-rounding", "--rounding-only"):
-        assert (f in args) is (f == flag)
+    assert "--rounding-only" in args and "--skip-rounding" not in args
 
 
-def test_price_off_skips_the_step(wired):
-    r = _repair(price_mode="off")
+@pytest.mark.parametrize("mode", ["off", "window_only"])
+def test_price_off_skips_the_step(wired, mode):
+    r = _repair(price_mode=mode)
     assert step(r, "price")["ran"] is False
-    assert "window and the .99 rounding off" in step(r, "price")["why"]
+    assert "the .99 rounding off" in step(r, "price")["why"]
     assert not any(s == "fix-selling-price.ts" for s, _ in wired["calls"]["scripts"])
 
 

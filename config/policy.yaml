@@ -308,6 +308,11 @@ guardrails:
     # escalated — reported, never written. PRICE.001 itself is ignored (severity_overrides).
     - price
     - retail_price
+    # NOR IS THE GRADE (13 Oct 2026, the user's call). vnyx-api re-priced a regraded
+    # product to retailPrice x the new grade's priceFactor, so every grade the agent
+    # wrote (301 by 13 Oct, vision verdicts and GRADE.001) could halve a price the
+    # client had approved. A grade finding is escalated — a person regrades.
+    - grade
 
 # --------------------------------------------------------------------------- #
 # Rules that are reported but never decide anything.
