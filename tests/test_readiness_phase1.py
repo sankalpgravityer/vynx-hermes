@@ -394,6 +394,29 @@ def test_a_gendered_twin_must_be_the_same_chart_and_list_the_size():
     assert gendered_twin(top, "Defaults", "women") is None           # generic: SIZE.012's case
 
 
+@pytest.mark.parametrize("field, old, new", [
+    ("grade", "A", "C"), ("price", 166.99, 82.99), ("retail_price", 120.0, 60.0),
+])
+def test_the_agent_never_writes_a_grade_or_a_price(field, old, new):
+    # 13 Oct 2026: vnyx-api re-prices a regraded product to retail x the new grade's
+    # factor, so a grade the agent wrote could halve a client-approved price — and
+    # the gate's own price fixes did (KLE-000067 166.99 -> 82.99). Every patch on
+    # these fields, from a rule or from the vision layer, goes through _gate.
+    from app.models import Action, Patch, Provenance
+    from app.resolver import _gate
+
+    patch = Patch(field=field, old_value=old, new_value=new, action=Action.APPLY,
+                  rule_id="TEST", reason="t", confidence=0.99, provenance=Provenance.DERIVED)
+    assert _gate(patch, POL, snap()).action == Action.ESCALATE
+
+
+def test_a_price_far_above_retail_is_never_planned_as_a_write():
+    pricey = gate(price="€500", retailPrice="€120")
+    assert not [a for a in pricey["repair_plan"]
+                if a["kind"] in ("set_column", "set_property")
+                and a.get("field") in ("price", "retailPrice", "retail_price")]
+
+
 def test_derive_rig_for_footwear_and_bootcut_jeans_are_not_shoes():
     d = readiness.derive_rig
     assert d("Men", ["men"], "Shoes", "Lifestyle", POL) == "Flatlay"

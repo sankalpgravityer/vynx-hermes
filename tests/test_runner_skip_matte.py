@@ -105,10 +105,10 @@ def test_price_rounding_only_reaches_repair(captured):
     assert _run(captured, price_rounding_only=True)["price_mode"] == "rounding_only"
 
 
-def test_the_window_check_is_the_default(captured):
-    """The full step by default, so the unattended agent keeps checking that a
-    price sits inside its grade's window — the check the flag switches OFF."""
-    assert _run(captured)["price_mode"] == "full"
+def test_rounding_only_is_the_default(captured):
+    """13 Oct 2026: the agent never clamps a price to its grade's window — that
+    halved client-approved prices (retail x factor). Only the .99 ending."""
+    assert _run(captured)["price_mode"] == "rounding_only"
 
 
 def test_the_batch_flag_narrows_the_brain_and_never_widens_it(captured):

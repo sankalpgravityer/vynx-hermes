@@ -1282,10 +1282,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            # checks.ts, frozen in the run's snapshot). Every default is the
            # chain as it ran before they existed.
            #
-           #   price_mode    full | window_only | rounding_only | off — the
-           #                 grade-window clamp and the .99 ending, separately.
-           #                 None derives it from price_rounding_only, which
-           #                 is still what the CLI flag sets.
+           #   price_mode    rounding_only | off. `full` / `window_only` are read
+           #                 as rounding_only (13 Oct 2026): no run moves a price
+           #                 by the grade window. `price_rounding_only` is kept
+           #                 for callers and the CLI flag; it is now the default.
            #   publish       False approves WITHOUT the Shopify push
            #                 (approve-products.ts --no-publish).
            #   sync_changes  re-push a product that is ALREADY on Shopify
@@ -2089,9 +2089,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # is a no-op when the price is already inside the window, it costs no model
     # call, and having it decide is what keeps Hermes from holding a second
     # opinion about what a correct price is.
-    mode = price_mode or ("rounding_only" if price_rounding_only else "full")
-    mode_flag = {"rounding_only": ["--rounding-only"],
-                 "window_only": ["--skip-rounding"]}.get(mode, [])
+    # THE .99 ENDING ONLY (13 Oct 2026, the client's rule): no run of this chain
+    # moves a price by the grade window — `full` and `window_only` clamped approved
+    # prices to retailPrice x priceFactor (± 20%). `off` is still honoured.
+    from app.services.auto_approval.config import agent_price_mode
+
+    mode = agent_price_mode(price_mode)
+    mode_flag = ["--rounding-only"] if mode == "rounding_only" else []
 
     def _price() -> str:
         ok, _, payload = run_step(vnyx_api, "fix-selling-price.ts",
@@ -2122,14 +2126,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                      str(state["loaded"]["record"].get("tenantId") or ""), policy())
                  else "")
     if not price_why and mode == "off":
-        price_why = "the Brain has both the grade window and the .99 rounding off"
-    elif not price_why and mode_flag and not remote_supports(
-            "roundingOnly" if mode == "rounding_only" else "skipRounding"):
-        # Sending a mode this vnyx-api cannot take is a 400 mid-chain; running
-        # the full step instead would write the change the tenant switched off.
-        price_why = (f"this vnyx-api cannot run the price step in {mode} mode — "
-                     f"left unchanged rather than applying the part the Brain "
-                     f"switched off")
+        price_why = "the Brain has the .99 rounding off"
+    elif not price_why and not remote_supports("roundingOnly"):
+        # A vnyx-api that cannot take --rounding-only would run its full step —
+        # the grade-window clamp this chain never applies. Skipped instead.
+        price_why = ("this vnyx-api cannot run the price step as .99 rounding only — "
+                     "left unchanged rather than clamping to the grade window")
     step("price", price_why, _price)
 
     # ---- 4. render --------------------------------------------------------
@@ -3887,11 +3889,9 @@ def main() -> int:
               "unaffected."))
     ap.add_argument(
         "--price-rounding-only", action="store_true",
-        help=("the price step checks ONLY that the shelf price ends in .99, and "
-              "fixes it when it does not. The grade window is not consulted, so "
-              "a price outside it is left where it is and only its cents move. "
-              "Reaches products the window check skips too — no retail anchor, "
-              "no grade factor — which still have a price that should end .99."))
+        help=("kept for old commands: the price step ALWAYS checks only that the "
+              "shelf price ends in .99 (13 Oct 2026). The grade window is never "
+              "consulted, so a price is never moved to retail x factor."))
     ap.add_argument(
         "--no-matte", action="store_true",
         help=("skip background removal AND the re-cut (45s + 168s a product, "
