@@ -23,7 +23,9 @@ and answers, per view, the user's three defects (12 Oct 2026) — each `minor` o
 
 and NOT, by name: the dress form's neck seen inside the neck opening (KLE-000398 —
 it keeps the garment from looking hollow, and the first prompt called it
-"background above the collar"), the back collar above the front neckline, a hanger
+"background above the collar"), the form's shoulders at a sleeveless top's armholes
+(VIN-000009, the user's call 13 Oct 2026; VIN-000016 had been held for exactly
+that), the back collar above the front neckline, a hanger
 or clip kept or left as a stub (keep the hanger rather than cut cloth), a missing
 shop tag.
 
@@ -69,7 +71,7 @@ Compare B with A, and D with C. Report ONLY these three kinds of defect:
                  touched the garment).
   background   — something that is NOT the garment, left OUTSIDE its outline: wall, floor,
                  ceiling, rail, the dress form's stand, pole or base, the form showing below
-                 the hem or beside the garment, tape, a hand, other objects.
+                 the hem, tape, a hand, other objects.
   colour       — the garment's colour lost or changed compared with the original: an area
                  washed out, turned white, grey or see-through, a print, patch or logo that
                  lost its colour, a clearly different shade.
@@ -77,6 +79,8 @@ Compare B with A, and D with C. Report ONLY these three kinds of defect:
 These are NOT defects — never report them:
   * the dress form's neck or body seen INSIDE the neck opening, armholes or other openings,
     enclosed by the garment (it keeps the garment from looking hollow);
+  * the dress form's shoulders or upper arms showing at the armholes of a sleeveless,
+    strappy or cap-sleeved garment (a tank top, camisole, sleeveless blouse);
   * the inside back of the collar or neckline visible above the front neckline;
   * a hanger, hook or clips kept on the garment, whole or as a small stub;
   * a missing shop tag, price ticket or swing tag (not part of the garment);

@@ -170,6 +170,9 @@ _PROPERTY_KEYS: dict[str, str] = {
 # every pair.
 for _field, _column, _prop in _gate.COLUMN_PROPERTY_PAIRS:
     _PROPERTY_KEYS.setdefault(_field, _prop)
+    # ...and by the stored key itself, which is what DRIFT.001 now plans (13 Oct
+    # 2026) because vnyx-api's executor writes the field name verbatim.
+    _PROPERTY_KEYS.setdefault(_prop, _prop)
 
 PLACEHOLDERS = {"", "unknown", "n/a", "na", "none", "-", "null", "tbd"}
 

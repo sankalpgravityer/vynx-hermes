@@ -1161,12 +1161,20 @@ def _plan_column_drift(findings: list[Finding],
                 ),
             })
         else:
+            # THE STORED KEY, not the snapshot field (13 Oct 2026): vnyx-api's
+            # executor writes `properties[field]` verbatim, so `master_category`
+            # landed beside `mastercategory` and the drift never closed. Hermes'
+            # own executor maps both spellings (product_audit._PROPERTY_KEYS).
             plan.append({
-                "kind": "set_property", "field": (f.fields or [None])[0],
+                "kind": "set_property",
+                "field": f.detail.get("property") or (f.fields or [None])[0],
                 "value": value, "reason": "DRIFT.001",
                 "detail": (
-                    f"properties.{f.detail['property']} holds a placeholder "
-                    f"while the column holds {value!r}"
+                    f"properties.{f.detail['property']} holds "
+                    + (f"{f.detail.get('property_value')!r}, and the product's gender "
+                       f"agrees with the column's {value!r}"
+                       if f.detail.get("decided_by") == "gender" else
+                       f"a placeholder while the column holds {value!r}")
                 ),
             })
 
