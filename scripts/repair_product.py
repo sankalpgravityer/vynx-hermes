@@ -1331,6 +1331,24 @@ def record_conflicts(gate: dict[str, Any], *, skip: frozenset[str] = frozenset()
     return RecordConflict(reasons=reasons)
 
 
+# A BRAND THAT SAYS "NO BRAND" IS NEVER APPROVED (16 Oct 2026, the user's call).
+# DATA.011 fired on 107 of 111 verified "NO BRAND" / "MT NO BRAND" products and they
+# were approved anyway: approve-products.ts only asks whether a brand is PRESENT. So
+# whatever DATA.011 still blocks once the care-label step has had its turn holds the
+# product for a person — never rejected. A tenant whose Brain switches the brand
+# check off sends DATA.011 as off, and nothing here holds.
+BRAND_LABEL = "brand missing"
+RECORD_LABELS = frozenset({CONFLICT_LABEL, BRAND_LABEL})
+
+
+def record_brand(gate: dict[str, Any]) -> RecordConflict:
+    """DATA.011, still blocking in a run_gate() answer, as a hold."""
+    return RecordConflict(
+        reasons=[f'DATA.011 {f.get("message") or ""}'.strip()
+                 for f in gate.get("blocking") or [] if f.get("rule_id") == "DATA.011"],
+        code="NO_BRAND")
+
+
 def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            infer: bool, min_confidence: int, skip_render: bool,
            approve: bool, skip_bin: bool,
@@ -3266,6 +3284,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # THE RECORD AGAINST ITSELF, after reconcile and settle (see
         # CONFLICT_RULES). Read from the stored rows; a failed read does not hold.
         conflict: RecordConflict | None = None
+        brand: RecordConflict | None = None
         try:
             from app import approval as _gate_mod
 
@@ -3278,6 +3297,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 a.get("reason") for a in gate_now.get("repair_plan") or []
                 if a.get("kind") in ("set_column", "set_property", "create_size_chart"))
             conflict = record_conflicts(gate_now, skip=frozenset() if apply else planned)
+            # No repair writes a brand (DATA.011 escalates), so a dry run holds too.
+            brand = record_brand(gate_now)
         except Exception as exc:  # noqa: BLE001 — a failed look is not a verdict
             if not quiet:
                 print(f"    record conflict check could not run: {type(exc).__name__}: {exc}"[:200])
@@ -3285,7 +3306,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                                                 ("photo audit", audit),
                                                 ("cut-outs", cutout_verdict),
                                                 ("cut-out check", integrity_verdict),
-                                                (CONFLICT_LABEL, conflict))
+                                                (CONFLICT_LABEL, conflict),
+                                                (BRAND_LABEL, brand))
                     if v is not None and v.blocks]
         blocked = bool(refusing)
         # Only ever passes --apply when BOTH flags are set. `--apply` alone
@@ -3341,8 +3363,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         if outcome == "would_approve":
             return "ready — pass --approve to move it"
         if outcome == "gate_blocked":
-            on = ("the record" if all(label == CONFLICT_LABEL for label, _ in refusing)
-                  else "the pictures and the record" if any(label == CONFLICT_LABEL for label, _ in refusing)
+            on = ("the record" if all(label in RECORD_LABELS for label, _ in refusing)
+                  else "the pictures and the record" if any(label in RECORD_LABELS for label, _ in refusing)
                   else "the pictures")
             return f"NOT approved — refused on {on}: " + "; ".join(problems)
         if outcome == "gate_unavailable":

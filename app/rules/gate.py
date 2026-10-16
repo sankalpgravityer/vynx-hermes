@@ -169,8 +169,8 @@ _LABELS = {
 
 
 _NO_BRAND_DEFAULT = {
-    "equals": ["boas", "brand", "unknown", "none", "na", "null", "tbd"],
-    "contains": ["nobrand"],
+    "equals": ["boas", "brand", "unknown", "none", "na", "null", "tbd", "kk", "mt"],
+    "contains": ["nobrand", "unbrand"],
 }
 
 
@@ -195,7 +195,8 @@ def no_brand_values(p: ProductSnapshot, pol: dict[str, Any] | None) -> list[str]
         if _absent(value):
             continue
         n = _letters(value)
-        if (n in equals or any(c in n for c in contains)) and str(value).strip() not in out:
+        # no letters at all ("'", "-", "123") names no brand either (16 Oct 2026)
+        if (not n or n in equals or any(c in n for c in contains)) and str(value).strip() not in out:
             out.append(str(value).strip())
     return out
 
