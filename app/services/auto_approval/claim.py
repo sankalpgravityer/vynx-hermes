@@ -367,7 +367,15 @@ def close_finished_runs() -> int:
            -- run, and no pump was ever dispatched for it (has_open_manual_run
            -- looks for a RUNNING run). An empty run that is genuinely finished
            -- closes on the next tick instead.
-           AND r."startedAt" < (now() AT TIME ZONE 'UTC') - interval '2 minutes'
+           --
+           -- vnyx-api writes the run's 'queue' event only AFTER every product
+           -- is inserted, so once it exists the run is filled and can close the
+           -- moment its last product finishes — without it a product done in
+           -- under two minutes (a cached reprice) left its run RUNNING until the
+           -- next sweep tick.
+           AND (r."startedAt" < (now() AT TIME ZONE 'UTC') - interval '2 minutes'
+                OR EXISTS (SELECT 1 FROM "AutoApprovalEvent" e
+                            WHERE e."runId" = r.id AND e.type = 'queue'))
            AND NOT EXISTS (
              SELECT 1 FROM "AutoApprovalRunProduct" q
               WHERE q."runId" = r.id

@@ -351,6 +351,43 @@ SELECT id::text, url, view::text, origin::text, processing::text, "mediaType"::t
  ORDER BY "isCurrent" DESC, position
 """
 
+# A C-COPY'S ORIGINALS ARE ITS PARENT'S (15 Oct 2026). `duplicateProduct` clones
+# only the current rows, so a gender-split copy (CBOA-, CVIN-, CKIL-) holds its
+# parent's cut-outs and none of the RAW photographs they were cut from. With no
+# original to measure against, the resolution check could not see that the
+# copy's cut-out was the ~1 MP intake one, and the chain only ever re-framed it
+# (CVIN-001265: 896x1195 -> 777x1036). The parent — same tenant, the SKU without
+# the "C", sharing at least one file, as a real copy always does — still has the
+# photographs; they ride along as archived (`isCurrent = false`) rows for the
+# cut-out pairing only, exactly like the product's own archive. vnyx-api's
+# backfill-bg-removal.ts finds the same parent (src/services/copy-parent.ts) when
+# the re-cut runs.
+PARENT_RAWS_SQL = """
+SELECT pm.id::text, pm.url, pm.view::text, pm.origin::text, pm.processing::text,
+       pm."mediaType"::text, pm.position, pm.width, pm.height, pm."derivedFromId"::text,
+       false, pm."shotKey"
+  FROM "Product" c
+  JOIN "Product" par ON par."tenantId" = c."tenantId"
+                    AND par.sku = substr(c.sku, 2) AND par.id <> c.id
+  JOIN "ProductMedia" pm ON pm."productId" = par.id
+ WHERE c.id = %s::uuid
+   AND upper(left(c.sku, 1)) = 'C' AND length(c.sku) > 1
+   AND pm."deletedAt" IS NULL AND pm.processing = 'RAW'
+   AND pm.view IN ('FRONT', 'BACK') AND pm."mediaType" = 'IMAGE'
+   AND EXISTS (SELECT 1 FROM "ProductMedia" a
+                 JOIN "ProductMedia" b ON b.url = a.url AND b."productId" = par.id
+                WHERE a."productId" = c.id)
+"""
+
+
+def with_parent_originals(media_rows: list[tuple], parent_rows: list[tuple]) -> list[tuple]:
+    """The product's rows plus its parent's RAW originals, for the view + origin
+    slots the product has no RAW of its own for. Rows are MEDIA_SQL-shaped:
+    (id, url, view, origin, processing, ...)."""
+    own = {(r[2], r[3]) for r in media_rows if r[4] == "RAW"}
+    return list(media_rows) + [r for r in parent_rows if (r[2], r[3]) not in own]
+
+
 GRADE_SQL = """
 SELECT code, label, severity::text, "priceFactor", "priceMultiplier",
        "priceMultiplierEnabled", "autoReject", position
@@ -594,6 +631,8 @@ def load(dsn: str, product_id: str, app_base: str = DEFAULT_APP_BASE) -> dict[st
 
         cur.execute(MEDIA_SQL, (product_id,))
         media_rows = cur.fetchall()
+        cur.execute(PARENT_RAWS_SQL, (product_id,))
+        media_rows = with_parent_originals(media_rows, cur.fetchall())
 
         ctx = load_tenant_context(cur, tenant_id)
 
@@ -862,6 +901,12 @@ SELECT "productId"::text, id::text, url, view::text, origin::text, processing::t
  ORDER BY "productId", "isCurrent" DESC, position
 """
 
+PARENT_RAWS_BATCH_SQL = (
+    PARENT_RAWS_SQL
+    .replace("SELECT pm.id::text,", 'SELECT c.id::text, pm.id::text,')
+    .replace("WHERE c.id = %s::uuid", "WHERE c.id = ANY(%s::uuid[])")
+)
+
 PLACEMENTS_BATCH_SQL = """
 SELECT DISTINCT ON (a."productId")
        a."productId"::text, bl."binCode", bl."binNumber", z.code, w.code,
@@ -900,6 +945,14 @@ def load_batch(cur, product_ids: list[str],
     media: dict[str, list[tuple]] = {}
     for r in cur.fetchall():
         media.setdefault(r[0], []).append(tuple(r[1:]))
+
+    # A C-copy's originals are its parent's (PARENT_RAWS_SQL).
+    cur.execute(PARENT_RAWS_BATCH_SQL, (product_ids,))
+    parent_raws: dict[str, list[tuple]] = {}
+    for r in cur.fetchall():
+        parent_raws.setdefault(r[0], []).append(tuple(r[1:]))
+    for pid, extra in parent_raws.items():
+        media[pid] = with_parent_originals(media.get(pid, []), extra)
 
     out = []
     for row in rows:

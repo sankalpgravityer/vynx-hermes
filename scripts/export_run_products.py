@@ -6,7 +6,7 @@ human, or failed, and why. READ ONLY.
     python scripts/export_run_products.py --run adf6048a-15a0-4981-ad8e-9e0fafd3e38d --db <dsn>
 
 `--run` takes the run id or a unique prefix of it. `--prod` reads the vnyx-prod
-connection string from E:\\vnyx\\vnyx-api\\.env (or $VNYX_PROD_DATABASE_URL); without
+connection string from ~/work/vnyx/vnyx-api/.env (VNYX_API_DIR) (or $VNYX_PROD_DATABASE_URL); without
 it, Hermes' .env DATABASE_URL is used. Either way the connection is opened read-only
 and the string is never printed.
 
@@ -29,7 +29,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 ROOT = Path(__file__).resolve().parents[1]
-API_ENV = Path(r"E:\vnyx\vnyx-api\.env")
+API_ENV = Path(os.getenv("VNYX_API_DIR", "~/work/vnyx/vnyx-api")).expanduser() / ".env"
 UI = "https://try.vnyx.ai"
 
 OUTCOME = {"VERIFIED": "Verified", "HELD_FOR_HUMAN": "Held for human", "FAILED": "Failed",
