@@ -26,10 +26,11 @@ never reproduce the defect.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
-ROOT = Path(r"C:\Users\Mahesh\Desktop\products test items")
+ROOT = Path(os.getenv("HERMES_BENCH_DIR", "~/Desktop/products test items")).expanduser()
 
 # folder name -> (category, subCategory, gapCategory, gapSubCategory, group)
 #

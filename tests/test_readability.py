@@ -41,9 +41,15 @@ def label_jpeg(long_edge: int = 2000, text_frac: float = 0.030,
     pt = max(4, int(h * text_frac))
     img = Image.new("RGB", (w, h), (246, 245, 241))
     draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("arial.ttf", pt)
-    except OSError:  # no Arial on CI
+    # Arial by name resolves on Windows only; macOS keeps it under Supplemental.
+    font = None
+    for name in ("arial.ttf", "/System/Library/Fonts/Supplemental/Arial.ttf"):
+        try:
+            font = ImageFont.truetype(name, pt)
+            break
+        except OSError:
+            continue
+    if font is None:  # no Arial on CI
         font = ImageFont.load_default()
     for i, line in enumerate(LABEL_LINES):
         draw.text((int(w * 0.07), int(h * 0.10) + i * int(pt * 2.0)), line,

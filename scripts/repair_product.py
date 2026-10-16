@@ -151,7 +151,10 @@ from app.rules import shot_sequence  # noqa: E402
 # verify-and-repair, backfill-imagery and approve-products. An older second
 # checkout at E:\vynx\vnyx-api used to be the only place that had five of them
 # and is retired — see docs/auto-approval-agent-implementation-plan.md §1.2.
-DEFAULT_VNYX_API = os.getenv("VNYX_API_DIR", r"E:\vnyx\vnyx-api")
+# Default = the Mac layout (15 Oct 2026, moved off Windows E:\vnyx\vnyx-api);
+# VNYX_API_DIR in .env wins.
+DEFAULT_VNYX_API = os.getenv(
+    "VNYX_API_DIR", os.path.expanduser("~/work/vnyx/vnyx-api"))
 
 # DEFENSIVE ABOUT sys.stdout, because this module is no longer only a CLI.
 #
@@ -211,6 +214,17 @@ def _trailing_int(line: str) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
+_PARENT_UPDATED = re.compile(r"parent updated\s*:\s*([0-9a-f-]{36})\s+(\S+)", re.I)
+
+
+def parents_updated(out: str | None) -> dict[str, str]:
+    """Parent product id -> SKU for every `parent updated` line of a
+    backfill-bg-removal.ts run: a C-copy re-cut from its parent's photograph
+    also replaced the parent's soft cut-out (15 Oct 2026), so the parent's
+    listing needs the same re-push as the copy's."""
+    return {m.group(1): m.group(2) for m in _PARENT_UPDATED.finditer(out or "")}
+
+
 # The words and finish reasons that mean the image model CHOSE not to render
 # (nanobanana._REFUSAL_REASONS), as they reach the render script's notes.
 _REFUSAL_TOKENS = ("declin", "refus", "image_other", "image_safety",
@@ -246,6 +260,10 @@ STEP_FOR_SCRIPT = {
     # One garment, one unit (9 Oct 2026): the chain's `stock` step, before the
     # product goes to Shopify.
     "settle-stock.ts": "stock",
+    # The Reprice calculator (15 Oct 2026): the new selling and/or retail price
+    # from the resale lookup. Called by app/services/auto_approval/reprice.py,
+    # never by the chain.
+    "set-resale-price.ts": "reprice",
 }
 
 
@@ -498,6 +516,11 @@ def run_remote(script: str, args: list[str], *, timeout_s: int,
     # LPN the garment is packed in. Sent only to a deployment whose /ping lists it.
     if "--close-stale-loose" in args:
         options["closeStaleLoose"] = True
+    # The `reprice` step's two amounts (15 Oct 2026), as plain "367.99" strings.
+    if "--price" in args:
+        options["price"] = args[args.index("--price") + 1]
+    if "--retail-price" in args:
+        options["retailPrice"] = args[args.index("--retail-price") + 1]
     # The reconcile step's image-gate hints (8 Oct 2026): the lead render's model
     # and the garment it shows. Sent only to a deployment whose /ping lists them.
     if "--render-gender" in args:
@@ -1413,6 +1436,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     common = ["--db", dsn, "--product", product_id]
     live = ["--apply"] if apply else []
+    # Parents a C-copy's re-cut also updated (parents_updated), re-pushed in `sync`.
+    pair_parents: dict[str, str] = {}
 
     # ---- 0. twin ----------------------------------------------------------
     #
@@ -1660,6 +1685,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         def _run_matte(extra: list[str]) -> tuple[int | None, int | None, int | None]:
             ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", [*args, *extra],
                                   timeout_s=600, quiet=quiet)
+            pair_parents.update(parents_updated(out))
             if not ok:
                 raise StepFailed("background removal returned non-zero")
             w = f = k = None
@@ -2542,6 +2568,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             args.extend(["--bg-strategies", ",".join(plan)])
         ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args,
                               timeout_s=600, quiet=quiet)
+        pair_parents.update(parents_updated(out))
         if not ok:
             raise StepFailed("background removal returned non-zero")
         written = failed = kept = None
@@ -2759,6 +2786,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         if plan:
             args.extend(["--bg-strategies", ",".join(plan)])
         ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args, timeout_s=600, quiet=quiet)
+        pair_parents.update(parents_updated(out))
         if not ok:
             raise StepFailed(f"{found} — the re-cut returned non-zero")
         written = kept = None
@@ -3442,6 +3470,36 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         sync_why = ""
     sync_report["why"] = sync_why or None
     step("sync", sync_why, _sync)
+
+    # THE PARENT TOO (15 Oct 2026). A C-copy re-cut from its parent's photograph
+    # put the same new cut-out on the parent (parents_updated), so the parent's
+    # storefront shows the old soft one until it is re-pushed. Same switch and
+    # same rules as the product's own sync; only parents already on Shopify.
+    def _sync_parents() -> str:
+        if not remote_supports("includeSynced"):
+            return "NOT pushed — this vnyx-api cannot re-push a synced listing; deploy vnyx-api"
+        done: list[str] = []
+        for pid, sku in pair_parents.items():
+            if not shopify_product_id(dsn, pid):
+                done.append(f"{sku}: not on Shopify")
+                continue
+            ok, out, _ = run_step(vnyx_api, "resync-listings.ts",
+                                  ["--product", pid, "--include-synced", *live],
+                                  timeout_s=120, quiet=quiet)
+            if not ok:
+                raise StepFailed(f"resync-listings.ts returned non-zero for parent {sku}")
+            m = re.search(r"queued\s*:\s*(\d+)", out or "")
+            done.append(f"{sku}: " + ("would re-push" if not apply
+                                       else "queued" if m and int(m.group(1)) else "nothing queued"))
+        return "parent's new cut-out — " + "; ".join(done)
+
+    if not pair_parents:
+        parent_sync_why = "no parent was updated"
+    elif not sync_changes:
+        parent_sync_why = "off in the Brain (syncChangesToShopify)"
+    else:
+        parent_sync_why = ""
+    step("sync-parent", parent_sync_why, _sync_parents)
 
     # ---- 6. the verdict that counts ---------------------------------------
     #

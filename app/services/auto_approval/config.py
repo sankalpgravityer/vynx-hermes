@@ -50,6 +50,19 @@ class RunSettings:
     # product that passes, Active in vnyx and a DRAFT on Shopify, is made Active
     # there (vnyx-api step `golive`). Only draft → active; LIVE mode only.
     activate_drafts: bool = False
+    # THE RUN'S KIND (15 Oct 2026): "verify" for every run until now, "reprice"
+    # for a Reprice calculator run — vnyx-api's configSnapshot.runKind. NOT
+    # `mode`: that is SHADOW/LIVE and decides whether a verification writes.
+    run_kind: str = "verify"
+    # Reprice runs only: compute and report, write nothing. True unless the
+    # person unticked Preview — the run's own guard, since a reprice run does
+    # not read the Brain's price settings.
+    reprice_preview: bool = True
+    # The Brain's "Reprice by brand tier" (16 Oct 2026), compiled by vnyx-api to
+    # chain.repriceTiers: a normal verification of a product whose brand is in
+    # one of these tiers is repriced from the resale market first (reprice.in_chain).
+    # Empty — the default, and every older snapshot — reprices nothing.
+    reprice_tiers: list[str] = field(default_factory=list)
 
     @property
     def apply(self) -> bool:
@@ -99,6 +112,7 @@ def settings_from_snapshot(snapshot: Any, fallback_max_attempts: int = 3) -> Run
     compiled = _as_dict(brain.get("compiled"))
     chain = _as_dict(compiled.get("chain"))
     price_mode = agent_price_mode(chain.get("priceMode"))
+    reprice = _as_dict(snap.get("reprice"))
 
     return RunSettings(
         mode=str(snap.get("mode") or "SHADOW"),
@@ -121,6 +135,9 @@ def settings_from_snapshot(snapshot: Any, fallback_max_attempts: int = 3) -> Run
         publish_active=bool(chain.get("publishActive", False)),
         sync_changes=bool(chain.get("syncChanges", False)),
         activate_drafts=bool(chain.get("activateDrafts", False)),
+        run_kind=str(snap.get("runKind") or "verify"),
+        reprice_preview=bool(reprice.get("preview", True)),
+        reprice_tiers=[str(x) for x in (chain.get("repriceTiers") or []) if x],
     )
 
 

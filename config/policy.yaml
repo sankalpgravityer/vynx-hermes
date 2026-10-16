@@ -535,6 +535,37 @@ llm:
     redis_url: null
 
 # --------------------------------------------------------------------------- #
+# Resale price lookup — app/pricing/resale_lookup.py, scripts/resale_price.py.
+#
+# A MANUAL TEST TOOL (14 Oct 2026), not part of the auto-approval chain: it reads
+# a product from the LOCAL database, finds used listings of the same item with
+# Gemini + Google Search, and reports a resale price with a trust tier. It writes
+# nothing. Ported from the BOAS handoff of 5 Oct 2026 (vnyx_price_lookup).
+# Key: HERMES_RESALE_GEMINI_API_KEY when set, else GEMINI_API_KEY.
+# --------------------------------------------------------------------------- #
+resale_lookup:
+  identify_model: "gemini-3.8-flash"   # vision: brand, model, article code from photos + label
+  search_model: "gemini-3.8-flash"     # Interactions API with the google_search tool
+  # Searches asked per round. Only an instruction to the model, which averages
+  # ~1.6x it (~8 an item) and once used 51 on one item.
+  max_searches: 5
+  rescue_searches: 4      # the EU-only second round, when fewer than 2 listings verify
+  page_check: true        # open uncited listing pages; keep the ones showing the price
+  # Open each COUNTED listing too (a plain page download — no Gemini or Google
+  # call, no cost): use the page's own price when the model read it wrong, drop
+  # the listing when the page shows no price. Sites that block us (403) are kept.
+  confirm_prices: true
+  cache_days: 21          # the same model in another size reuses the listings
+  cache_dir: ".cache/resale"
+  identify_timeout_s: 120
+  search_timeout_s: 180
+  # For the cost line the tool prints. The Google billing page is the truth.
+  price_per_1k_searches_usd: 14.0
+  free_searches_per_month: 5000          # shared by every Gemini 3+ model on the project
+  token_price_in_per_1m_usd: 0.75        # gemini-3.8-flash until 31 Dec 2026; doubles 1 Jan 2027
+  token_price_out_per_1m_usd: 3.75
+
+# --------------------------------------------------------------------------- #
 # Imagery — the on-model renders and background removal.
 # See docs/IMAGERY-VERIFICATION.md for how these numbers were arrived at.
 # --------------------------------------------------------------------------- #

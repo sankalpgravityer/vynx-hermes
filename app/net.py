@@ -131,29 +131,34 @@ def fetch_all(
                     time.sleep(0.5 * (attempt + 1))
         raise last if last else RuntimeError("fetch failed")
 
+    # Not a `with` block: its exit is shutdown(wait=True), which joins the
+    # in-flight downloads and so voided the deadline — a trickling R2 read held a
+    # reprice run for minutes past it.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(urls)))
+    futures: dict[concurrent.futures.Future, str] = {}
     try:
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(8, len(urls))
-        ) as pool:
-            futures = {pool.submit(one, u): u for u in urls}
-            done, pending = concurrent.futures.wait(futures, timeout=deadline_s)
-            for future in done:
-                url = futures[future]
-                try:
-                    out[url] = future.result()
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("image fetch failed (%s): %s", url[:70], exc)
-            for future in pending:
-                # Cancel what has not started; a request already in flight runs to
-                # completion on its thread and its result is simply dropped. The
-                # alternative — waiting for it — is the stall this exists to avoid.
-                future.cancel()
-                log.warning(
-                    "image fetch did not finish inside %.0fs: %s",
-                    deadline_s, futures[future][:70],
-                )
+        futures = {pool.submit(one, u): u for u in urls}
+        done, pending = concurrent.futures.wait(futures, timeout=deadline_s)
+        for future in done:
+            url = futures[future]
+            try:
+                out[url] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("image fetch failed (%s): %s", url[:70], exc)
+        for future in pending:
+            # Cancel what has not started; a request already in flight runs to
+            # completion on its thread and its result is simply dropped. The
+            # alternative — waiting for it — is the stall this exists to avoid.
+            future.cancel()
+            log.warning(
+                "image fetch did not finish inside %.0fs: %s",
+                deadline_s, futures[future][:70],
+            )
     finally:
-        if own:
+        pool.shutdown(wait=False, cancel_futures=True)
+        # Closing a client our own late threads still read from would fail them
+        # mid-body; they are abandoned anyway, so only close once none are left.
+        if own and all(f.done() for f in futures):
             http.close()
 
     got = sum(1 for v in out.values() if v is not None)

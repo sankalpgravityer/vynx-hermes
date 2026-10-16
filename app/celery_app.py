@@ -54,9 +54,15 @@ except ImportError:  # python-dotenv is optional, as it is in app/config.py
 #
 # repair_product.py already does the same thing one level down for its own
 # `from app import product_audit`.
+#
+# Inserted EVEN WHEN ALREADY PRESENT (15 Oct 2026). Started from the repo, the
+# root IS on the path while this module loads — but only because Celery's
+# cwd_in_path() put it there, and that removes it again once the app is loaded.
+# Skipping the insert left the worker with no root at all, so the first lazy
+# `import scripts.repair_product` (the reprice write step) died with "No module
+# named 'scripts'". With our own copy, Celery's remove() leaves one behind.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+sys.path.insert(0, _ROOT)
 
 SWEEP_SECONDS = int(os.getenv("AUTO_APPROVAL_SWEEP_SECONDS", "60"))
 

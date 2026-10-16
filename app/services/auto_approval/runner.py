@@ -97,8 +97,14 @@ def _finish(
     error: str | None = None,
     duration_ms: int | None = None,
     expect_status: str = "IN_PROGRESS",
+    touch_product: bool = True,
 ) -> None:
     """Write the terminal status, the product's cache and the run counters.
+
+    `touch_product=False` leaves the product's verification cache alone — the
+    Reprice calculator (15 Oct 2026): a reprice is not a verification, so an
+    Approved product keeps its last verdict. The run row and counters are
+    written as always.
 
     ONE TRANSACTION, and the run-product UPDATE is conditional on the status the
     caller expects to find — so a row the lease reaper already took back is not
@@ -180,7 +186,9 @@ def _finish(
             # The product's denormalised cache. CANCELLED never lands here — a
             # withdrawn product carries no verdict and goes back to NOT_STARTED
             # so it is eligible again.
-            if verdict.status == "CANCELLED":
+            if not touch_product:
+                pass
+            elif verdict.status == "CANCELLED":
                 cur.execute(
                     """
                     UPDATE "Product"
@@ -465,6 +473,16 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     still verifies and repairs; the approve step still refuses to move them
     (only REVIEW is ever handed to it as a stage to move from).
     """
+    # THE REPRICE CALCULATOR (15 Oct 2026). A reprice run never enters the
+    # repair chain: no cut-outs, renders, gate or approval, and the Brain's price
+    # settings are not read. It prices the product from its resale listings and
+    # writes the selling and retail price — see reprice.py.
+    if rs.run_kind == "reprice":
+        from app.services.auto_approval import reprice
+
+        reprice.reprice_one(row, rs, expect_status=expect_status)
+        return None
+
     settled = section != "REVIEW"
     repair = _load_repair()
 
@@ -514,7 +532,8 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
         f"{'' if rs.price_mode == 'full' else f' · price {rs.price_mode}'}"
         f"{'' if rs.publish_on_approve else ' · Shopify push off'}"
         f"{' · publish as Active' if rs.publish_on_approve and rs.publish_active else ''}"
-        f"{' · sync repairs to Shopify' if rs.sync_changes else ''}",
+        f"{' · sync repairs to Shopify' if rs.sync_changes else ''}"
+        f"{' · reprice ' + '/'.join(t.lower() for t in rs.reprice_tiers) if rs.reprice_tiers else ''}",
         run_id=row["runId"],
         run_product_id=row["id"],
         product_id=product_id,
@@ -595,6 +614,26 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
         # The reject step refused. Fall through and verify it normally rather
         # than leave the row unfinished — a held product is recoverable, a
         # stranded one is not.
+
+    # REPRICE BY BRAND TIER (the Brain's switch, 16 Oct 2026). Before the chain,
+    # so the price checks judge the new price. Never holds: a weak lookup is a
+    # step note and the verification goes on — see reprice.in_chain.
+    reprice_steps: list[dict[str, Any]] = []
+    reprice_report: dict[str, Any] | None = None
+    if rs.reprice_tiers:
+        from app.services.auto_approval import reprice
+
+        try:
+            reprice_steps, reprice_report = reprice.in_chain(row, rs)
+        except product_audit.ProductNotFound:
+            _finish(
+                row,
+                Verdict("CANCELLED", "PRODUCT_DELETED", "The product no longer exists.",
+                        False, False),
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                expect_status=expect_status,
+            )
+            return
 
     # The caller's batch flag narrows the price step further; it never widens
     # what the Brain switched off.
@@ -695,7 +734,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
         return
 
     duration = int((time.monotonic() - t0) * 1000)
-    steps = list(result.get("steps") or [])
+    steps = reprice_steps + list(result.get("steps") or [])
 
     # One line per step, from repair()'s own record. This is the audit trail and
     # it costs nothing to produce.
@@ -881,6 +920,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
             "copy": result.get("copy"),
             "generation": gen or None,
             "shopifyGoLive": golive,
+            **({"reprice": reprice_report} if reprice_report else {}),
         },
         duration_ms=duration,
         expect_status=expect_status,

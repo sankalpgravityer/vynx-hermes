@@ -66,9 +66,10 @@ from app.imaging.nanobanana import (  # noqa: E402
 )
 from app.models import ImagerySettings  # noqa: E402
 
-ROOT = Path(r"C:\Users\Mahesh\Desktop\products test items")
+ROOT = Path(os.getenv("HERMES_BENCH_DIR", "~/Desktop/products test items")).expanduser()
 OUT_ROOT = ROOT / "_bench_out"
-VNYX_DIST = Path(r"E:\vnyx\vnyx-api\dist\services\shot-prompt.js")
+VNYX_DIST = (Path(os.getenv("VNYX_API_DIR", "~/work/vnyx/vnyx-api")).expanduser()
+             / "dist" / "services" / "shot-prompt.js")
 
 # view -> the vnyx-api ShotKey that means the same thing. The two builders name
 # the same five framings differently; this is the only place that mapping lives.

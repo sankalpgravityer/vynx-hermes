@@ -167,7 +167,7 @@ def _read_gemini(images: list[tuple[bytes, str]]) -> tuple[dict[str, Any] | None
         # broken feature rather than a wrong interpreter.
         log.warning(
             "gemini unavailable (%s). Running %s — if that is not "
-            "hermes/.venv, use .venv/Scripts/python.exe, or "
+            "hermes/.venv, use .venv/bin/python, or "
             "`pip install google-genai` for this interpreter.",
             exc, sys.executable,
         )
