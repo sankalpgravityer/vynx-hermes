@@ -142,9 +142,12 @@ completeness:
   # brand record. The empty placeholders are here too ("Unknown" passed as a
   # brand on MID-000622): in Review a brand still missing after the care-label
   # step is then rejected, as before; elsewhere it is held.
+  # 16 Oct 2026: "Unbranded" (108 verified products) is `contains: unbrand`; a tenant
+  # code standing alone as the brand ("KK" on Kilo, "MT" on Midtex — each only on its own tenant) is `equals` (not "MK": the usual short form of Michael Kors);
+  # a brand with no letters at all ("'") counts as no brand in the code.
   no_brand:
-    equals: ["boas", "brand", "unknown", "none", "na", "null", "tbd"]
-    contains: ["nobrand"]
+    equals: ["boas", "brand", "unknown", "none", "na", "null", "tbd", "kk", "mt"]
+    contains: ["nobrand", "unbrand"]
 
 # ATTR.005 — the supplier a tenant's products should all name. The auditor
 # carried one canonical supplier per tenant; here it is keyed by tenant id and

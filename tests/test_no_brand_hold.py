@@ -51,6 +51,9 @@ def findings(**over):
 @pytest.mark.parametrize("brand", [
     "MT NO BRAND", "NOBRAND", "MK No Brand", "Mt Nobrand", "MT NOBRAND", "No Brand",
     "no-brand", "BOAS", "boas", "BRAND", "Unknown", "n/a",
+    # 16 Oct 2026: "Unbranded", and a tenant code standing alone as the brand
+    # ("MT" only ever on Midtex, "KK" only on Kilo Kilo Vintage)
+    "Unbranded", "MT", "KK",
 ])
 def test_every_no_brand_spelling_is_held(brand):
     (f,) = findings(brand=brand)
@@ -58,7 +61,7 @@ def test_every_no_brand_spelling_is_held(brand):
     assert f'"{brand}"' in f.message and "Brand is missing" in f.message
 
 
-@pytest.mark.parametrize("brand", ["Nike", "Levi's", "MT", "Brandit", "Boast", "Ragman", "UNIQLO"])
+@pytest.mark.parametrize("brand", ["Nike", "Levi's", "MK", "Brandit", "Boast", "Ragman", "UNIQLO"])
 def test_a_real_brand_is_not(brand):
     assert findings(brand=brand) == []
 
