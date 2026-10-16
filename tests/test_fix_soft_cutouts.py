@@ -45,10 +45,14 @@ def test_soft_is_under_2000_on_the_long_side():
     assert fx.soft_views(rows[:1]) == []
 
 
-def _driver(monkeypatch, before, after, out):
+def _driver(monkeypatch, before, after, out, *, raws=None, parent=False):
     calls = iter([before, after])
     monkeypatch.setattr(fx, "cutouts", lambda pid: next(calls))
     monkeypatch.setattr(fx, "_vnyx_api_dir", lambda: "/nowhere")
+    # The raw photographs on file: by default one for every slot in `before`.
+    slots = raws if raws is not None else [{"view": r["view"], "origin": r["origin"]} for r in before]
+    monkeypatch.setattr(fx.db, "fetch_all", lambda sql, params=None: (
+        [{"pid": "x", "parent_sku": "P"}] if parent else []) if sql is fx.PARENTS_SQL else slots)
     sent = {}
 
     def run_step(vnyx_api, script, args, **kw):
@@ -79,10 +83,35 @@ def test_a_copy_shared_from_its_parent(monkeypatch):
     sharp = [{"view": "FRONT", "origin": "PHOTOBOOTH", "url": "p", "width": 2624, "height": 3499}]
     _driver(monkeypatch, soft, sharp,
             "  c2b4d42e FRONT  -> parent's cut-out  2624x3499  [reuse-parent]\n"
-            "  shared from parent: 1\n")
+            "  shared from parent: 1\n", raws=[], parent=True)
     r = fx.fix_one({"sku": "CVIN-001265", "id": "c1", "tenant": "Vinted"}, dsn="x", apply=True,
                    sync=False, provider="hermes", quiet=True)
     assert r["status"] == "fixed" and r["action"] == "shared from parent" and r["copy"] is True
+
+
+def test_an_extra_cut_out_with_no_photo_of_its_origin_is_not_sent(monkeypatch):
+    # KIL-001816: a soft WEB FRONT beside a sharp PHOTOBOOTH one; only booth photos.
+    rows = [{"view": "FRONT", "origin": "WEB", "url": "w", "width": 691, "height": 922},
+            {"view": "FRONT", "origin": "PHOTOBOOTH", "url": "b", "width": 2314, "height": 3086}]
+    sent = _driver(monkeypatch, rows, rows, "", raws=[{"view": "FRONT", "origin": "PHOTOBOOTH"}])
+    r = fx.fix_one({"sku": "KIL-001816", "id": "k1", "tenant": "Kilo"}, dsn="x", apply=True,
+                   sync=False, provider="hermes", quiet=True)
+    assert r["status"] == "skipped: no photo to re-cut" and "args" not in sent
+    assert "FRONT/WEB 691x922" in r["note"]
+
+
+def test_the_sheet_names_why_a_lead_is_soft():
+    lead = {"mid": "c2", "view": "FRONT", "origin": "WEB"}
+    raw = {"id": "r", "src": None, "processing": "RAW", "view": "FRONT", "origin": "WEB"}
+    c1 = {"id": "c1", "src": "r", "processing": "BG_REMOVED", "view": "FRONT", "origin": "WEB"}
+    c2 = {"id": "c2", "src": "c1", "processing": "BG_REMOVED", "view": "FRONT", "origin": "WEB"}
+    assert fx.classify({**lead, "mid": "c1"}, [raw, c1], None)[0] == "raw stored, never re-cut"
+    assert fx.classify(lead, [raw, c1, c2], None)[0] == "raw stored, re-cut kept soft size"
+    orphan = {**c2, "src": None}
+    assert fx.classify(lead, [orphan], {"parent_sku": "BOA-1"})[0].startswith("copy without raw")
+    booth = {**raw, "origin": "PHOTOBOOTH"}
+    assert fx.classify(lead, [orphan, booth], None)[0].startswith("extra cut-out")
+    assert fx.classify(lead, [orphan], None)[0] == "no raw found"
 
 
 def test_an_already_sharp_product_is_not_sent(monkeypatch):

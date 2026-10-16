@@ -74,6 +74,171 @@ SELECT m.view::text AS view, m.origin::text AS origin, m.url, m.width, m.height
  ORDER BY m.view, m.origin
 """
 
+# --------------------------------------------------------------------------- #
+# --build-sheet: which verified live products lead with a soft cut-out NOW
+# --------------------------------------------------------------------------- #
+# The 15 Oct sheet was a snapshot; products verified since are not on it. These
+# are the same rules the client's check used: Active, on Shopify, not deleted or
+# archived, the agent's verdict VERIFIED, and the FIRST gallery image a cut-out
+# of 1195 px or less on its long side. Read-only.
+SOFT_LEAD = 1195
+
+LIVE_LEADS_SQL = """
+SELECT p.id::text AS pid, p.sku, t.name AS tenant, p."createdAt"::date::text AS created,
+       p."tenantId"::text AS tenant_id, m.id::text AS mid, m.url, m.view::text AS view,
+       m.origin::text AS origin, m.processing::text AS processing, m.width, m.height,
+       m."createdAt"::timestamp(0)::text AS uploaded
+  FROM "Product" p
+  JOIN "Tenant" t ON t.id = p."tenantId"
+  JOIN LATERAL (SELECT * FROM "ProductMedia" x
+                 WHERE x."productId" = p.id AND x.url = p.images[1]
+                 ORDER BY x."deletedAt" NULLS FIRST, x."createdAt" DESC LIMIT 1) m ON true
+ WHERE p.status = 'Active' AND p."shopifyProductId" IS NOT NULL
+   AND NOT p."isDeleted" AND NOT p."isArchived"
+   AND p."verificationStatus" = 'VERIFIED'
+   AND m.processing IN ('BG_REMOVED', 'COMPOSITED')
+   {tenant}
+"""
+
+LINEAGE_SQL = """
+SELECT id::text AS id, "productId"::text AS pid, url, view::text AS view,
+       origin::text AS origin, processing::text AS processing, width, height,
+       "derivedFromId"::text AS src
+  FROM "ProductMedia"
+ WHERE "productId" = ANY(%(pids)s::uuid[]) AND view IN ('FRONT', 'BACK', 'OTHER')
+"""
+
+# A C-copy's parent: same tenant, the SKU without the "C", sharing a file
+# (the rule vnyx-api's copy-parent.ts applies before using it).
+PARENTS_SQL = """
+SELECT c.id::text AS pid, par.sku AS parent_sku,
+       (SELECT max(greatest(coalesce(m.width, 0), coalesce(m.height, 0)))
+          FROM "ProductMedia" m
+         WHERE m."productId" = par.id AND m."deletedAt" IS NULL
+           AND m.processing IN ('BG_REMOVED', 'COMPOSITED') AND m.view IN ('FRONT', 'BACK')
+           AND NOT EXISTS (SELECT 1 FROM "ProductMedia" d
+                            WHERE d."derivedFromId" = m.id AND d."deletedAt" IS NULL)
+       ) AS parent_best,
+       EXISTS (SELECT 1 FROM "ProductMedia" r
+                WHERE r."productId" = par.id AND r."deletedAt" IS NULL
+                  AND r.processing = 'RAW' AND r.view IN ('FRONT', 'BACK')) AS parent_has_raw
+  FROM "Product" c
+  JOIN "Product" par ON par."tenantId" = c."tenantId" AND par.sku = substr(c.sku, 2)
+                    AND par.id <> c.id
+ WHERE c.id = ANY(%(pids)s::uuid[])
+   AND EXISTS (SELECT 1 FROM "ProductMedia" a
+                 JOIN "ProductMedia" b ON b.url = a.url AND b."productId" = par.id
+                WHERE a."productId" = c.id)
+"""
+
+RAW_SLOTS_SQL = """
+SELECT DISTINCT view::text AS view, origin::text AS origin
+  FROM "ProductMedia"
+ WHERE "productId" = %(pid)s::uuid AND processing = 'RAW' AND "deletedAt" IS NULL
+   AND view IN ('FRONT', 'BACK') AND "mediaType" = 'IMAGE'
+"""
+
+SHEET_COLS = ["sku", "tenant", "product_created", "lead_origin", "lead_view", "lead_file",
+              "lead_px", "lead_uploaded", "cause", "raw_to_recut_from", "raw_px",
+              "parent_sku", "parent_best_cutout_px", "on_15_oct_sheet"]
+
+
+def classify(lead: dict[str, Any], rows: list[dict[str, Any]],
+             parent: dict[str, Any] | None) -> tuple[str, dict[str, Any] | None]:
+    """Why the lead cut-out is soft, and the RAW to re-cut it from (or None).
+    The same three causes as the 15 Oct sheet."""
+    by_id = {r["id"]: r for r in rows}
+    chain, cur, seen = [], by_id.get(lead["mid"]), set()
+    while cur and cur["id"] not in seen and len(chain) < 12:
+        seen.add(cur["id"])
+        chain.append(cur)
+        cur = by_id.get(cur["src"]) if cur["src"] else None
+    raw = next((r for r in chain if r["processing"] == "RAW"), None)
+    if raw:
+        cuts = sum(1 for r in chain if r["processing"] != "RAW")
+        return ("raw stored, re-cut kept soft size" if cuts > 1
+                else "raw stored, never re-cut"), raw
+    if parent:
+        return "copy without raw (parent holds it)", None
+    # A raw of the same view and origin, unlinked: the re-cut finds it too.
+    same = [r for r in rows if r["processing"] == "RAW" and r["view"] == lead["view"]
+            and r["origin"] == lead["origin"]]
+    if same:
+        return "raw stored, never re-cut", same[0]
+    # KIL-001816 (16 Oct 2026): the lead is an old WEB `<ts>-N-processed` cut-out
+    # (or a re-cut of one) with no WEB photograph, beside sharp PHOTOBOOTH /
+    # DECISION cut-outs of the same view. A re-cut can only remake it from itself;
+    # what fixes it is removing it, so the sharp one leads.
+    if any(r["processing"] == "RAW" and r["view"] == lead["view"] for r in rows):
+        return "extra cut-out, no photo of its origin (remove it)", None
+    return "no raw found", None
+
+
+def build_sheet(tenant: str | None) -> tuple[list[dict[str, Any]], Path]:
+    leads = db.fetch_all(LIVE_LEADS_SQL.format(tenant="AND t.name = %(tenant)s" if tenant else ""),
+                         {"tenant": tenant})
+    say(f"verified live products leading with a cut-out: {len(leads)}")
+    missing = [r["url"] for r in leads if not (r["width"] and r["height"])]
+    if missing:
+        from app.net import image_dims_all
+
+        say(f"reading the size of {len(missing)} cut-out(s) with no stored dimensions…")
+        dims = image_dims_all(missing, timeout_s=15, deadline_s=max(60, len(missing) // 4))
+        for r in leads:
+            d = dims.get(r["url"])
+            if d and not (r["width"] and r["height"]):
+                r["width"], r["height"] = d
+    soft = [r for r in leads if 0 < long_side(r) <= SOFT_LEAD]
+    unknown = [r for r in leads if not long_side(r)]
+
+    pids = [r["pid"] for r in soft]
+    rows: dict[str, list[dict[str, Any]]] = {}
+    parents: dict[str, dict[str, Any]] = {}
+    for i in range(0, len(pids), 1000):
+        chunk = pids[i:i + 1000]
+        for r in db.fetch_all(LINEAGE_SQL, {"pids": chunk}):
+            rows.setdefault(r["pid"], []).append(r)
+        for r in db.fetch_all(PARENTS_SQL, {"pids": chunk}):
+            parents[r["pid"]] = r
+
+    old: set[str] = set()
+    if SHEET.exists():
+        old = {s for s, _ in read_skus(SHEET)}
+
+    out = []
+    for r in soft:
+        parent = parents.get(r["pid"]) if r["sku"][:1].upper() == "C" else None
+        cause, raw = classify(r, rows.get(r["pid"], []), parent)
+        out.append({
+            "sku": r["sku"], "tenant": r["tenant"], "product_created": r["created"],
+            "lead_origin": r["origin"], "lead_view": r["view"],
+            "lead_file": r["url"].rsplit("/", 1)[-1], "lead_px": f"{r['width']}x{r['height']}",
+            "lead_uploaded": r["uploaded"], "cause": cause,
+            "raw_to_recut_from": raw["url"] if raw else "",
+            "raw_px": f"{raw['width']}x{raw['height']}" if raw and raw["width"] else "",
+            "parent_sku": parent["parent_sku"] if parent else "",
+            "parent_best_cutout_px": parent["parent_best"] if parent else "",
+            "on_15_oct_sheet": "yes" if r["sku"] in old else "no",
+        })
+    out.sort(key=lambda x: (x["cause"], x["tenant"], x["sku"]))
+
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    path = REPORT_DIR / f"verified_soft_leads_{datetime.now():%Y-%m-%d}.csv"
+    with path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SHEET_COLS)
+        w.writeheader()
+        w.writerows(out)
+    if unknown:
+        say(f"({len(unknown)} lead cut-out(s) could not be measured — left off the sheet)")
+    return out, path
+
+
+def latest_sheet() -> Path:
+    """The newest verified_soft_leads_<date>.csv, else the 15 Oct one."""
+    found = sorted(REPORT_DIR.glob("verified_soft_leads_*.csv"))
+    return found[-1] if found else SHEET
+
+
 _print = threading.Lock()
 
 
@@ -133,12 +298,28 @@ def fix_one(prod: dict[str, Any], *, dsn: str, apply: bool, sync: bool,
                            "parents": "", "shopify": "", "note": ""}
     before = cutouts(pid)
     res["before"] = sizes(before)
-    views = soft_views(before)
     if not before:
         res["status"] = "no cut-out"
         return res
-    if not views:
+    soft = [r for r in before if long_side(r) < SHARP]
+    if not soft:
         res["status"] = "already sharp"
+        return res
+
+    # WHAT A RE-CUT CAN FIX. A copy: anything (vnyx-api goes to the parent). Any
+    # other product: a soft cut-out with a photograph of its own view AND origin.
+    # One without (KIL-001816's old WEB cut-outs beside sharp booth ones) can only
+    # be remade from itself — reported, never sent.
+    is_copy = bool(res["copy"]) and bool(db.fetch_all(PARENTS_SQL, {"pids": [pid]}))
+    slots = {(r["view"], r["origin"]) for r in db.fetch_all(RAW_SLOTS_SQL, {"pid": pid})}
+    extra = [] if is_copy else [r for r in soft if (r["view"], r["origin"]) not in slots]
+    extra_slots = {(r["view"], r["origin"]) for r in extra}
+    views = sorted({r["view"] for r in soft if (r["view"], r["origin"]) not in extra_slots})
+    extra_note = ("extra cut-out(s) with no photo of their origin, not re-cut — remove them: "
+                  + ", ".join(f"{r['view']}/{r['origin']} {r['width']}x{r['height']}"
+                              for r in extra)) if extra else ""
+    if not views:
+        res["status"], res["note"] = "skipped: no photo to re-cut", extra_note
         return res
 
     vnyx_api = _vnyx_api_dir()
@@ -170,9 +351,10 @@ def fix_one(prod: dict[str, Any], *, dsn: str, apply: bool, sync: bool,
 
     after = cutouts(pid)
     res["after"] = sizes(after)
-    still = soft_views(after)
+    still = sorted({r["view"] for r in after if long_side(r) < SHARP
+                    and (r["view"], r["origin"]) not in extra_slots})
     res["status"] = "fixed" if not still else f"still soft: {', '.join(still)}"
-    res["note"] = "; ".join([*kept, *failed])[:500]
+    res["note"] = "; ".join(x for x in [*kept, *failed, extra_note] if x)[:500]
 
     if sync:
         pushed = []
@@ -194,7 +376,12 @@ def fix_one(prod: dict[str, Any], *, dsn: str, apply: bool, sync: bool,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--sheet", type=Path, default=SHEET, help="CSV with a `sku` column")
+    ap.add_argument("--build-sheet", action="store_true",
+                    help="list today's verified live products with a soft lead cut-out "
+                         "(read-only, any database) and stop")
+    ap.add_argument("--tenant", help="--build-sheet: one tenant only (e.g. BOAS)")
+    ap.add_argument("--sheet", type=Path, default=None,
+                    help="CSV with a `sku` column (default: the newest verified_soft_leads_*.csv)")
     ap.add_argument("--skus", help="comma-separated SKUs instead of the sheet")
     ap.add_argument("--apply", action="store_true", help="write (default: dry run)")
     ap.add_argument("--sync", action="store_true",
@@ -209,6 +396,20 @@ def main() -> int:
 
     dsn = db.dsn()
     host, at = where(dsn)
+    if a.build_sheet:                  # read-only: allowed against any database
+        from collections import Counter
+
+        say(f"Database : {at} (read-only)")
+        rows, path = build_sheet(a.tenant)
+        say(f"\nsoft lead cut-outs (<= {SOFT_LEAD} px), verified + live: {len(rows)}")
+        for cause, n in Counter(r["cause"] for r in rows).most_common():
+            say(f"  {cause:40} {n}")
+        say("by tenant: " + ", ".join(f"{t} {n}" for t, n in
+                                      Counter(r["tenant"] for r in rows).most_common()))
+        new = sum(1 for r in rows if r["on_15_oct_sheet"] == "no")
+        say(f"not on the 15 Oct sheet: {new}")
+        say(f"sheet: {path}")
+        return 0
     if host.lower() not in LOCAL_HOSTS and not a.prod:
         sys.exit(f"REFUSED: DATABASE_URL points at {at}, not the local database. "
                  f"Pass --prod only with the go-ahead to write there.")
@@ -216,8 +417,11 @@ def main() -> int:
         sys.exit("--sync re-pushes what --apply wrote; pass both")
     provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip() or "hermes"
 
+    sheet = a.sheet or latest_sheet()
     wanted = ([(s.strip(), "") for s in a.skus.split(",") if s.strip()] if a.skus
-              else read_skus(a.sheet))
+              else read_skus(sheet))
+    if not a.skus:
+        say(f"Sheet    : {sheet}")
     found = db.fetch_all(PRODUCT_SQL, {"skus": [s for s, _ in wanted]})
     tenant_of = {s: t for s, t in wanted}
     prods = [p for p in found if not tenant_of.get(p["sku"]) or tenant_of[p["sku"]] == p["tenant"]]
