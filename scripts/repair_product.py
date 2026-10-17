@@ -1538,8 +1538,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                     f'{master_decision["master"]!r} ({master_decision["basis"]}: '
                     f'{master_decision["detail"]}); reconcile writes it')
         if action == "unresolved":
-            return (f'UNRESOLVED — {master_decision["detail"]}; the product holds '
-                    f'as MASTER_CATEGORY_UNRESOLVED')
+            return (f'UNRESOLVED from the record — {master_decision["detail"]}; reconcile '
+                    f'asks the render\'s model, else the product holds as MASTER_CATEGORY_UNRESOLVED')
         return master_decision["detail"]
 
     from app import readiness as _readiness
@@ -2076,19 +2076,38 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                                  catalog=fresh.get("catalog"),
                                  imagery_settings=fresh.get("imagery_settings"),
                                  llm=None, severity_overrides=severity_overrides)
-        if not any(f.get("rule_id") == "TAX.004" for f in gate.get("blocking") or []):
+        blocking = gate.get("blocking") or []
+        # ...AND A MASTER NOTHING ELSE CAN NAME (17 Oct 2026): TAX.001, or the
+        # master among DATA.010's empty fields. The render's model decides it.
+        unresolved = any(f.get("rule_id") == "TAX.001"
+                         or (f.get("rule_id") == "DATA.010"
+                             and "master_category" in (f.get("fields") or []))
+                         for f in blocking)
+        if not unresolved and not any(f.get("rule_id") == "TAX.004" for f in blocking):
             return None
         verdict = quality_gate.judge(
             fresh["media"], gender=None,
             category=fresh["record"].get("category"),
             subcategory=fresh["record"].get("subCategory"), pol=policy())
         seen = getattr(verdict, "gender_seen", None)
-        return seen if seen in ("men", "women") else None
+        if seen not in ("men", "women"):
+            return None
+        # A product with NO CATEGORY either is filed by the garment the same
+        # render shows, under the master the render gives it.
+        garment = str((getattr(verdict, "raw", None) or {}).get("garment") or "").strip()
+        if unresolved and garment and not str(fresh["record"].get("category") or "").strip():
+            render_garment_hint["garment"] = garment
+        return seen
+
+    render_garment_hint: dict[str, str] = {}
 
     def _reconcile(hints: dict[str, Any] | None = None) -> str:
         if hints is None:
+            render_garment_hint.clear()
             seen = _render_gender_hint()
             hints = {"render_gender": seen} if seen else {}
+            if seen and render_garment_hint.get("garment"):
+                hints["render_garment"] = render_garment_hint["garment"]
         args = [*common]
         if apply:
             args.append("--apply")
@@ -3541,7 +3560,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # master among DATA.010's empty fields): either way no root fits, nothing
     # downstream can be settled, and the outcome names it rather than whichever
     # rule sorted first.
-    master_unresolved = master_decision.get("action") == "unresolved" or any(
+    # FROM THE RECORD AFTER RECONCILE, not the master step's look before it (17 Oct
+    # 2026): the render's model can now settle a master the record could not, so
+    # "unresolved at the head of the chain" no longer means unresolved at the end.
+    master_unresolved = any(
         f.get("rule_id") == "TAX.001"
         or (f.get("rule_id") == "DATA.010"
             and "master_category" in (f.get("fields") or []))

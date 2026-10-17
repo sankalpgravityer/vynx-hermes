@@ -280,6 +280,26 @@ def _model_name(provider: str, pol: dict[str, Any]) -> str:
     return str(llm.get("model_fast") or "")
 
 
+# A TWO-LANGUAGE SIZE LABEL (17 Oct 2026, the user): "S/P" (small / petit),
+# "M/M" (medium / moyen), "L/G" (large / grand) is the letter size in two
+# languages, and counts as that size. VIN-000179's label read "S/P" at 95% and
+# was refused because the chart lists "S". Only a letter size followed by a
+# short letters-only translation — a range like "S/M" or "30/32" is NOT this.
+_LETTER = ("XXXS", "XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL", "4XL", "5XL")
+_TRANSLATED = {"S": {"P", "CH", "K"}, "M": {"M", "MED"}, "L": {"G", "GR"},
+               "XS": {"XP", "TP", "XCH"}, "XL": {"XG", "TG", "XGR", "EG"},
+               "XXL": {"XXG", "TTG", "XXGR", "EEG", "2XG"}, "XXS": {"XXP", "TTP"}}
+
+
+def two_language_size(value: Any) -> str:
+    """"S/P" -> "S", "M/M" -> "M", "L/G" -> "L"; anything else unchanged."""
+    text = str(value or "").strip()
+    parts = [x.strip().upper() for x in text.replace("\\", "/").split("/")]
+    if len(parts) == 2 and parts[0] in _LETTER and parts[1] in _TRANSLATED.get(parts[0], set()):
+        return parts[0]
+    return text
+
+
 def _size_ok(value: str, ladder: list[str] | None) -> bool:
     """Is this a size the product's own sizing guide can actually express?
 
@@ -373,6 +393,8 @@ def read(label_urls: list[str], *, want: tuple[str, ...] = ("brand", "size"),
             score = float(raw.get(f"{field}_confidence") or 0)
             if value is None or not str(value).strip():
                 continue
+            if field == "size":
+                value = two_language_size(value)
             if score < min_confidence:
                 # Kept at the best score seen across providers, so a field the
                 # second model was surer about is not hidden by the first.

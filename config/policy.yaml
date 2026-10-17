@@ -1685,6 +1685,13 @@ readiness:
     # 0 turns it off. Kept ON (10 Oct 2026, the user's call): the old low-resolution
     # cut-outs are re-cut at full size, though it costs ~100 s a product.
     resolution_max: 1.6
+    # A WEB photo (a marketplace listing's own picture) may sit at 1/2.0 (17 Oct
+    # 2026, the user): framing scales a tight-cropped listing photo's garment down
+    # to the 15% margin, and the photo's extra pixels are often upscaling, not
+    # detail. Centring, cropping and margin are unchanged. Photobooth and decision
+    # photos keep resolution_max.
+    resolution_max_by_origin:
+      WEB: 2.0
     # WHEN THE TWO CANNOT BE LINED UP (7 Oct 2026) the garment's scale is unknown
     # and the test above said nothing — and 66 old 896x1195 cut-outs went to
     # "frame only" in one day, cropped smaller still (699x933 against 3000x4000).
