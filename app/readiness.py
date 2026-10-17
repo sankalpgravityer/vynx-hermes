@@ -281,8 +281,8 @@ def decide_master(p: ProductSnapshot, pol: dict[str, Any] | None, *,
     with gender 'women' belongs under the tenant's Women root if it has one.
     Then the category path: a category that exists under exactly one root
     ('Dresses' only under Women) names the root; several roots are narrowed by
-    the subcategory. The mannequin rig is never consulted, and neither is the
-    render — see the module docstring.
+    the subcategory. The mannequin rig is never consulted. The render (`render_gender`)
+    settles a gender conflict and, last of all, a master nothing else names.
     """
     if not enabled(pol) or not p.catalog or not p.catalog.categories:
         return {"action": "skip", "master": p.master_category, "basis": "no catalog",
@@ -344,6 +344,19 @@ def decide_master(p: ProductSnapshot, pol: dict[str, Any] | None, *,
                            + (f" > '{p.subcategory}'" if p.subcategory and hits else "")
                            + f" exists only under '{hits[0]}'"),
                 "rule": rule}
+
+    # NOTHING ELSE DECIDES IT: THE RENDER DOES (17 Oct 2026, the user). 20 Vinted
+    # imports had no master, no category and a gender of "both" ("… Unisex XS")
+    # and held as MASTER_CATEGORY_UNRESOLVED. The on-model render shows who the
+    # product is presented for, so — last, after every data source — its model's
+    # gender names the root.
+    if seen:
+        target = next((r for r in roots if root_gender(r, pol) == seen), None)
+        if target:
+            return {"action": "set", "master": target, "basis": "render model",
+                    "detail": (f"no master category from the record; the render's model "
+                               f"is {seen}, so '{target}'"),
+                    "rule": rule}
 
     return {
         "action": "unresolved", "master": None, "basis": "none",

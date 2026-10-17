@@ -1269,7 +1269,7 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
 
 def resolution_problem(m: dict[str, Any], cutout_dims: tuple[int, int],
                        original_dims: tuple[int, int],
-                       cfg: dict[str, Any]) -> str | None:
+                       cfg: dict[str, Any], *, origin: str | None = None) -> str | None:
     """A sentence when the cut-out keeps the garment at a fraction of the
     photograph's resolution — fixable: a re-cut takes the original's pixels.
 
@@ -1286,6 +1286,14 @@ def resolution_problem(m: dict[str, Any], cutout_dims: tuple[int, int],
     means scale 1; registration attempted and FAILED means the two could not be
     lined up, and nothing is said on a measurement that did not happen."""
     limit = float(cfg.get("resolution_max") or 0)
+    # PER ORIGIN (17 Oct 2026, the user): a WEB photo — a marketplace listing's own
+    # picture, cropped tight round the garment and often upscaled — is framed to the
+    # same 15% margin by scaling the garment DOWN, which lands it at 1/1.7-1/1.8 of a
+    # photo whose extra pixels were never real detail. Centred and cropped exactly
+    # as before; only the limit is looser for that origin.
+    by_origin = cfg.get("resolution_max_by_origin") or {}
+    if origin and limit > 0 and str(origin).upper() in {str(k).upper() for k in by_origin}:
+        limit = float({str(k).upper(): v for k, v in by_origin.items()}[str(origin).upper()] or limit)
     if limit <= 0 or not original_dims or not all(original_dims) or not all(cutout_dims):
         return None
     reg = (m or {}).get("registered") or {}
@@ -1781,7 +1789,7 @@ def judge(p: Any, pol: dict[str, Any] | None, *,
                 # the original's pixels.
                 if original_dims:
                     why = resolution_problem(measured_garment, (cut.width, cut.height),
-                                             original_dims, cfg)
+                                             original_dims, cfg, origin=getattr(raw, "origin", None))
                     if why and why not in check["problems"]:
                         check["problems"].append(why)
         elif raw is not None and gc_on:

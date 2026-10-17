@@ -64,7 +64,7 @@ def test_check_names_the_failing_views_and_holds(monkeypatch):
 
     def judge(pairs, category=None, model=None):
         asked["pairs"] = pairs
-        return _answer(("FRONT", [{"type": "cloth_broken", "part": "collar", "severity": "minor", "where": "top"}]),
+        return _answer(("FRONT", [{"type": "cloth_broken", "part": "strap", "severity": "minor", "where": "top"}]),
                        ("BACK", [{"type": "background", "part": "wall", "severity": "minor", "where": "side"}])), ""
 
     monkeypatch.setattr(ci, "judge", judge)
@@ -82,7 +82,7 @@ def test_a_pass_does_not_hold_and_soft_policy_never_does(monkeypatch):
     monkeypatch.setattr(ci, "judge", lambda pairs, category=None, model=None: (_answer(("FRONT", [])), ""))
     assert ci.check(rows, [], category=None, pol={"readiness": {"cutouts": {"hold": "block"}}}).action == "ok"
     monkeypatch.setattr(ci, "judge", lambda pairs, category=None, model=None: (_answer(
-        ("FRONT", [{"type": "cloth_broken", "part": "cuff", "severity": "clear", "where": ""}])), ""))
+        ("FRONT", [{"type": "cloth_broken", "part": "waistband", "severity": "clear", "where": ""}])), ""))
     soft = ci.check(rows, [], category=None, pol={"readiness": {"cutouts": {"hold": "soft"}}})
     assert soft.action == "bad" and not soft.blocks
 
@@ -153,3 +153,34 @@ def test_held_products_kinds():
     assert kind_of("WOMEN_RIG_ON_A_MEN_PRODUCT") == "Mannequin / rig"
     assert kind_of("TAX.005") == "Category / taxonomy"
     assert kind_of("SOMETHING_NEW") == "Other"
+
+
+def test_a_hanger_named_as_background_never_holds():
+    """17 Oct 2026: 18 Vinted products held as "background (hanger)"."""
+    for d in ({"type": "background", "part": "hanger", "severity": "clear", "where": "above the collar"},
+              {"type": "background", "part": "top", "severity": "clear", "where": "hanger hook above the neckline"},
+              {"type": "background", "part": "clips", "severity": "clear", "where": "waistband"}):
+        assert not ci._fails(d), d
+    # broken cloth near a hanger is still the garment
+    assert ci._fails({"type": "cloth_broken", "part": "strap", "severity": "minor", "where": "under the hanger hook"})
+    # other background still holds
+    assert ci._fails({"type": "background", "part": "stand", "severity": "clear", "where": "below the hem"})
+    assert "never report a hanger as background" in ci._ASK
+
+
+def test_only_the_reliable_findings_hold():
+    """17 Oct 2026, the user's review of 40 held Vinted cut-outs."""
+    holds = [("cloth_broken", "strap"), ("cloth_broken", "shoulder straps"), ("cloth_broken", "waistband"),
+             ("background", "dress form"), ("background", "dress form stand"), ("background", "stand"),
+             ("background", "torso"), ("colour", "body")]
+    notes = [("cloth_broken", "collar"), ("cloth_broken", "sleeve"), ("cloth_broken", "hem"),
+             ("cloth_broken", "neckline"), ("background", "hem"), ("background", "bottom hem"),
+             ("background", "neckline"), ("background", "waistband"), ("background", "sleeve"),
+             ("background", "leg"), ("background", "crotch"), ("background", "collar"), ("background", "background")]
+    for kind, part in holds:
+        assert ci._fails({"type": kind, "part": part, "severity": "clear", "where": ""}), (kind, part)
+    for kind, part in notes:
+        assert not ci._fails({"type": kind, "part": part, "severity": "clear", "where": ""}), (kind, part)
+    # background and colour still need `clear`
+    assert not ci._fails({"type": "background", "part": "stand", "severity": "minor", "where": ""})
+    assert not ci._fails({"type": "colour", "part": "body", "severity": "minor", "where": ""})

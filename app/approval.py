@@ -1669,7 +1669,17 @@ def run_gate(raw: dict[str, Any], *, catalog: dict[str, Any] | None = None,
     plan: list[dict[str, Any]] = []
     # THE IMAGE GATE'S GARMENT, FIRST: it decides the branch and the leaf, and
     # everything below plans against where the product is about to be filed.
-    refiled = _plan_render_garment(p, hints.get("render_garment"), plan)
+    # A PRODUCT WITH NO MASTER YET (17 Oct 2026) is filed under the one the render's
+    # model is about to give it; _plan_master below writes the master itself.
+    under = p
+    if hints.get("render_garment") and hints.get("render_gender") and catalog is not None:
+        from app import readiness as _rd
+
+        if _rd.match_root((p.master_category or "").strip(), list((p.catalog.categories or {}) if p.catalog else [])) is None:
+            pre = _rd.decide_master(p, pol, render_gender=hints.get("render_gender"))
+            if pre.get("action") == "set" and pre.get("master"):
+                under = p.model_copy(update={"master_category": pre["master"]})
+    refiled = _plan_render_garment(under, hints.get("render_garment"), plan)
     if refiled:
         p = p.model_copy(update={"category": refiled[0], "subcategory": refiled[1]})
         findings = _all_findings(

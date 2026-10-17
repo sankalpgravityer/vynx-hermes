@@ -202,7 +202,8 @@ def test_broken_cloth_fails_at_any_severity_background_and_colour_only_when_clea
 
     answer = {"views": [
         {"view": "FRONT", "ok": False, "summary": "", "defects": [
-            {"type": "cloth_broken", "part": "collar", "severity": "minor", "where": "back neckline"},
+            {"type": "cloth_broken", "part": "strap", "severity": "minor", "where": "left shoulder"},
+            {"type": "cloth_broken", "part": "collar", "severity": "clear", "where": "back neckline"},
             {"type": "colour", "part": "logo", "severity": "minor", "where": "chest"}]},
         {"view": "BACK", "ok": False, "summary": "", "defects": [
             {"type": "background", "part": "stand", "severity": "clear", "where": "below the hem"},
@@ -210,7 +211,9 @@ def test_broken_cloth_fails_at_any_severity_background_and_colour_only_when_clea
             {"type": "colour", "part": "print", "severity": "clear", "where": "turned white"}]},
     ]}
     fails = ci.failing(answer)
-    assert any("cloth broken (collar)" in f for f in fails)
+    assert any("cloth broken (strap)" in f for f in fails)
+    # 17 Oct 2026: a broken COLLAR is a note — the user's review found 5 of 6 false
+    assert not any("(collar)" in f for f in fails) and any("(collar)" in n for n in ci.noted(answer))
     assert any("background (stand)" in f for f in fails)
     assert any("colour (print)" in f for f in fails)
     assert not any("(wall)" in f for f in fails)            # minor background: noted only

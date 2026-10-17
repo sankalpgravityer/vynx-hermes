@@ -29,15 +29,17 @@ that), the back collar above the front neckline, a hanger
 or clip kept or left as a stub (keep the hanger rather than cut cloth), a missing
 shop tag.
 
-`failing()` decides: `cloth_broken` at any severity — fabric the garment has and
-the listing does not is never acceptable — and `background` / `colour` the model
-calls `clear`.
+`failing()` decides (17 Oct 2026, after the user's review of 40 held cut-outs):
+`cloth_broken` on a strap or waistband, `background` the model calls `clear` that
+is a dress form, stand or torso, and `colour` it calls `clear`. Every other finding
+is a note, not a hold — see `_fails`.
 
 Cached by image URLs + prompt, so a re-run is free. Never raises.
 """
 from __future__ import annotations
 
 import io
+import re
 import logging
 from dataclasses import asdict, dataclass, field
 from typing import Any
@@ -82,7 +84,8 @@ These are NOT defects — never report them:
   * the dress form's shoulders or upper arms showing at the armholes of a sleeveless,
     strappy or cap-sleeved garment (a tank top, camisole, sleeveless blouse);
   * the inside back of the collar or neckline visible above the front neckline;
-  * a hanger, hook or clips kept on the garment, whole or as a small stub;
+  * a hanger, hook or clips anywhere in the cut-out — kept on the garment, above or inside
+    the neckline, whole or as a stub (never report a hanger as background);
   * a missing shop tag, price ticket or swing tag (not part of the garment);
   * slightly soft edges, or lighting that is a little different but the same colour.
 
@@ -228,11 +231,39 @@ def _sentence(view: Any, d: dict[str, Any]) -> str:
             + f" [{d.get('severity')}]")
 
 
+# A HANGER IS NEVER A DEFECT (17 Oct 2026, the user): 18 Vinted products held as
+# "background (hanger)" although the prompt already said so. Whatever the model
+# answers, a background finding that names the hanger, its hook or the clips holds
+# nothing. Broken CLOTH near a hanger still holds — that is the garment.
+_HANGER = re.compile(r"\b(hanger|hook|clip|clips|peg)s?\b", re.I)
+
+
+# WHICH FINDINGS THE AI IS TRUSTED TO HOLD ON (17 Oct 2026, the user's review of 40
+# held Vinted cut-outs). Real defects: broken STRAPS 5 of 6, WAISTBANDS 2 of 2, and
+# "background" that is a DRESS FORM / STAND / TORSO 3 of 4. False alarms: a broken
+# COLLAR 5 of 6, a broken sleeve / hem / neckline / shoulder 4 of 4, and "background"
+# named after a garment part (hem, neckline, waistband, sleeve, leg, crotch…) 12 of
+# 15. So only the reliable kinds hold; the rest become a note on the product. A
+# collar that is really cut away is still held by the pixel measurement against
+# the photograph (cutouts.py, neckline), which this does not touch. Lost COLOUR
+# holds as before.
+_HOLDS_BROKEN = re.compile(r"strap|waist|belt", re.I)
+_HOLDS_BACKGROUND = re.compile(r"form|stand|mannequin|torso|dummy|bust|pole|base", re.I)
+
+
 def _fails(d: dict[str, Any]) -> bool:
-    """The user's three (12 Oct 2026): broken cloth at any severity; background or
-    lost colour when clear."""
+    """A finding that holds the product (see _HOLDS_BROKEN / _HOLDS_BACKGROUND):
+    broken cloth on a strap or waistband; clear background that is the dress
+    form, its stand or a torso — never a hanger; clear lost colour."""
     kind, sev = str(d.get("type") or ""), str(d.get("severity") or "")
-    return kind == "cloth_broken" or (kind in ("background", "colour") and sev == "clear")
+    part = str(d.get("part") or "")
+    if kind == "background" and _HANGER.search(f'{part} {d.get("where") or ""}'):
+        return False
+    if kind == "cloth_broken":
+        return bool(_HOLDS_BROKEN.search(part))
+    if kind == "background":
+        return sev == "clear" and bool(_HOLDS_BACKGROUND.search(part))
+    return kind == "colour" and sev == "clear"
 
 
 def failing(answer: dict[str, Any] | None) -> list[str]:
