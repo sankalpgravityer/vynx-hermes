@@ -356,6 +356,8 @@ def inspect(dsn: str, product_id: str, *, measure: bool = False, judge: bool = F
             "mannequinType", "brand", "color", "material", "condition", "grade", "price", "retailPrice")},
         "media": {
             "renders": sorted({m["view"] for m in live if str(m.get("view", "")).startswith("AI_")}),
+            # How many the product's image sequence asks for (5 = the built-in default).
+            "renders_expected": _expected_renders(record.get("shotSequence")),
             "cutouts": sorted({m["view"] for m in live if m.get("view") in ("FRONT", "BACK")
                                and m.get("processing") != "RAW"}),
             "raw_garments": sorted({m["view"] for m in live if m.get("view") in ("FRONT", "BACK", "OTHER")
@@ -386,6 +388,12 @@ def _short(text: Any, n: int) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _expected_renders(payload: Any) -> int | None:
+    from app.rules import shot_sequence
+    resolved = shot_sequence.from_payload(payload)
+    return len(shot_sequence.expand_sequence(resolved.shots)) if resolved else None
+
+
 def print_report(rep: dict[str, Any], *, heading: str = "ISSUES") -> None:
     rec, med = rep["record"], rep["media"]
     print(f'\n{rep["sku"]} · {_short(rep["title"], 70)} · {rep["tenant"]} · {rep["stage"]}')
@@ -393,7 +401,7 @@ def print_report(rep: dict[str, Any], *, heading: str = "ISSUES") -> None:
           f'size {rec["size"]} (EU {rec["euSize"]}) · guide {rec["sizingGuide"]} · rig {rec["mannequinType"]}')
     print(f'  brand {rec["brand"]} · colour {rec["color"]} · material {rec["material"]} · '
           f'grade {rec["grade"]} · price {rec["price"]} (retail {rec["retailPrice"]})')
-    print(f'  renders {len(med["renders"])}/5 · cut-outs {", ".join(med["cutouts"]) or "none"} · '
+    print(f'  renders {len(med["renders"])}/{med.get("renders_expected") or 5} · cut-outs {", ".join(med["cutouts"]) or "none"} · '
           f'raw garments {", ".join(med["raw_garments"]) or "none"} · labels {med["labels"]} · '
           f'size chart {med["chart"]}' + (" · gallery arranged by a person" if med["gallery_manual"] else ""))
     m = rep["master"]

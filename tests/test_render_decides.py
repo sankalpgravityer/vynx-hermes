@@ -154,3 +154,17 @@ def test_mid_000586_no_guide_attached_is_planned_from_the_covering_chart():
 def test_a_product_with_its_guide_is_untouched():
     p = to_snapshot(raw(), catalog=CATALOG)
     assert not [x for x in gate.check_gate(p, policy()) if x.rule_id == "SIZE.015"]
+
+
+def test_accessories_need_no_size_chart():
+    # 21 Oct 2026: an accessory is approved without a sizing guide or chart image,
+    # so no SIZE.010-017 finding fires and nothing plans a guide for it.
+    p = to_snapshot(raw(masterCategory="Men", category="Accessories", subCategory="Belts",
+                        gender=["men"], sizingGuide=None, size="M", internationalSize="M",
+                        euSize="48"), catalog=CATALOG)
+    ids = {f.rule_id for f in gate.check_gate(p, policy())}
+    assert not {i for i in ids if i.startswith("SIZE.01")}
+    out = approval.run_gate(raw(masterCategory="Men", category="Accessories", subCategory="Belts",
+                                gender=["men"], sizingGuide=None, size="M",
+                                internationalSize="M", euSize="48"), catalog=CATALOG)
+    assert "sizingGuide" not in plan_of(out)
