@@ -157,3 +157,13 @@ def test_the_other_per_invocation_flags_are_unaffected(captured):
     assert seen["apply"] is True            # shadowWritesRepairs
     assert seen["skip_render"] is False     # from the snapshot, not the flag
     assert seen["approve"] is False         # SHADOW never approves
+
+
+def test_skip_price_reaches_repair_when_asked(captured):
+    """run_from_sheet --no-price (23 Oct 2026): the price is left exactly as it
+    is, .99 included. Forwarded as its own flag, never folded into price_mode."""
+    assert _run(captured, skip_price=True)["skip_price"] is True
+
+
+def test_the_unattended_agent_keeps_the_price_step(captured):
+    assert _run(captured)["skip_price"] is False

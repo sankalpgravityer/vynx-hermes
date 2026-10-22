@@ -426,6 +426,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                expect_status: str = "IN_PROGRESS",
                skip_matte: bool = False,
                price_rounding_only: bool = False,
+               skip_price: bool = False,
                silent: bool = False,
                section: str = "REVIEW") -> str | None:
     """One claimed product, start to finish. Never raises.
@@ -456,6 +457,10 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     the grade-window check. Like the flags below it, a decision about one batch
     rather than a rule for the catalogue, so it is a parameter and not a config
     field: the unattended agent still checks the window.
+
+    `skip_price` skips the price step altogether — no .99 rounding either
+    (run_from_sheet --no-price, 23 Oct 2026). Default False: the unattended
+    agent keeps the Brain's price mode.
 
     `skip_matte` drops the background-removal and re-cut steps for THIS
     invocation. Like `allow_stage` and `ignore_stop`, it is a judgement about a
@@ -657,6 +662,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                 skip_matte=skip_matte or not rs.matte,
                 skip_gate=not rs.gate,
                 price_mode=price_mode,
+                skip_price=skip_price,
                 publish=rs.publish_on_approve,
                 # The agent's approvals only (this is the runner, never the
                 # manual flow): which Shopify status the approval publishes with.

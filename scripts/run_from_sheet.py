@@ -835,7 +835,8 @@ class Parallel:
     def __init__(self, rs_for_run: dict[str, Any], workers: int,
                  stages: list[str], reject_attrs: bool, apply: bool,
                  skip_matte: bool = False,
-                 price_rounding_only: bool = False) -> None:
+                 price_rounding_only: bool = False,
+                 skip_price: bool = False) -> None:
         import queue
         import threading
 
@@ -849,6 +850,7 @@ class Parallel:
         self.apply = apply
         self.skip_matte = skip_matte
         self.price_rounding_only = price_rounding_only
+        self.skip_price = skip_price
         self.submitted = 0
         # Set by the first worker that sees a run-level stop — the canary or
         # a vision outage. The main loop reads it before every submit and the
@@ -925,6 +927,7 @@ class Parallel:
                                       allow_stage=stages, expect_status="QUEUED",
                                       skip_matte=self.skip_matte,
                                       price_rounding_only=self.price_rounding_only,
+                                      skip_price=self.skip_price,
                                       silent=True, section=section_of(row))
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             with lock:
@@ -1113,6 +1116,12 @@ def main() -> int:
                           ".99 and fixes it when it does not; the grade window "
                           "is not consulted. Passes repair_product.py's flag of "
                           "the same name straight through."))
+    ap.add_argument("--no-price", action="store_true",
+                    help=("skip the price step ENTIRELY — not even the .99 "
+                          "rounding. The price is left exactly as it is. The "
+                          "Brain's 'leave prices alone' still rounds to .99; "
+                          "this does not (23 Oct 2026). Overrides "
+                          "--price-rounding-only."))
     ap.add_argument("--no-matte", action="store_true",
                     help=("skip background removal AND the re-cut, as "
                           "repair_product.py's own --no-matte does. The CPU "
@@ -1419,7 +1428,8 @@ def main() -> int:
                 pool = Parallel(snap, args.workers, stages,
                                 args.reject_missing_attrs, args.apply,
                                 skip_matte=args.no_matte,
-                                price_rounding_only=args.price_rounding_only)
+                                price_rounding_only=args.price_rounding_only,
+                                skip_price=args.no_price)
             if pool.abort:
                 # A worker saw a run-level stop. The row this iteration just
                 # enqueued would otherwise sit QUEUED with nothing to claim it.
@@ -1543,6 +1553,7 @@ def main() -> int:
         abort = runner.verify_one(claimed, rs, ignore_stop=True, allow_stage=stages,
                                   skip_matte=args.no_matte,
                                   price_rounding_only=args.price_rounding_only,
+                                  skip_price=args.no_price,
                                   section=section_of(row))
 
         after = db.fetch_one(

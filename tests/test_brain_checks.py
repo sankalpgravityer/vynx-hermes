@@ -659,3 +659,12 @@ def test_the_claim_honours_a_runs_own_stages():
     sql = claim._CLAIM_SQL
     assert 'JOIN "AutoApprovalRun" r ON r.id = p."runId"' in sql
     assert "requestParams\"->'stages'" in sql
+
+
+@pytest.mark.parametrize("mode", ["full", "rounding_only", None])
+def test_no_price_skips_the_step_even_the_rounding(wired, mode):
+    # 23 Oct 2026: 'leave prices alone' still rounds to .99; --no-price does not.
+    r = _repair(price_mode=mode, skip_price=True)
+    assert step(r, "price")["ran"] is False
+    assert "--no-price" in step(r, "price")["why"]
+    assert not any(s == "fix-selling-price.ts" for s, _ in wired["calls"]["scripts"])
