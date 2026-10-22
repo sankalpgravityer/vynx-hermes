@@ -418,6 +418,12 @@ sizing:
   chart_preference:
     Men Bottoms: ["Men Bottoms (auto)"]
 
+  # Categories that need NO size chart (21 Oct 2026, the operator's call). A
+  # product under one of these is approved without a sizing guide or a chart
+  # image, so the SIZE.010-017 chart rules stay silent on it. Matched
+  # case-insensitively against master category, category and subcategory.
+  chart_exempt_categories: [Accessories, Backpacks & Bags]
+
   # Which half of the body a category and a guide name refer to.
   #
   # SIZE.014 compares the two: a Women > T-Shirts & Polos product sitting on

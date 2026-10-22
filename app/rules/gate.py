@@ -159,6 +159,19 @@ def guide_gender(name: str | None) -> str | None:
 def is_generic_guide(name: str | None) -> bool:
     return bool(name) and name.strip().lower() in _GENERIC_GUIDES
 
+
+def chart_exempt(p: ProductSnapshot, pol: dict[str, Any] | None) -> bool:
+    """True when the product's category needs no size chart (accessories).
+
+    `sizing.chart_exempt_categories` in policy.yaml, matched case-insensitively
+    against the master category, category and subcategory, so "Accessories"
+    under Men or Women both resolve.
+    """
+    names = ((pol or {}).get("sizing") or {}).get("chart_exempt_categories") or []
+    exempt = {str(n).strip().lower() for n in names}
+    return any(str(v).strip().lower() in exempt
+               for v in (p.master_category, p.category, p.subcategory) if v)
+
 # Human-facing names, so a finding message reads like the edit screen's label
 # rather than like a Python attribute.
 _LABELS = {
@@ -851,6 +864,11 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
             },
         ))
 
+    # Accessories carry no size chart (21 Oct 2026, the operator's call): a belt,
+    # a cap or a scarf is approved without a sizing guide or a chart image, so
+    # none of the SIZE.010-017 chart rules below applies to it.
+    no_chart = chart_exempt(p, pol)
+
     # ---- SIZE.011 / SIZE.012: is this the RIGHT chart? ----------------------
     #
     # SIZE.010 asks whether a chart covers the product at all. These two ask
@@ -859,7 +877,7 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
     # the wrong chart with a matching euSize passes it cleanly while carrying a
     # size from the wrong table.
     current = p.sizing_guide
-    if current and p.catalog and (p.catalog.sizing_guides or {}):
+    if current and p.catalog and (p.catalog.sizing_guides or {}) and not no_chart:
         want = product_gender(p)
         have = guide_gender(current)
 
@@ -1041,7 +1059,7 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
     # Skipped entirely when there is no catalog: absence of evidence about the
     # tenant's charts is not evidence that the tenant has none, and a raw webhook
     # payload carries no catalog at all.
-    if p.catalog is not None and resolve_guide(p, pol) is None:
+    if p.catalog is not None and not no_chart and resolve_guide(p, pol) is None:
         ambiguous = candidate_guides(p, pol=pol)
         # A chart is only invented when NOTHING the tenant has covers the size.
         # When several do, the tenant is configured fine and the product just
@@ -1086,7 +1104,7 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
     # exactly one chart resolves, attaching it is a lookup: the guide-switch
     # planner writes the name, vnyx-api resolves the id and syncs the size-chart
     # image into the gallery, and both pre-flight problems clear.
-    if p.catalog is not None and _absent(p.sizing_guide):
+    if p.catalog is not None and not no_chart and _absent(p.sizing_guide):
         covering = resolve_guide(p, pol)
         if covering:
             out.append(Finding(
@@ -1107,7 +1125,7 @@ def check_gate(p: ProductSnapshot, pol: dict[str, Any], *,
     # Only when the catalog says what images each guide carries (an older
     # vnyx-api sends no `images`, and absence of the key is not "no image"), and
     # only when exactly one guide prefers this one.
-    if p.catalog is not None and p.sizing_guide:
+    if p.catalog is not None and not no_chart and p.sizing_guide:
         guides = p.catalog.sizing_guides or {}
         mine = guides.get(p.sizing_guide)
         if mine is not None and "images" in mine and not mine.get("images"):
