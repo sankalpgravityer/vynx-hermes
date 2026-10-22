@@ -1611,7 +1611,7 @@ def _plan_render_garment(p: ProductSnapshot, garment: str | None,
             plan.append({
                 "kind": "set_column", "field": field, "value": value,
                 "reason": "CATEGORY_IMAGE_MISMATCH", "basis": "render",
-                "detail": (f"the image gate sees {garment!r}; filed under "
+                "detail": (f"the cut-outs show {garment!r}; filed under "
                            f"'{p.master_category} > {pick[0]} > {pick[1]}'"
                            + (f" (was '{was}')" if was else "")),
             })

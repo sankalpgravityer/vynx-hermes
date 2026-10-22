@@ -2092,11 +2092,15 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         seen = getattr(verdict, "gender_seen", None)
         if seen not in ("men", "women"):
             return None
-        # A product with NO CATEGORY either is filed by the garment the same
-        # render shows, under the master the render gives it.
-        garment = str((getattr(verdict, "raw", None) or {}).get("garment") or "").strip()
-        if unresolved and garment and not str(fresh["record"].get("category") or "").strip():
-            render_garment_hint["garment"] = garment
+        # A product with NO CATEGORY either is filed by the garment its
+        # background-removed photographs show (22 Oct 2026, the user: the
+        # cut-outs, not the render), under the master the render gives it.
+        if unresolved and not str(fresh["record"].get("category") or "").strip():
+            from app.imaging import cutout_garment
+
+            garment = cutout_garment.read(fresh["media"], policy()).garment
+            if garment:
+                render_garment_hint["garment"] = garment
         return seen
 
     render_garment_hint: dict[str, str] = {}
@@ -2418,20 +2422,70 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # gate re-files the product under the tenant's matching subcategory, and the
     # lead render is judged again against where it now sits. The copy step
     # downstream rewrites the title and description for the new category.
+    #
+    # THE CUT-OUTS DECIDE THE GARMENT, NOT THE RENDER (22 Oct 2026, the user).
+    # A render is drawn FROM the category it was given, so a product filed under
+    # the wrong category can be rendered as that wrong garment (BOA-007605: a
+    # t-shirt filed under Bags). The background-removed FRONT/BACK photographs
+    # are the garment itself — app/imaging/cutout_garment.py reads them, and the
+    # gate's family/type test compares that answer with the filing. The garment
+    # still travels to vnyx-api as `--render-garment`; only its source changed.
+    #
+    # Two outcomes besides "agree":
+    #   cut-outs disagree with the filing  -> re-file under the cut-outs' garment
+    #   cut-outs agree, the render does not -> the RENDER is wrong: it is
+    #                                          re-rendered (regen), not re-filed
+    import dataclasses
+
+    from app.imaging import cutout_garment
+
+    cutout_seen: cutout_garment.CutoutGarment | None = None
+    cutout_conflict: str | None = None
+    if not skip_gate and (policy().get("quality_gate") or {}).get("category_from_cutouts", True):
+        _fresh = needs(dsn, product_id)["loaded"]
+        cutout_seen = cutout_garment.read(_fresh["media"], policy())
+        cutout_conflict = cutout_garment.mismatch(
+            cutout_seen, category=_fresh["record"].get("category"),
+            subcategory=_fresh["record"].get("subCategory"), pol=policy())
+
     def _refile() -> str:
         nonlocal gate_verdict
-        garment = str((gate_verdict.raw or {}).get("garment") or "").strip()
+        garment = cutout_seen.garment
         note = _reconcile({"render_garment": garment})
         if not apply:
-            return f"image gate sees {garment!r} — {note}"
-        gate_verdict = _judge_lead()
-        return f"image gate sees {garment!r} — {note}; gate again: {gate_verdict.summary()}"
+            return f"{cutout_conflict} — {note}"
+        # Re-filed to what the cut-outs show, so a render that still shows the
+        # old garment is now the wrong picture, not a wrong record.
+        gate_verdict = _render_is_wrong(_judge_lead())
+        return f"{cutout_conflict} — {note}; gate again: {gate_verdict.summary()}"
 
-    if (gate_verdict is None or gate_verdict.code != "CATEGORY_IMAGE_MISMATCH"
-            or not str((gate_verdict.raw or {}).get("garment") or "").strip()):
-        refile_why = "the image gate agrees with the category"
+    def _render_is_wrong(v: Any) -> Any:
+        """The record agrees with the cut-outs and the render shows another
+        garment: the RENDERS are wrong. Every AI view is re-drawn — they were
+        all made from the same wrong garment — instead of a person's hold."""
+        if (v is None or v.code != "CATEGORY_IMAGE_MISMATCH" or cutout_seen is None
+                or cutout_seen.unavailable or not cutout_seen.garment):
+            return v
+        media = needs(dsn, product_id)["loaded"]["media"]
+        ai = sorted({str(m.get("view")) for m in media
+                     if str(m.get("view") or "").startswith("AI_") and not m.get("deletedAt")})
+        return dataclasses.replace(
+            v, action="regen", bad_views=sorted(set(v.bad_views) | set(ai)),
+            reasons=[f"{cutout_seen.summary()}, matching the category — the renders "
+                     f"are wrong ({'; '.join(v.reasons)})"])
+
+    if cutout_seen is not None and not cutout_conflict:
+        gate_verdict = _render_is_wrong(gate_verdict)
+
+    if cutout_seen is None:
+        refile_why = ("--no-gate" if skip_gate
+                      else "disabled in policy (quality_gate.category_from_cutouts)")
+    elif cutout_seen.unavailable:
+        refile_why = cutout_seen.summary()
+    elif not cutout_conflict:
+        refile_why = f"{cutout_seen.summary()} — agrees with the category"
     elif not remote_supports("renderGarment"):
-        refile_why = ("this vnyx-api cannot take the gate's garment yet "
+        refile_why = ("this vnyx-api cannot take the garment yet "
                       "(no `renderGarment`); deploy vnyx-api")
     else:
         refile_why = ""

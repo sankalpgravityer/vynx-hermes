@@ -195,7 +195,11 @@ garment_families:
     ["shoe", "sneaker", "boot", "sandal", "heel", "loafer", "trainer", "footwear"]
   accessories:
     ["cap", "hat", "beanie", "belt", "bag", "scarf", "backpack", "wallet",
-     "glove", "sock", "accessor"]
+     "glove", "sock", "accessor",
+     # whole-word match, so "bag" does not cover these (22 Oct 2026: the
+     # cut-outs of BOA-007605 read "handbag", which matched no family)
+     "handbag", "tote", "purse", "clutch", "satchel", "crossbody", "rucksack",
+     "duffel", "pouch"]
   # Pairs the model routinely conflates; a mismatch between them is not a
   # finding. Tops/outerwear only: a shirt-jacket reads as either. Dresses are
   # deliberately NOT adjacent to tops — a gown rendered on a vest listing
@@ -1299,6 +1303,12 @@ imagery:
 # --------------------------------------------------------------------------- #
 quality_gate:
   enabled: true
+  # WHICH PICTURE DECIDES THE CATEGORY (22 Oct 2026, the user). true = the
+  # background-removed FRONT/BACK photographs (app/imaging/cutout_garment.py):
+  # the refile step re-files the product under the garment THEY show, and a
+  # render that shows another garment than a filing the cut-outs agree with is
+  # re-rendered, not re-filed. false = no refile at all (the render never decides).
+  category_from_cutouts: true
   # When the gate cannot run at all (no GEMINI_API_KEY), block approval rather
   # than skip it. false = a rules-only deployment approves without the gate,
   # which is the pre-gate behaviour.
