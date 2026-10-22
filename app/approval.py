@@ -1156,6 +1156,9 @@ def _plan_column_drift(findings: list[Finding],
                 "kind": "set_column", "field": f.detail["column"],
                 "value": value, "reason": "DRIFT.001",
                 "detail": (
+                    f"the column holds {f.detail.get('column_value')!r}, the same size as "
+                    f"properties.{f.detail['property']}'s {value!r}"
+                    if f.detail.get("decided_by") == "same size" else
                     f"the column holds a placeholder while "
                     f"properties.{f.detail['property']} holds {value!r}"
                 ),
@@ -1174,6 +1177,8 @@ def _plan_column_drift(findings: list[Finding],
                     + (f"{f.detail.get('property_value')!r}, and the product's gender "
                        f"agrees with the column's {value!r}"
                        if f.detail.get("decided_by") == "gender" else
+                       f"{f.detail.get('property_value')!r}, the same size as the column's {value!r}"
+                       if f.detail.get("decided_by") == "same size" else
                        f"a placeholder while the column holds {value!r}")
                 ),
             })
