@@ -871,3 +871,41 @@ def test_it_pairs_with_the_size_this_run_is_about_to_write():
     approval._plan_eu_size(p, approval._all_findings(p, policy()), plan, policy())
     eu = [a for a in plan if a["field"] == "eu_size"]
     assert eu and eu[0]["value"] == "50", "should pair with the PLANNED L, not the stored S"
+
+
+# --------------------------------------------------------------------------- #
+# One size written two ways (22 Oct 2026, BOA-007605)
+# --------------------------------------------------------------------------- #
+
+def test_a_glossed_size_is_the_same_size_and_the_plain_form_is_written():
+    """'One Size (EU One Size)' and 'One Size' are one size. The drift used to be
+    'a judgement', which withheld the copy step and left a bag titled
+    'Leather T-Shirt'. The plain form goes over the glossed copy."""
+    p = snap(columns={"internationalSize": "One Size (EU One Size)"},
+             properties={"international_size": "One Size"})
+    found = drift(p)
+    assert len(found) == 1
+    assert found[0].detail["repair_to"] == "One Size"
+    assert found[0].detail["repair_side"] == "column"
+    assert found[0].detail["decided_by"] == "same size"
+
+
+def test_the_gloss_on_the_property_side_is_repaired_on_the_property():
+    p = snap(columns={"internationalSize": "M"},
+             properties={"international_size": "m (EU 48)"})
+    found = drift(p)
+    assert found[0].detail["repair_to"] == "m"
+    assert found[0].detail["repair_side"] == "properties"
+
+
+def test_two_different_sizes_with_a_gloss_are_still_a_judgement():
+    p = snap(columns={"internationalSize": "L (EU 50)"},
+             properties={"international_size": "M"})
+    assert drift(p)[0].detail["repair_to"] is None
+
+
+def test_same_size_helper():
+    assert gate._same_size("One Size (EU One Size)", "One Size") == "One Size"
+    assert gate._same_size("XL", "XL (D 52)") == "XL"
+    assert gate._same_size("M", "L") is None
+    assert gate._same_size("One Size", "") is None

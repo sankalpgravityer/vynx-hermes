@@ -83,6 +83,8 @@ def _preflight_code(blockers: list[str]) -> str:
         ("size chart / gender conflict: ", "GENDER_CHART_CONFLICT"),
         # DATA.011 still blocking at approval (16 Oct 2026)
         ("brand missing: ", "NO_BRAND"),
+        # TEXT.008's garment form still open at approval (22 Oct 2026)
+        ("title vs category: ", "TITLE_CATEGORY_MISMATCH"),
     ):
         if first.startswith(prefix):
             return code

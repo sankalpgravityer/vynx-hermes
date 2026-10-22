@@ -1338,7 +1338,14 @@ def record_conflicts(gate: dict[str, Any], *, skip: frozenset[str] = frozenset()
 # product for a person — never rejected. A tenant whose Brain switches the brand
 # check off sends DATA.011 as off, and nothing here holds.
 BRAND_LABEL = "brand missing"
-RECORD_LABELS = frozenset({CONFLICT_LABEL, BRAND_LABEL})
+# A TITLE THAT NAMES ANOTHER GARMENT IS NEVER APPROVED (22 Oct 2026, the user's
+# call). BOA-007605, a handbag filed under Bags, was approved and published as
+# "Vintage TAVECCHI Leather T-Shirt": the copy step had been withheld and
+# TEXT.008 was only advisory. Whatever TEXT.008's garment form still says once
+# `copy` has had its turn holds the product for a person — never rejected. Its
+# size form (a title ending in the wrong letter size) is not this hold.
+TITLE_LABEL = "title vs category"
+RECORD_LABELS = frozenset({CONFLICT_LABEL, BRAND_LABEL, TITLE_LABEL})
 
 
 def record_brand(gate: dict[str, Any]) -> RecordConflict:
@@ -1347,6 +1354,17 @@ def record_brand(gate: dict[str, Any]) -> RecordConflict:
         reasons=[f'DATA.011 {f.get("message") or ""}'.strip()
                  for f in gate.get("blocking") or [] if f.get("rule_id") == "DATA.011"],
         code="NO_BRAND")
+
+
+def record_title(gate: dict[str, Any]) -> RecordConflict:
+    """TEXT.008's garment form — the title names another garment than the
+    category — in a run_gate() answer (blocking or advisory), as a hold."""
+    return RecordConflict(
+        reasons=[f'TEXT.008 {f.get("message") or ""}'.strip()
+                 for f in [*(gate.get("blocking") or []), *(gate.get("advisory") or [])]
+                 if f.get("rule_id") == "TEXT.008"
+                 and "subcategory" in (f.get("fields") or [])],
+        code="TITLE_CATEGORY_MISMATCH")
 
 
 def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
@@ -3358,6 +3376,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # CONFLICT_RULES). Read from the stored rows; a failed read does not hold.
         conflict: RecordConflict | None = None
         brand: RecordConflict | None = None
+        title_conflict: RecordConflict | None = None
         try:
             from app import approval as _gate_mod
 
@@ -3372,6 +3391,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             conflict = record_conflicts(gate_now, skip=frozenset() if apply else planned)
             # No repair writes a brand (DATA.011 escalates), so a dry run holds too.
             brand = record_brand(gate_now)
+            # After `copy`: a title it rewrote no longer contradicts the record.
+            title_conflict = record_title(gate_now)
         except Exception as exc:  # noqa: BLE001 — a failed look is not a verdict
             if not quiet:
                 print(f"    record conflict check could not run: {type(exc).__name__}: {exc}"[:200])
@@ -3380,7 +3401,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                                                 ("cut-outs", cutout_verdict),
                                                 ("cut-out check", integrity_verdict),
                                                 (CONFLICT_LABEL, conflict),
-                                                (BRAND_LABEL, brand))
+                                                (BRAND_LABEL, brand),
+                                                (TITLE_LABEL, title_conflict))
                     if v is not None and v.blocks]
         blocked = bool(refusing)
         # Only ever passes --apply when BOTH flags are set. `--apply` alone

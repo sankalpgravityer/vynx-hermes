@@ -1188,6 +1188,19 @@ COLUMN_PROPERTY_PAIRS: tuple[tuple[str, str, str], ...] = (
 _UNKNOWN = {"", "unknown", "n/a", "na", "none", "null", "-", "tbd"}
 
 
+def _same_size(a: Any, b: Any) -> str | None:
+    """The plain size when two size strings differ only by a parenthetical
+    gloss ('One Size (EU One Size)' / 'One Size', 'M (EU 48)' / 'M'), else None.
+    Case and spacing are ignored; the plain form is the glossed value with its
+    gloss removed, so it keeps that value's own spelling."""
+    def bare(v: Any) -> str:
+        return " ".join(re.sub(r"\([^)]*\)", " ", str(v or "")).split())
+    ba, bb = bare(a), bare(b)
+    if not ba or ba.lower() != bb.lower():
+        return None
+    return bare(max((str(a).strip(), str(b).strip()), key=len))
+
+
 def _meaningless(value: Any) -> bool:
     return value is None or str(value).strip().lower() in _UNKNOWN
 
@@ -1338,6 +1351,21 @@ def check_column_drift(p: ProductSnapshot) -> list[Finding]:
             # is a taxonomy move with categoryId behind it, and a gender that
             # disagrees with the column is TAX.004's, settled by the render.
             tie = None
+            side = "properties"
+            # ONE SIZE WRITTEN TWO WAYS IS NOT A DISAGREEMENT (22 Oct 2026,
+            # BOA-007605: column 'One Size (EU One Size)', property 'One Size').
+            # A parenthetical gloss restates the size; with it removed the two
+            # copies are the same value. The plain form is written over the
+            # glossed one — both consumers then read 'One Size' — and the copy
+            # step, which withholds the title on any open DRIFT.001, is no
+            # longer stopped by a size nobody disputes.
+            if field == "international_size":
+                plain = _same_size(col_value, prop_value)
+                if plain is not None:
+                    tie = plain
+                    # the copy that carries the gloss is the one rewritten
+                    side = ("column" if len(str(col_value).strip()) >= len(str(prop_value).strip())
+                            else "properties")
             if field == "master_category" and _tree_holds(p, field, col_value):
                 said = resolve_gender(p.gender)
                 if (said and resolve_gender(col_value) == said
@@ -1348,8 +1376,11 @@ def check_column_drift(p: ProductSnapshot) -> list[Finding]:
                 message=(
                     f"'{column}' holds {col_value!r} but "
                     f"'properties.{prop_key}' holds {prop_value!r}. "
-                    + (f"The product's gender ({p.gender!r}) agrees with the column, "
-                       f"so the property follows it."
+                    + (("Both name the same size; the plain form "
+                        f"{tie!r} is written to the other copy."
+                        if field == "international_size" else
+                        f"The product's gender ({p.gender!r}) agrees with the column, "
+                        f"so the property follows it.")
                        if tie is not None else
                        "Both are real values, so which is correct is a judgement.")
                 ),
@@ -1357,7 +1388,8 @@ def check_column_drift(p: ProductSnapshot) -> list[Finding]:
                     "column": column, "column_value": col_value,
                     "property": prop_key, "property_value": prop_value,
                     "repair_to": tie,
-                    **({"repair_side": "properties", "decided_by": "gender"}
+                    **({"repair_side": side,
+                        "decided_by": "same size" if field == "international_size" else "gender"}
                        if tie is not None else {}),
                 },
             ))
