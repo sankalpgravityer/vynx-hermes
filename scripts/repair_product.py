@@ -1393,6 +1393,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            #   sync_changes  re-push a product that is ALREADY on Shopify
            #                 after a run that changed it. Never creates one.
            price_mode: str | None = None,
+           # Skip the price step entirely, .99 rounding included (23 Oct 2026,
+           # run_from_sheet --no-price): the price is left exactly as it is.
+           skip_price: bool = False,
            publish: bool = True,
            # 'active' | 'draft': the Shopify status the AGENT's approval
            # publishes with (the Brain's publishActiveOnApprove). None — every
@@ -2253,7 +2256,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                  "not written" if is_consignment(
                      str(state["loaded"]["record"].get("tenantId") or ""), policy())
                  else "")
-    if not price_why and mode == "off":
+    if not price_why and skip_price:
+        price_why = "--no-price — the price is left exactly as it is"
+    elif not price_why and mode == "off":
         price_why = "the Brain has the .99 rounding off"
     elif not price_why and not remote_supports("roundingOnly"):
         # A vnyx-api that cannot take --rounding-only would run its full step —
