@@ -715,7 +715,7 @@ def measure(data: bytes, cfg: dict[str, Any],
 
     if not opaque:
         return {"width": width, "height": height, "transparent": round(transparent, 4),
-                "rgb": None, "coverage": 0.0, "stddev": 0.0, "sampled": total,
+                "rgb": None, "coverage": 0.0, "uniformity": 0.0, "stddev": 0.0, "sampled": total,
                 "edge_fill": edge_fill, "edges_touched": edges_touched, "box": box}
 
     n = len(opaque)
