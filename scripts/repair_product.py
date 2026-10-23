@@ -2293,6 +2293,20 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             if "note:" in line and _refusal_text(line):
                 into["refused"] = True
 
+    def _views_still_missing(st: dict[str, Any]) -> list[str]:
+        """The on-model VIEWS the sequence's missing shots stand for that the
+        stored product still lacks. A second variation (`full_front#2`) of a view
+        already on file asks for nothing: --views would replace that render."""
+        from app.rules.shot_sequence import AI_VIEWS, SHOT_CATALOG
+
+        wanted = {SHOT_CATALOG[s.split("#")[0]][0]
+                  for s in (st.get("missing_shots") or []) if s.split("#")[0] in SHOT_CATALOG}
+        media = needs(dsn, product_id)["loaded"]["media"]
+        have = {str(m.get("view")) for m in media
+                if str(m.get("view") or "") in AI_VIEWS and not m.get("deletedAt")
+                and m.get("isCurrent", True)}
+        return [v for v in AI_VIEWS if v in wanted and v not in have]
+
     def _render() -> str:
         render_report["attempted"] = True
         # BY THE SEQUENCE (3 Oct 2026): vnyx-api makes exactly the missing shot
@@ -2331,6 +2345,33 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             note += f' — could not produce {", ".join(render_report["failed"])}'
             if render_report["refused"]:
                 note += " (the image model declined the print)"
+        # HERMES' OWN GENERATOR FOR WHAT THE SEQUENCE LEFT MISSING (23 Oct 2026,
+        # the user). The sequence render runs on vnyx-api's Gemini call alone, no
+        # second vendor: TST-000078 (a "HARDEN 13" jersey) failed five shots in
+        # 33s, and BOAS/Klekt products "rendered 3 of 6" in ~5s while writing
+        # nothing at all — silently, so the hold said MISSING_RENDER with no
+        # cause. Hermes' generator (/v1/imagery/generate, reached through
+        # backfill-imagery.ts --views without --sequence) tries its Gemini models
+        # and then OpenAI gpt-image. Read from the STORED media, not the script's
+        # report, so the silent case is caught too. Not on a dry run.
+        if apply and by_seq and (policy().get("imagery") or {}).get("render_fallback_hermes", True):
+            left = _views_still_missing(state)
+            if left:
+                fb: dict[str, Any] = {"written": [], "failed": [], "refused": False}
+                ok3, out3, _ = run_step(vnyx_api, "backfill-imagery.ts",
+                                        [*common, *live, "--views", ",".join(left)],
+                                        timeout_s=1800, quiet=quiet)
+                _read_render(out3, fb)
+                still = _views_still_missing(state)
+                render_report["fallback"] = {"asked": left, "still_missing": still,
+                                             "written": fb["written"], "ok": ok3}
+                render_report["written"] = render_report["written"] + fb["written"]
+                if not still:
+                    render_report["failed"] = []
+                    render_report["refused"] = False
+                note += (f' — Hermes generator (Gemini, then OpenAI) for {", ".join(left)}: '
+                         + ("made them" if not still
+                            else f'still missing {", ".join(still)}'))
         return note
 
     from app import readiness as _rd
@@ -3053,10 +3094,37 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # By the sequence: the named views' instances are re-made (`--replace`),
         # each retiring only the render it pairs with.
         seq_args = ["--sequence", "--replace"] if plan.get("sequence") else []
+        before_written = list(regen_report["written"])
         ok, out, _ = run_step(vnyx_api, "backfill-imagery.ts",
                               [*common, *live, "--views", ",".join(views), *seq_args],
                               timeout_s=1800, quiet=quiet)
         _read_render(out, regen_report)
+        # A RE-RENDER GEMINI WOULD NOT MAKE goes to Hermes' generator (Gemini,
+        # then OpenAI) — the same fallback as the render step (23 Oct 2026).
+        # Judged by what came BACK: a view not written is a view not re-made,
+        # whether the script said "could not produce" or said nothing at all.
+        if apply and seq_args and (policy().get("imagery") or {}).get("render_fallback_hermes", True):
+            from app.rules.shot_sequence import SHOT_CATALOG
+
+            def _as_view(label: str) -> str:
+                key = str(label).split("#")[0].strip()
+                return SHOT_CATALOG[key][0] if key in SHOT_CATALOG else key.upper()
+
+            made = {_as_view(w) for w in regen_report["written"] if w not in before_written}
+            redo = [v for v in views if v not in made]
+            if redo:
+                ok_fb, out_fb, _ = run_step(vnyx_api, "backfill-imagery.ts",
+                                            [*common, *live, "--views", ",".join(redo)],
+                                            timeout_s=1800, quiet=quiet)
+                fb: dict[str, Any] = {"written": [], "failed": [], "refused": False}
+                _read_render(out_fb, fb)
+                regen_report["written"] = regen_report["written"] + fb["written"]
+                regen_report["fallback"] = {"asked": redo, "written": fb["written"],
+                                            "failed": fb["failed"], "ok": ok_fb}
+                if not fb["failed"] and ok_fb:
+                    regen_report["failed"] = [f for f in regen_report["failed"]
+                                              if _as_view(f) not in redo]
+                ok = ok or ok_fb
         if not ok:
             raise StepFailed("regeneration returned non-zero")
 

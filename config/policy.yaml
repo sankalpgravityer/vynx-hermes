@@ -583,6 +583,12 @@ resale_lookup:
 # See docs/IMAGERY-VERIFICATION.md for how these numbers were arrived at.
 # --------------------------------------------------------------------------- #
 imagery:
+  # WHEN THE SEQUENCE RENDER LEAVES VIEWS MISSING (23 Oct 2026, the user): the
+  # render step asks Hermes' own generator (Gemini models, then OpenAI
+  # gpt-image when OPENAI_API_KEY is set — imagery.generation.openai_fallback)
+  # for the AI views still absent, through backfill-imagery.ts --views.
+  # vnyx-api's sequence render has no second vendor. false = no fallback.
+  render_fallback_hermes: true
   # The AI views whose absence is a DEFECT.
   #
   # Deliberately not all five. The three-quarter views were added by a later
