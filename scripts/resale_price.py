@@ -239,7 +239,8 @@ def render(r: dict) -> str:
     if r.get("cached_from"):
         extra.append(f"listings reused from {r['cached_from']}")
     if r.get("rescue"):
-        extra.append("EU second round ran")
+        extra.append("StockX second round ran" if str(r.get("price_source", "")).startswith("StockX")
+                     else "EU second round ran")
     L.append(f"  Spent        {r.get('searches', 0)} searches · ~${r.get('cost_usd', 0):.3f} · "
              f"{r.get('seconds', 0)} s" + (f" · {'; '.join(extra)}" if extra else ""))
     return "\n".join(L)

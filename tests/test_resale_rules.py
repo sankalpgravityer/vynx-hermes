@@ -5,6 +5,8 @@ Figures come from the BOAS handoff (5 Oct 2026) where it gave them.
 """
 from __future__ import annotations
 
+import copy
+
 import pytest
 
 from app.pricing import resale_lookup as RL
@@ -239,6 +241,151 @@ def test_summarise_counts_only_grounded_listings_on_resale_sites():
     assert res["comps"][1]["url"] == "https://www.vinted.nl/items/987654322-real"
     assert s["n_comps"] == 3 and s["n_sold"] == 3
     assert s["confidence"] == "high"
+
+
+@pytest.mark.parametrize("url, kind", [
+    ("https://stockx.com/nike-dunk-low-retro-white-black-2021", "listing"),
+    ("https://stockx.com/de-de/nike-dunk-low-retro-white-black-2021", "listing"),
+    ("https://stockx.com/sneakers", "search"),
+    ("https://stockx.com/brands/nike", "search"),
+    ("https://stockx.com/search?s=dunk+low", "search"),
+    ("https://images.stockx.com/images/Nike-Dunk-Low.jpg", "other"),
+])
+def test_url_kind_stockx(url, kind):
+    assert RL.url_kind(url) == kind
+
+
+def test_a_shoe_counts_stockx_listings_only():
+    item = {"condition": "Very good", "vnyx_price": 90.0, "footwear": True}
+    stockx = ["https://stockx.com/nike-dunk-low-retro-white-black-2021",
+              "https://stockx.com/nike-dunk-low-retro-white-black-gs"]
+    res = {"estimate_confidence": "medium", "comps": [
+        {"price_raw": "€110", "status": "sold", "condition": "deadstock",
+         "url": stockx[0], "cited": [stockx[0]]},
+        {"price_raw": "€120", "status": "listed", "condition": "deadstock",
+         "url": stockx[1], "cited": [stockx[1]]},
+        {"price_raw": "€70", "status": "sold", "condition": "Very good",
+         "url": "https://www.ebay.de/itm/123456789012", "cited": ["https://www.ebay.de/itm/123456789012"]},
+        {"price_raw": "€75", "status": "sold", "condition": "Very good",
+         "url": "https://www.grailed.com/listings/12345678-nike-dunk",
+         "cited": ["https://www.grailed.com/listings/12345678-nike-dunk"]},
+    ]}
+    grounding = {"queries": ["site:stockx.com nike dunk low"], "domains": [], "sources": []}
+    s = RL.summarise(item, res, grounding)
+    assert [c["counted"] for c in res["comps"]] == [True, True, False, False]
+    assert s["n_comps"] == 2
+    # The same listings for a jacket: StockX is not a site it prices from.
+    s2 = RL.summarise({**item, "footwear": False}, res, grounding)
+    assert [c["counted"] for c in res["comps"]] == [False, False, True, True]
+    assert s2["n_comps"] == 2
+
+
+def test_a_shoe_searches_stockx_and_keeps_its_own_cache_key(cache_dir, monkeypatch):
+    ident = {"brand": "Nike", "model": "Dunk Low Retro White Black", "article_code": "DD1391-100",
+             "id_confidence": "high"}
+    assert RL.cache_key(ident, footwear=True) == "stockx|nike|code|dd1391100"
+    assert RL.cache_key(ident) == "nike|code|dd1391100"
+    prompts = []
+    monkeypatch.setattr(RL, "config", lambda: {**RL.DEFAULTS, "cache_dir": str(cache_dir),
+                                               "page_check": False, "confirm_prices": False})
+    monkeypatch.setattr(RL, "api_key", lambda: "k")
+    monkeypatch.setattr(RL, "identify", lambda item, key, usage: (ident, None))
+
+    def search(p, key, usage):
+        prompts.append(p)
+        return ({"comps": []}, {"queries": ["q"], "domains": [], "sources": [], "search_count": 2,
+                                "raw_answer": ""}, None)
+
+    monkeypatch.setattr(RL, "search_round", search)
+    out = RL.lookup({"sku": "BOA-1", "images": ["https://r2/a.jpg"], "footwear": True})
+    assert out["price_source"] == "StockX only (footwear)"
+    assert len(prompts) == 2 and all("stockx.com" in p for p in prompts)
+    assert prompts[0].startswith("Search Google for this shoe on StockX")
+    assert prompts[1].startswith("Second StockX search")
+
+
+def test_a_shoe_is_the_stockx_price_less_35_percent():
+    # Last sale wins over the lowest ask; no condition or asking discount.
+    comps = [{"price_eur": 165.0, "status": "sold", "condition": "deadstock",
+              "url": "https://stockx.com/adidas-continental-80-recon-pack"},
+             {"price_eur": 191.0, "status": "listed", "condition": "deadstock",
+              "url": "https://stockx.com/adidas-continental-80-recon-pack"}]
+    p = R.price_shoe(comps, 40.99)
+    assert p["suggested_eur"] == 107.99            # 165 × 0.65 = 107.25 -> .99
+    assert p["basis"] == "StockX last sale €165.00 less 35%"
+    p = R.price_shoe(comps[1:], 40.99)
+    assert p["suggested_eur"] == 124.99            # 191 × 0.65 = 124.15
+    assert "lowest ask" in p["basis"]
+    # A cut goes through too: no 3-listing / under-€25 guard for shoes.
+    assert R.price_shoe(comps[:1], 150.0)["suggested_eur"] == 107.99
+
+
+def test_shoe_tiers():
+    assert R.shoe_tier(107.99, 40.99, 1, "")[0] == "A"
+    assert R.shoe_tier(107.99, 40.99, 0, "")[0] == "B"          # page not cited
+    assert R.shoe_tier(107.99, 40.99, 1, "", cond_flag=True)[0] == "C"   # Lived In
+    assert R.shoe_tier(107.99, 15.0, 1, "")[0] == "B"           # > 6x
+    assert R.shoe_tier(20.0, 50.0, 1, "")[0] == "C"             # big cut
+
+
+def _shoe_lookup(cache_dir, monkeypatch, res, sources=()):
+    ident = {"brand": "adidas", "model": "Ozweego Dusty Pink", "article_code": "FY2024",
+             "id_confidence": "high"}
+    monkeypatch.setattr(RL, "config", lambda: {**RL.DEFAULTS, "cache_dir": str(cache_dir),
+                                               "page_check": False, "confirm_prices": False})
+    monkeypatch.setattr(RL, "api_key", lambda: "k")
+    monkeypatch.setattr(RL, "identify", lambda item, key, usage: (ident, None))
+    monkeypatch.setattr(RL, "search_round", lambda p, key, usage: (
+        copy.deepcopy(res),
+        {"queries": ["site:stockx.com FY2024"], "domains": [], "search_count": 2,
+         "sources": [{"url": u} for u in sources], "raw_answer": ""}, None))
+    return RL.lookup({"sku": "KLE-002781", "images": ["https://r2/a.jpg"], "footwear": True,
+                      "condition": "As New", "vnyx_price": 40.99, "retail_price": 96.99})
+
+
+def test_a_shoe_sells_at_the_stockx_retail_less_35_percent(cache_dir, monkeypatch):
+    url = "https://stockx.com/adidas-ozweego-dusty-pink"
+    out = _shoe_lookup(cache_dir, monkeypatch, {
+        "comps": [], "retail_new_eur": 94.6, "retail_raw": "US$110", "retail_url": url,
+        "retail_style": "FY2024", "retail_cited": []}, sources=[url])
+    assert out["new_retail"] == 94.99                   # our retail = StockX retail, to .99
+    assert out["new_price"] == 61.99                    # 94.99 × 0.65 = 61.74 -> .99
+    assert out["basis"] == "StockX retail €94.99 less 35%"
+    assert out["tier"] == "A" and "less 35%" in out["basis"]
+
+
+def test_a_shoe_retail_from_another_style_code_is_held(cache_dir, monkeypatch):
+    # KLE-002781, 23 Oct 2026: an "Ash Pearl" page for a Dusty Pink FY2024.
+    url = "https://stockx.com/adidas-ozweego-ash-pearl"
+    out = _shoe_lookup(cache_dir, monkeypatch, {
+        "comps": [], "retail_new_eur": 94.6, "retail_raw": "US$110", "retail_url": url,
+        "retail_style": "EE6999", "retail_cited": [url]})
+    assert out["new_retail"] is None and out["tier"] == "B"
+    assert "style EE6999" in out["retail_note"]
+
+
+def test_a_shoe_retail_page_google_did_not_return_is_held(cache_dir, monkeypatch):
+    url = "https://stockx.com/adidas-ozweego-dusty-pink"
+    out = _shoe_lookup(cache_dir, monkeypatch, {
+        "comps": [], "retail_new_eur": 94.6, "retail_raw": "US$110", "retail_url": url,
+        "retail_style": "FY2024", "retail_cited": []})
+    assert out["new_retail"] is None and out["tier"] == "B"
+
+
+def test_the_shoe_retail_line_carries_the_style_code():
+    text = ("ESTIMATE: €55\nCONFIDENCE: low\n"
+            "RETAIL NEW: US$110 | https://stockx.com/adidas-ozweego-dusty-pink | FY2024\nREASON: x")
+    res = RL.parse_search_answer(text, [])
+    assert (res["retail_raw"], res["retail_style"]) == ("US$110", "FY2024")
+    assert res["retail_url"] == "https://stockx.com/adidas-ozweego-dusty-pink"
+    assert "Style code" in RL.SHOE_SEARCH_PROMPT and "Style code" not in RL.SEARCH_PROMPT
+
+
+def test_item_from_payload_flags_footwear():
+    rec = {"id": "p", "sku": "S", "category": "Sneakers", "subCategory": "Low Top"}
+    assert RL.item_from_payload({"record": rec, "media": []})["footwear"] is True
+    rec = {"id": "p", "sku": "S", "category": "Jeans", "subCategory": "Bootcut"}
+    assert RL.item_from_payload({"record": rec, "media": []})["footwear"] is False
 
 
 def test_summarise_without_a_search_is_not_evidence():
