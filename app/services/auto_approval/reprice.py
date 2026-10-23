@@ -107,9 +107,41 @@ def decide(res: dict[str, Any]) -> dict[str, Any]:
             "reason": reason}
 
 
+def _listings(res: dict[str, Any]) -> list[dict[str, Any]]:
+    """The run report's "Listings": the pages a price was picked from.
+
+    A shoe is priced from the StockX page's RETAIL price, which is not a resale
+    listing, so that page leads the list (23 Oct 2026: the run row showed no
+    link at all for a shoe). Then the counted listings, then — for a shoe — the
+    StockX pages found without a usable price, so a person can open them. The
+    run row prints each as "€price status url"; no UI change needed.
+    """
+    out: list[dict[str, Any]] = []
+    shoe = str(res.get("price_source") or "").startswith("StockX")
+    if shoe and res.get("retail_url") and res.get("retail_new_eur"):
+        out.append({"url": res["retail_url"], "priceEur": res.get("retail_new_eur"),
+                    "status": f"StockX retail {res.get('retail_raw') or ''}".strip()
+                              + ("" if res.get("new_retail") else " (not proven)"),
+                    "verified": res.get("retail_verified")})
+    out += [{"url": c.get("url"), "priceEur": c.get("price_eur"), "status": c.get("status"),
+             "verified": c.get("verified")}
+            for c in res.get("comps") or [] if c.get("counted")]
+    if shoe:
+        out += [{"url": c.get("url"), "priceEur": None, "status": "StockX page, no price shown",
+                 "verified": c.get("verified")}
+                for c in res.get("comps") or []
+                if not c.get("counted") and "stockx.com" in str(c.get("url") or "")]
+    seen: set[str] = set()
+    uniq = []
+    for x in out:
+        if x["url"] and x["url"] not in seen:
+            seen.add(x["url"])
+            uniq.append(x)
+    return uniq[:8]
+
+
 def summary(res: dict[str, Any]) -> dict[str, Any]:
     """What the run report keeps: the numbers and the evidence, not the raw answer."""
-    counted = [c for c in res.get("comps") or [] if c.get("counted")]
     return {
         "before": res.get("vnyx_price"), "after": res.get("new_price"),
         "retailBefore": res.get("retail_price"), "retailAfter": res.get("new_retail"),
@@ -119,10 +151,11 @@ def summary(res: dict[str, Any]) -> dict[str, Any]:
         "retailFound": res.get("retail_new_eur"), "retailVerified": res.get("retail_verified"),
         "retailUrl": res.get("retail_url"), "retailNote": res.get("retail_note"),
         "identified": res.get("identified"), "authLevel": res.get("auth_level"),
+        # "StockX only (footwear)" for a shoe, whose evidence is the StockX
+        # page's retail price (retailUrl), not listings (23 Oct 2026).
+        "priceSource": res.get("price_source"), "retailRaw": res.get("retail_raw"),
         "authenticity": (res.get("authenticity_concerns") or "")[:400],
-        "listings": [{"url": c.get("url"), "priceEur": c.get("price_eur"),
-                      "status": c.get("status"), "verified": c.get("verified")}
-                     for c in counted[:8]],
+        "listings": _listings(res),
         "photos": [p.get("url") for p in res.get("photos_sent") or [] if p.get("sent")],
         "searches": res.get("searches"), "costUsd": res.get("cost_usd"),
         "seconds": res.get("seconds"), "error": res.get("error"),
@@ -163,9 +196,13 @@ def apply_rules(product_id: str, res: dict[str, Any], *, preview: bool) -> dict[
     """
     d = decide(res)
     report = summary(res)
+    if str(res.get("price_source") or "").startswith("StockX") and res.get("retail_new_eur"):
+        found = (f"StockX retail {res.get('retail_raw') or money(res.get('retail_new_eur'))}"
+                 f"{'' if res.get('new_retail') else ' (not proven)'}")
+    else:
+        found = f"{res.get('n_comps', 0)} verified listing(s)"
     steps = [{"step": "lookup", "ran": True, "ok": True,
-              "note": f"{res.get('n_comps', 0)} verified listing(s), "
-                      f"{res.get('searches', 0)} searches",
+              "note": f"{found}, {res.get('searches', 0)} searches",
               "seconds": res.get("seconds")}]
     report["preview"] = preview
     status, outcome, reason = d["status"], d["outcome"], d["reason"]
