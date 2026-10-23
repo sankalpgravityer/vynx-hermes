@@ -37,7 +37,7 @@ EU_TLDS = ("de", "nl", "fr", "it", "es", "be", "at", "ie", "pt", "pl", "se", "dk
 EU_SITES = ("vinted", "vestiairecollective", "marktplaats", "2dehands", "kleinanzeigen",
             "leboncoin", "vide-dressing", "wallapop", "subito", "tise", "sellpy", "zalando")
 US_SITES = ("poshmark", "mercari", "therealreal", "ebay.com")
-GLOBAL_SITES = ("grailed", "depop", "etsy")
+GLOBAL_SITES = ("grailed", "depop", "etsy", "stockx")
 
 # How much a listing counts, and the price level it is scaled to (EU = 1).
 # v2 levels (23 Sep 2026): v1 stacked asking ×0.85, region ×0.8 and condition
@@ -292,6 +292,41 @@ def price_item(comps: list[dict], our_condition: str, vnyx_price: float | None) 
     }
 
 
+SHOE_STOCKX_FACTOR = 0.65   # a shoe sells at the StockX price less 35%
+
+
+def price_shoe(comps: list[dict], vnyx_price: float | None) -> dict:
+    """A shoe's price (the user's rule, 23 Oct 2026): the StockX price less 35%.
+
+    `comps`: the COUNTED StockX listings. The last sale is the StockX price
+    (the median when several pages sold); with no sale, the lowest ask. No
+    condition, region or asking discount and no no-cut guards — the 35% is the
+    whole calculation. Same keys as `price_item`.
+    """
+    priced = [c for c in comps if c.get("price_eur")]
+    sold = [c for c in priced if (c.get("status") or "").startswith("sold")]
+    use = sold or priced
+    base = st.median([c["price_eur"] for c in use]) if use else None
+    for c in priced:
+        c.pop("outlier", None)
+        c["region"] = c.get("region") or region_of(c.get("url", ""), c.get("location", ""))
+        c["adj_eur"], c["weight"] = round(c["price_eur"] * SHOE_STOCKX_FACTOR, 2), 1.0
+    sug = round99(base * SHOE_STOCKX_FACTOR) if base else None
+    flag = ""
+    if sug and vnyx_price:
+        r = sug / vnyx_price
+        if r < 0.5 or r > 3:
+            flag = f"{r:.1f}× VNYX — check"
+    return {
+        "median_all_eur": round(base, 2) if base else None,
+        "weighted_eur": None, "eu_median_eur": None, "n_eu": 0, "n_priced": len(priced),
+        "suggested_eur": sug,
+        "basis": (f"StockX {'last sale' if sold else 'lowest ask'} €{base:.2f} less 35%"
+                  if base else ""),
+        "price_flag": flag, "price_note": "",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 4. Brands
 # --------------------------------------------------------------------------- #
@@ -364,3 +399,24 @@ def trust_tier(final, vnyx, suggested, confidence, n, auth, cond_flag=False) -> 
     if r > 6:
         return "B", f"very big raise ({r:.1f}× VNYX) — 1 in 3 of these were lowered by hand"
     return "B", f"only {n} listing{'s' if n != 1 else ''}" + (f", {r:.1f}× VNYX" if r > 3 else "")
+
+
+def shoe_tier(final, vnyx, proven, auth, cond_flag=False) -> tuple[str, str]:
+    """A shoe has one StockX page, not 2+ listings: tier A needs its price
+    `proven` (the page Google returned; for the retail, the style code matches
+    too). Doubt, a big cut, an implausible price and a >6× raise still go to a
+    person, as in `trust_tier`."""
+    if not final:
+        return "", ""
+    if auth == "hold" or cond_flag:
+        return "C", "authenticity or grade doubt"
+    r = final / vnyx if vnyx else 1
+    if r < 0.5:
+        return "C", f"big cut ({r:.1f}× VNYX)"
+    if final > 1000:
+        return "C", f"implausible: €{final:.0f} = {r:.1f}× VNYX"
+    if r > 6:
+        return "B", f"very big raise ({r:.1f}× VNYX)"
+    if proven:
+        return "A", f"StockX price on a page Google returned, {r:.1f}× VNYX"
+    return "B", "StockX price not proven (page not returned by Google, or another style code)"

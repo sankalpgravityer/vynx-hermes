@@ -10,7 +10,13 @@ Midtex items; what changed is the plumbing around them:
     thread lock, not `fcntl` (Unix-only — the handoff did not start on Windows);
   * the uncited-listing page check runs inline, before the EU rescue round is
     decided, so a listing it confirms can save that round's searches;
-  * nothing here writes to VNYX.
+  * nothing here writes to VNYX;
+  * a shoe (vnyx-api's footwear test) is searched and priced from StockX only
+    (21 Oct 2026, the user's call): its own prompts, and a listing anywhere
+    else is never counted. Since 23 Oct the Retail Price StockX shows is its
+    retail, and its selling price is that less 35% (`judge_shoe_retail`,
+    `resale_rules.shoe_tier`); with no StockX retail, the StockX last sale /
+    lowest ask less 35% (`resale_rules.price_shoe`).
 
 TWO CALLS, ON PURPOSE. (1) Vision, no tools: identify brand, model and article
 code from the photos and the care label. (2) Text only, Google Search tool:
@@ -84,6 +90,9 @@ def api_key() -> str:
 
 RESALE_SITES = ("vinted", "grailed", "vestiaire", "ebay", "depop", "marktplaats", "2dehands",
                 "kleinanzeigen", "etsy", "poshmark", "vide-dressing", "wallapop", "subito", "tise")
+# Shoes are priced from StockX ONLY (the user's call, 21 Oct 2026): a shoe's
+# eBay / Grailed / Vinted listing is never counted, whatever the model reports.
+SHOE_SITES = ("stockx",)
 
 # --------------------------------------------------------------------------- #
 # Prompts — the handoff's, verbatim apart from line wrapping
@@ -99,7 +108,13 @@ Company 13CMSS...). Reply with ONLY this JSON (no markdown):
  "authenticity_concerns": "", "catalogue_corrections": ""}}
 resale_interest: would this item resell for clearly MORE than ordinary used clothing of its type
 (true vintage e.g. 80s/90s, a sought-after model, collab, rare colourway, designer)? high = yes,
-clearly; medium = maybe; low = ordinary used item."""
+clearly; medium = maybe; low = ordinary used item.{extra}"""
+
+ID_SHOE_EXTRA = """
+This item is FOOTWEAR. Its article_code is the STYLE CODE printed on the size label inside the
+tongue or on the box (e.g. Nike DD1391-100, adidas GY7658, New Balance M990GL6). model = the
+shoe's full name as StockX lists it (e.g. "Dunk Low Retro White Black"). search_terms: the
+StockX product name, and the style code."""
 
 _BLOCK_FORMAT = """Answer in EXACTLY this format, one block per listing (up to 6), then the summary lines:
 
@@ -141,6 +156,43 @@ Use at most {max_s} searches. Only report listings you actually found; never inv
 
 """ + _BLOCK_FORMAT
 
+# A shoe is priced from the RETAIL price StockX shows (the user's rule, 23 Oct
+# 2026): that is our retail, and the selling price is it less 35%. The style
+# code the page shows is asked for so a wrong colourway's page cannot price it.
+_SHOE_BLOCK_FORMAT = "\n".join(
+    ("RETAIL NEW: <the Retail Price shown on this shoe's StockX page, amount AND currency as shown> "
+     "| <that StockX page URL> | <the Style code shown on that page>\n"
+     "  (only a figure you saw on stockx.com in your search results; else: RETAIL NEW: unknown)")
+    if ln.startswith("RETAIL NEW:") else ln
+    for ln in _BLOCK_FORMAT.splitlines() if not ln.lstrip().startswith("(only a figure"))
+
+SHOE_SEARCH_PROMPT = """Search Google for this shoe on StockX (stockx.com) and report its prices there.
+
+Item: {ident}
+Our item: condition {cond}, size {size}. We sell in the Netherlands / EU.
+Suggested searches: {terms}
+
+Use ONLY stockx.com — add "site:stockx.com" to every search. Do not report eBay, Grailed, Vinted,
+GOAT, Klekt or any other site. Find the StockX product page of this exact shoe (same style code
+and colourway). Its Retail Price matters most: report it on the RETAIL NEW line. Also report
+its prices as listings, for our size when the page shows it. Its last sale is Status: sold, its lowest ask
+Status: listed. Condition: deadstock for a new pair, or as StockX states it for a used one.
+Use at most {max_s} searches in total. Only report pages you actually found in search results.
+Never invent a price or URL. Fewer real listings beat more guessed ones.
+
+""" + _SHOE_BLOCK_FORMAT
+
+SHOE_RESCUE_PROMPT = """Second StockX search for this shoe.
+
+Item: {ident}
+Our item: condition {cond}, size {size}.
+The first search did not find this shoe's StockX Retail Price. Search stockx.com ONLY ("site:stockx.com"),
+by the style code and by the model name with its colourway; a regional StockX page
+(stockx.com/de-de/..., /en-gb/...) is fine. Never report another site.
+Use at most {max_s} searches. Only report pages you actually found; never invent a price or URL.
+
+""" + _SHOE_BLOCK_FORMAT
+
 PROBE_PROMPT = ("Find 2 used Stone Island crewneck sweatshirts listed on eBay in Europe, "
                 "with price and listing URL. Use at most 2 searches.")
 
@@ -177,6 +229,16 @@ def url_kind(u: str) -> str:
     # dropped as a search page). Checked first.
     if "/s-anzeige/" in path:
         return "listing"
+    # A StockX product page is one slug, no id: stockx.com/nike-dunk-low-retro-white-black
+    # (or under a region, /de-de/<slug>). One short word is a category (/sneakers).
+    if pu.netloc.lower().removeprefix("www.").endswith("stockx.com"):
+        segs = [s for s in path.split("/") if s]
+        if segs and re.fullmatch(r"[a-z]{2}(-[a-z]{2})?", segs[0]):
+            segs = segs[1:]
+        if (len(segs) == 1 and segs[0].count("-") >= 3 and not pu.query
+                and not any(h in full for h in SEARCH_HINTS)):
+            return "listing"
+        return "search"
     if path in ("", "/") or any(h in full for h in SEARCH_HINTS):
         return "search"
     if any(h in path for h in LISTING_HINTS) or re.search(r"\d{6,}", path):
@@ -230,6 +292,8 @@ def _pick_photos(media: list[dict], gallery: list[str]) -> list[str]:
 
 def item_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """The lookup's input from `product_audit.load(...)`'s payload."""
+    from app.rules.imagery import is_footwear
+
     rec = payload["record"]
     media = payload.get("media") or []
     labels = [m["url"] for m in media
@@ -247,6 +311,9 @@ def item_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "brand": "" if str(brand).strip().lower() in ("no brand", "unknown") else brand,
         "category": rec.get("category"),
         "sub_category": rec.get("subCategory"),
+        # vnyx-api's isFootwearCategory test: a shoe is priced from StockX only.
+        "footwear": is_footwear(rec.get("masterCategory"), rec.get("category"),
+                                rec.get("subCategory")),
         "gender": rec.get("gender"),
         "size": rec.get("size") or rec.get("internationalSize"),
         "color": rec.get("color"),
@@ -292,16 +359,19 @@ GENERIC_MODELS = {"", "unknown", "hoodie", "sweatshirt", "t-shirt", "tee", "jack
                   "hooded sweatshirt", "knit", "shorts", "dress", "top"}
 
 
-def cache_key(ident: dict) -> str | None:
-    """The same model in another size has the same listings. Specific ids only."""
+def cache_key(ident: dict, footwear: bool = False) -> str | None:
+    """The same model in another size has the same listings. Specific ids only.
+    A shoe's key is apart (`stockx|...`): an entry cached before shoes went
+    StockX-only holds eBay and Grailed listings."""
     b = (ident.get("brand") or "").strip().lower()
+    pre = "stockx|" if footwear else ""
     code = re.sub(r"[^a-z0-9]", "", (ident.get("article_code") or "").lower())
     if b and len(code) >= 5:
-        return f"{b}|code|{code}"
+        return f"{pre}{b}|code|{code}"
     model = re.sub(r"\s+", " ", (ident.get("model") or "").strip().lower())
     if (b and ident.get("id_confidence") == "high" and model not in GENERIC_MODELS
             and len(model.split()) >= 3):
-        return f"{b}|model|{model}"
+        return f"{pre}{b}|model|{model}"
     return None
 
 
@@ -328,7 +398,8 @@ def cache_put(key: str | None, sku: str, res: dict, grounding: dict) -> None:
             "at": dt.datetime.now().isoformat(timespec="seconds"), "sku": sku,
             "res": {k: res.get(k) for k in ("comps", "resale_estimate_eur",
                                             "estimate_confidence", "retail_new_eur", "reasoning",
-                                            "retail_raw", "retail_url", "retail_cited")},
+                                            "retail_raw", "retail_url", "retail_cited",
+                                            "retail_style")},
             "grounding": {k: grounding.get(k) for k in ("queries", "domains", "n_sources",
                                                         "sources", "search_count")},
         }
@@ -449,7 +520,8 @@ def identify(item: dict, key: str, usage: Usage) -> tuple[dict | None, str | Non
     photos_sent = len(parts)
     rec = {k: item.get(k) for k in ("title", "brand", "category", "sub_category", "gender",
                                     "size", "color", "material", "condition")}
-    parts.append({"text": ID_PROMPT.format(rec=json.dumps(rec, ensure_ascii=False))})
+    parts.append({"text": ID_PROMPT.format(rec=json.dumps(rec, ensure_ascii=False),
+                                           extra=ID_SHOE_EXTRA if item.get("footwear") else "")})
     js, err = _post(f"{API}/models/{cfg['identify_model']}:generateContent",
                     {"contents": [{"parts": parts}],
                      "generationConfig": {"temperature": 0.1, "maxOutputTokens": 8192,
@@ -577,13 +649,16 @@ def parse_retail_line(text: str, start: int, annotations: list[dict]) -> dict:
     is checked the same way a listing is: was its page really in the results?
     """
     m = re.search(r"(?im)^RETAIL NEW:\s*(.+)$", text[start:])
-    out = {"retail_new_eur": None, "retail_raw": "", "retail_url": "", "_retail_cite_raw": []}
+    out = {"retail_new_eur": None, "retail_raw": "", "retail_url": "", "retail_style": "",
+           "_retail_cite_raw": []}
     if not m:
         return out
     line = m.group(1).strip()
     if line.lower().startswith("unknown"):
         return out
     price_part, _, url_part = line.partition("|")
+    url_part, _, style_part = url_part.partition("|")     # a shoe's line adds | <style code>
+    out["retail_style"] = style_part.strip(" *.`")
     um = re.search(r"\((https?://[^)\s]+)\)", url_part) or re.search(r"(https?://\S+)", url_part or line)
     url = um.group(1).rstrip(".,)") if um else ""
     amt, cur = R.parse_price(price_part)
@@ -789,10 +864,12 @@ def summarise(item: dict, res: dict, grounding: dict) -> dict:
     """Our own numbers from the listings — never just the model's estimate.
 
     A listing counts only if a search really ran, its price is above zero, it is
-    on a resale site, its URL is an individual listing, and it is grounded: the
-    exact page Google cited (`exact`), a listing on a cited site (`site`), or a
-    page we opened that shows the price (`page`).
+    on a resale site (for a shoe: StockX, and nothing else), its URL is an
+    individual listing, and it is grounded: the exact page Google cited
+    (`exact`), a listing on a cited site (`site`), or a page we opened that
+    shows the price (`page`).
     """
+    sites = SHOE_SITES if item.get("footwear") else RESALE_SITES
     comps = [c for c in (res.get("comps") or []) if isinstance(c, dict)]
     good = []
     searched = bool(grounding.get("queries"))
@@ -811,7 +888,7 @@ def summarise(item: dict, res: dict, grounding: dict) -> dict:
         u = str(c.get("url") or "")
         d = domain(u)
         c["domain"] = d
-        c["resale_site"] = any(k in d for k in RESALE_SITES)
+        c["resale_site"] = any(k in d for k in sites)
         c["kind"] = url_kind(u)
         site_ok = bool(d) and any(d == g or d.endswith("." + g) or g.endswith("." + d)
                                   for g in gdomains if g)
@@ -851,8 +928,9 @@ def summarise(item: dict, res: dict, grounding: dict) -> dict:
         conf = "low"
     else:
         conf = "no listings"
-    priced = R.price_item([c for c in comps if c.get("counted")],
-                          item.get("condition", ""), item.get("vnyx_price"))
+    counted = [c for c in comps if c.get("counted")]
+    priced = (R.price_shoe(counted, item.get("vnyx_price")) if item.get("footwear")
+              else R.price_item(counted, item.get("condition", ""), item.get("vnyx_price")))
     return {"comp_median_eur": round(st.median(pts), 2) if pts else None,
             "n_comps": len(good), "n_sold": len(sold), "n_exact": n_exact,
             "n_offered": len(comps), "confidence": conf, **priced}
@@ -920,7 +998,11 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
                                 item.get("sub_category")) if x)
     terms = out["search_terms"] or [desc]
     page_checks = cfg["page_check"] if check_pages is None else check_pages
-    ckey = cache_key(ident)
+    shoe = bool(item.get("footwear"))
+    out["price_source"] = "StockX only (footwear)" if shoe else "resale sites"
+    search_prompt, rescue_prompt = ((SHOE_SEARCH_PROMPT, SHOE_RESCUE_PROMPT) if shoe
+                                    else (SEARCH_PROMPT, RESCUE_PROMPT))
+    ckey = cache_key(ident, footwear=shoe)
     cached = None if fresh else cache_get(ckey)
     if cached:
         res = copy.deepcopy(cached["res"])
@@ -930,7 +1012,7 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
             confirm_counted_prices(res["comps"])
     else:
         res, grounding, err = search_round(
-            SEARCH_PROMPT.format(ident=desc, cond=item.get("condition"), size=item.get("size"),
+            search_prompt.format(ident=desc, cond=item.get("condition"), size=item.get("size"),
                                  terms="; ".join(terms[:4]), max_s=cfg["max_searches"]),
             key, usage)
         if err:
@@ -939,9 +1021,11 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
         if page_checks:
             run_page_checks(res["comps"])
             first = summarise(item, res, grounding)
-        if first["n_comps"] < 2:            # too few verified: one EU-only round, merged in
+        # Too few verified: one EU-only round, merged in. A shoe: a 2nd StockX
+        # round when the first found no StockX retail price.
+        if (not res.get("retail_new_eur")) if shoe else first["n_comps"] < 2:
             r2, g2, err2 = search_round(
-                RESCUE_PROMPT.format(ident=desc, cond=item.get("condition"),
+                rescue_prompt.format(ident=desc, cond=item.get("condition"),
                                      size=item.get("size"), max_s=cfg["rescue_searches"]),
                 key, usage)
             if not err2:
@@ -951,11 +1035,13 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
                 grounding["search_count"] += g2["search_count"]
                 grounding["sources"] += g2["sources"]
                 grounding["domains"] = sorted(set(grounding["domains"]) | set(g2["domains"]))
-                grounding["raw_answer"] += "\n\n--- EU round ---\n" + g2["raw_answer"]
+                grounding["raw_answer"] += (f"\n\n--- {'StockX round 2' if shoe else 'EU round'} ---\n"
+                                            + g2["raw_answer"])
                 grounding["rescue"] = True
                 if not res.get("retail_new_eur") and r2.get("retail_new_eur"):
                     res.update({k: r2.get(k) for k in ("retail_new_eur", "retail_raw",
-                                                       "retail_url", "retail_cited")})
+                                                       "retail_url", "retail_cited",
+                                                       "retail_style")})
                 if not res.get("resale_estimate_eur"):
                     res.update({k: r2.get(k) for k in ("resale_estimate_eur", "estimate_confidence",
                                                        "retail_new_eur", "reasoning")})
@@ -976,9 +1062,24 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
     s = summarise(item, res, grounding)
     final = s["suggested_eur"]
     cond_flag = (item.get("condition") or "").strip().lower() in R.DOUBTFUL_CONDITIONS
-    tier, tier_reason = R.trust_tier(final, item.get("vnyx_price"), s["suggested_eur"],
-                                     s["confidence"], s["n_comps"], out["auth_level"], cond_flag)
-    retail = judge_retail(res, grounding, final)
+    if shoe:
+        retail = judge_shoe_retail(res, grounding, ident)
+        market_proven = bool(final) and s["n_exact"] >= 1
+        if retail["retail_new_eur"] and (retail["new_retail"] or not market_proven):
+            # The user's rule: StockX retail (to .99) is our retail; selling = it less 35%.
+            base = R.round99(retail["retail_new_eur"])
+            final = R.round99(base * R.SHOE_STOCKX_FACTOR)
+            proven = bool(retail["new_retail"])
+            s.update(suggested_eur=final, price_flag="", price_note="",
+                     basis=f"StockX retail €{base:.2f} less 35%")
+        else:                       # no StockX retail: its last sale / lowest ask less 35%
+            proven = market_proven
+        tier, tier_reason = R.shoe_tier(final, item.get("vnyx_price"), proven,
+                                        out["auth_level"], cond_flag)
+    else:
+        tier, tier_reason = R.trust_tier(final, item.get("vnyx_price"), s["suggested_eur"],
+                                         s["confidence"], s["n_comps"], out["auth_level"], cond_flag)
+        retail = judge_retail(res, grounding, final)
     return done(
         **retail,
         new_price=final, tier=tier, tier_reason=tier_reason,
@@ -991,6 +1092,43 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
         raw_answer=grounding.get("raw_answer", ""), fx=R.fx_rates().get("_source"),
         **s,
     )
+
+
+def _code(x: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (x or "").lower())
+
+
+def judge_shoe_retail(res: dict, grounding: dict, ident: dict) -> dict[str, Any]:
+    """A shoe's retail from the StockX page, and whether to trust it.
+
+    Proven (proposed as the NEW retail, and tier A possible) when the page is
+    on stockx.com, Google returned that exact page (cited, or among the search
+    sources — StockX refuses our own page check with a 403), and the style
+    code the page shows is the one identified from the label. A wrong
+    colourway's page (KLE-002781: an "Ash Pearl" page for a Dusty Pink
+    FY2024) fails the style check.
+    """
+    eur, url = res.get("retail_new_eur"), res.get("retail_url") or ""
+    out: dict[str, Any] = {"retail_new_eur": eur, "retail_raw": res.get("retail_raw") or "",
+                           "retail_url": url, "retail_verified": "none", "new_retail": None,
+                           "retail_note": ""}
+    if not eur:
+        out["retail_note"] = "no StockX retail price found — keep the current one"
+        return out
+    returned = {norm_url(x) for x in (res.get("retail_cited") or [])}
+    returned |= {norm_url(x.get("url")) for x in grounding.get("sources") or [] if x.get("url")}
+    style, ours = _code(res.get("retail_style")), _code(ident.get("article_code"))
+    if not domain(url).endswith("stockx.com"):
+        out["retail_note"] = "not from stockx.com — shown, not proposed"
+    elif norm_url(url) not in returned:
+        out["retail_note"] = "the StockX page was not among Google's results — shown, not proposed"
+    elif not (style and ours and style == ours):
+        out["retail_note"] = (f"the StockX page shows style {res.get('retail_style') or '?'}, the label "
+                              f"says {ident.get('article_code') or '?'} — shown, not proposed")
+    else:
+        out["retail_verified"] = "cited"
+        out["new_retail"] = R.round99(eur)          # retail ends in .99 too (the user's call)
+    return out
 
 
 def judge_retail(res: dict, grounding: dict, new_selling: float | None) -> dict[str, Any]:
