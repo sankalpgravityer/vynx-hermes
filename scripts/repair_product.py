@@ -1197,6 +1197,42 @@ def shopify_product_id(dsn: str, product_id: str) -> str | None:
     return str(row[0]) if row and row[0] else None
 
 
+def vnyx_status(dsn: str, product_id: str) -> str | None:
+    """The product's VNYX status (Active / Draft / Archived), read fresh."""
+    with product_audit.connect(dsn, read_only=True) as conn:
+        row = conn.execute('SELECT status::text FROM "Product" WHERE id = %s::uuid',
+                           (product_id,)).fetchone()
+    return str(row[0]) if row and row[0] else None
+
+
+def vnyx_sellable(dsn: str, product_id: str) -> int:
+    """The count vnyx's stock sync would tell a channel — sellableQuantityForProduct
+    (vnyx-api inventory.ts): quantity - reserved, floored at 0, over the product's
+    Inventory rows that are not CLOSED or MISSING."""
+    with product_audit.connect(dsn, read_only=True) as conn:
+        row = conn.execute(
+            'SELECT COALESCE(SUM(GREATEST(0, i.quantity - i.reserved)), 0)'
+            '  FROM "Inventory" i JOIN "ProductVariant" v ON v.id = i."productVariantId"'
+            ' WHERE v."productId" = %s::uuid'
+            "   AND i.status::text NOT IN ('CLOSED', 'MISSING')",
+            (product_id,)).fetchone()
+    return int(row[0] or 0)
+
+
+# AN ARCHIVED PRODUCT KEEPS ITS SHOPIFY QUANTITY (25 Oct 2026, the user: update it
+# on Shopify, keep it Archived, and a 0 must never become 1). vnyx-api keeps the
+# status Archived on approval, but the approval's upsert is followed by the normal
+# stock sync, which sends VNYX's sellable count to the listing. So:
+#   * vnyx count 0  -> approved and updated on Shopify; the sync sends 0, 0 stays 0;
+#   * vnyx count >0 -> approved WITHOUT the Shopify push (--no-publish), no sync,
+#                      so a Shopify 0 cannot be turned into that count;
+#   * either way: no `stock` step, and no bin placement on approval — a placed bin
+#     row is itself a unit, and would turn the 0 into a 1.
+ARCHIVED_UNTOUCHED = "Archived — nothing sent to Shopify, stock left alone"
+ARCHIVED_STOCKED = ("Archived with stock {n} in vnyx — not pushed, so Shopify's "
+                    "quantity is not changed")
+
+
 def flip_rejected_stage(dsn: str, product_id: str, frm: str, to: str) -> bool:
     """Move a REJECTED product's STAGE between REJECTED and REVIEW, nothing else.
 
@@ -3453,6 +3489,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # The CHECK always runs; the MOVE needs --approve. See the module docstring:
     # approving publishes a live Shopify listing and there is no undo.
     verdict: dict[str, Any] = {}
+    # Read by the approve step (the product's VNYX status just before approval)
+    # and then by `stock` and `sync`: see ARCHIVED_UNTOUCHED.
+    archived_hold: dict[str, Any] = {"is": False, "sellable": 0}
 
     def _approve() -> str:
         nonlocal verdict
@@ -3513,15 +3552,20 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # FROM REJECTED (25 Oct 2026): the stage is REVIEW for this call alone,
         # and only once every picture verdict has passed. Not approved — held
         # by the pre-flight, refused, or an error — puts it straight back.
+        archived_hold["is"] = vnyx_status(dsn, product_id) == "Archived"
+        archived_hold["sellable"] = vnyx_sellable(dsn, product_id) if archived_hold["is"] else 0
+        # pushed only when the count it would carry is 0 (see ARCHIVED_UNTOUCHED)
+        archived_quiet = archived_hold["is"] and archived_hold["sellable"] > 0
         from_rejected = (approve_from_rejected and apply and approve and not blocked
                          and flip_rejected_stage(dsn, product_id, "REJECTED", "REVIEW"))
         verdict = {}
         try:
             verdict = approve_check(vnyx_api, dsn, product_id,
                                     apply=apply and approve and not blocked,
-                                    skip_bin=skip_bin,
+                                    skip_bin=skip_bin or archived_hold["is"],
                                     quiet=quiet, allow_stage=allow_stage,
-                                    publish=publish, publish_status=publish_status)
+                                    publish=publish and not archived_quiet,
+                                    publish_status=publish_status)
         finally:
             if from_rejected and verdict.get("outcome") != "approved":
                 flip_rejected_stage(dsn, product_id, "REVIEW", "REJECTED")
@@ -3550,7 +3594,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         problems = verdict.get("problems") or []
         if outcome == "approved":
             ps = verdict.get("publishStatus")
-            if not verdict.get("published", True):
+            if archived_quiet:
+                pushed = "NOT published — " + ARCHIVED_STOCKED.format(n=archived_hold["sellable"])
+            elif not verdict.get("published", True):
                 pushed = "NOT published — the Brain has the Shopify push off"
             elif ps == "active":
                 pushed = ("Shopify upsert enqueued as ACTIVE — the status turns Active "
@@ -3624,7 +3670,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                      and verdict.get("published", True))
     would_publish = (not apply and approve and publish
                      and verdict.get("outcome") == "would_approve")
-    if not stock_to_one:
+    if archived_hold["is"]:
+        stock_why = "Archived — stock left alone (vnyx count %d)" % archived_hold["sellable"]
+    elif not stock_to_one:
         stock_why = "off — only the Auto Approval agent's runs settle stock"
     elif not remote_has_step("settle-stock.ts"):
         stock_why = "this vnyx-api has no `stock` step yet — deploy vnyx-api"
@@ -3690,7 +3738,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # "Just approved" FIRST: the approval has already pushed this product, so
     # the re-sync is not needed whatever the switch says — and naming the
     # switch instead read as though the product had not gone to Shopify.
-    if verdict.get("outcome") == "approved":
+    if archived_hold["is"] and archived_hold["sellable"] > 0:
+        sync_why = ARCHIVED_STOCKED.format(n=archived_hold["sellable"])
+    elif verdict.get("outcome") == "approved":
         sync_why = "just approved — the approval pushed it"
     elif not sync_changes:
         sync_why = "off in the Brain (syncChangesToShopify)"

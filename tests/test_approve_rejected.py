@@ -69,6 +69,8 @@ def chain(monkeypatch):
 
     def fake_approve_check(vnyx_api, dsn, pid, *, apply, **kw):
         world["approve_apply"] = apply
+        world["publish"] = kw.get("publish")
+        world["skip_bin"] = kw.get("skip_bin")
         if world["raise"]:
             raise RuntimeError("vnyx-api down")
         return {"outcome": world["outcome"] if apply else "would_approve", "problems": [],
@@ -126,3 +128,36 @@ def test_without_the_flag_or_on_a_dry_run_nothing_moves(chain):
     _repair(apply=False)
     _repair(approve=False)
     assert chain["flips"] == []
+
+
+def _step(r, name):
+    return next(s for s in r["steps"] if s["step"] == name)
+
+
+def test_an_archived_product_at_zero_is_updated_and_its_stock_left_alone(chain, monkeypatch):
+    # 25 Oct 2026: update an Archived product on Shopify; its quantity is not
+    # changed — vnyx holds 0, so the stock sync can only ever send 0.
+    monkeypatch.setattr(rp, "vnyx_status", lambda dsn, pid: "Archived")
+    monkeypatch.setattr(rp, "vnyx_sellable", lambda dsn, pid: 0)
+    monkeypatch.setattr(rp, "shopify_product_id", lambda dsn, pid: "123")
+    r = _repair()
+    assert chain["publish"] is True
+    assert chain["skip_bin"] is True               # no bin row: that would be a unit
+    assert _step(r, "stock")["ran"] is False and "stock left alone" in _step(r, "stock")["why"]
+
+
+def test_an_archived_product_with_stock_is_approved_without_the_push(chain, monkeypatch):
+    # a 0 on Shopify must never become vnyx's 1
+    monkeypatch.setattr(rp, "vnyx_status", lambda dsn, pid: "Archived")
+    monkeypatch.setattr(rp, "vnyx_sellable", lambda dsn, pid: 1)
+    monkeypatch.setattr(rp, "shopify_product_id", lambda dsn, pid: "123")
+    r = _repair()
+    assert chain["publish"] is False
+    assert _step(r, "stock")["ran"] is False
+    assert _step(r, "sync")["ran"] is False and "not pushed" in _step(r, "sync")["why"]
+    assert "NOT published" in _step(r, "approve")["note"]
+
+
+def test_a_draft_product_still_publishes(chain):
+    _repair()
+    assert chain["publish"] is True
