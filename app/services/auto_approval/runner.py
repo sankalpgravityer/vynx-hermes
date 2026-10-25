@@ -427,6 +427,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                skip_matte: bool = False,
                price_rounding_only: bool = False,
                skip_price: bool = False,
+               approve_from_rejected: bool = False,
                silent: bool = False,
                section: str = "REVIEW") -> str | None:
     """One claimed product, start to finish. Never raises.
@@ -663,6 +664,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                 skip_gate=not rs.gate,
                 price_mode=price_mode,
                 skip_price=skip_price,
+                approve_from_rejected=approve_from_rejected,
                 publish=rs.publish_on_approve,
                 # The agent's approvals only (this is the runner, never the
                 # manual flow): which Shopify status the approval publishes with.

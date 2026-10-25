@@ -1197,6 +1197,33 @@ def shopify_product_id(dsn: str, product_id: str) -> str | None:
     return str(row[0]) if row and row[0] else None
 
 
+def flip_rejected_stage(dsn: str, product_id: str, frm: str, to: str) -> bool:
+    """Move a REJECTED product's STAGE between REJECTED and REVIEW, nothing else.
+
+    run_from_sheet --approve-rejected (25 Oct 2026, the user): approve a Rejected
+    product straight into Approved without it ever showing in Review. vnyx-api's
+    approve-products.ts approves only from REVIEW and refuses REJECTED outright,
+    so the stage is REVIEW for the approval call alone; the tabs follow
+    `reviewStatus`, which stays REJECTED until approval writes ACCEPTED.
+
+    Written here, not through the app's stage sync, on purpose: that sync queues
+    a label print and calls the print-bot on every arrival at Review. Guarded on
+    the review state and the expected stage, so it can only ever touch a
+    rejected product in the stage it was found in. `updatedAt` is left alone.
+    """
+    with product_audit.connect(dsn, read_only=False) as conn:
+        cur = conn.execute(
+            'UPDATE "Product" SET "currentStage" = %(to)s::"ProductStage"'
+            ' WHERE id = %(p)s::uuid AND "currentStage" = %(frm)s::"ProductStage"'
+            ' AND "reviewStatus" = \'REJECTED\'::"ProductReviewStatus"'
+            ' AND "isDeleted" = false',
+            {"p": product_id, "frm": frm, "to": to},
+        )
+        n = cur.rowcount
+        conn.commit()
+    return n == 1
+
+
 def approve_check(vnyx_api: Path, dsn: str, product_id: str, *,
                   apply: bool, skip_bin: bool,
                   quiet: bool,
@@ -1396,6 +1423,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            # Skip the price step entirely, .99 rounding included (23 Oct 2026,
            # run_from_sheet --no-price): the price is left exactly as it is.
            skip_price: bool = False,
+           # Approve a REJECTED product straight to Approved (25 Oct 2026,
+           # run_from_sheet --approve-rejected): see flip_rejected_stage.
+           approve_from_rejected: bool = False,
            publish: bool = True,
            # 'active' | 'draft': the Shopify status the AGENT's approval
            # publishes with (the Brain's publishActiveOnApprove). None — every
@@ -3480,11 +3510,23 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         blocked = bool(refusing)
         # Only ever passes --apply when BOTH flags are set. `--apply` alone
         # repairs; publishing has to be asked for separately.
-        verdict = approve_check(vnyx_api, dsn, product_id,
-                                apply=apply and approve and not blocked,
-                                skip_bin=skip_bin,
-                                quiet=quiet, allow_stage=allow_stage,
-                                publish=publish, publish_status=publish_status)
+        # FROM REJECTED (25 Oct 2026): the stage is REVIEW for this call alone,
+        # and only once every picture verdict has passed. Not approved — held
+        # by the pre-flight, refused, or an error — puts it straight back.
+        from_rejected = (approve_from_rejected and apply and approve and not blocked
+                         and flip_rejected_stage(dsn, product_id, "REJECTED", "REVIEW"))
+        verdict = {}
+        try:
+            verdict = approve_check(vnyx_api, dsn, product_id,
+                                    apply=apply and approve and not blocked,
+                                    skip_bin=skip_bin,
+                                    quiet=quiet, allow_stage=allow_stage,
+                                    publish=publish, publish_status=publish_status)
+        finally:
+            if from_rejected and verdict.get("outcome") != "approved":
+                flip_rejected_stage(dsn, product_id, "REVIEW", "REJECTED")
+        if from_rejected and verdict.get("outcome") == "approved":
+            verdict = {**verdict, "stageBefore": "REJECTED"}
         if blocked:
             gate_problems = [f"{label}: {r}" for label, v in refusing for r in v.reasons]
             # A real refusal names its code; only when EVERY refusing verdict is

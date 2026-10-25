@@ -123,7 +123,7 @@ APPROVABLE_STAGES = ("REVIEW", "LABEL", "MISSING_LABEL", "PHOTOBOOTH")
 # So APPROVED is selectable but never approvable: it is absent from
 # APPROVABLE_STAGES above, which is what `allow_stage` is validated against, so
 # widening the sheet cannot widen what the approval pre-flight will move.
-SELECTABLE_STAGES = (*APPROVABLE_STAGES, "APPROVED")
+SELECTABLE_STAGES = (*APPROVABLE_STAGES, "APPROVED", "REJECTED")
 
 
 def section_of(row: dict[str, Any]) -> str:
@@ -285,17 +285,20 @@ def eligibility_clauses(retry: bool = False,
             if name == "in Review" else (name, sql)
             for name, sql in clauses
         ]
-        if "APPROVED" in stages:
+        if "APPROVED" in stages or "REJECTED" in stages:
             # A SECOND CLAUSE SAYS THE SAME THING IN THE OTHER VOCABULARY.
             # `reviewStatus` is ACCEPTED on an approved product, so widening
             # the stage alone still refuses every row with "review status
             # pending" — which reads as a different problem and is not one.
             # The two columns are one fact (ProductStage.APPROVED is defined as
             # reviewStatus=ACCEPTED in the schema), so they widen together.
+            # REJECTED widens it the same way (--approve-rejected, 25 Oct 2026),
+            # and the list comes from claim.review_statuses so the predicate and
+            # the claim cannot disagree about it.
+            allowed = ",".join(f"'{v}'" for v in claim.review_statuses(stages))
             clauses = [
                 (name,
-                 'p."reviewStatus" = ANY(ARRAY[\'PENDING\',\'PENDING_DECISON\','
-                 '\'ACCEPTED\']::"ProductReviewStatus"[])')
+                 f'p."reviewStatus" = ANY(ARRAY[{allowed}]::"ProductReviewStatus"[])')
                 if name == "review status pending" else (name, sql)
                 for name, sql in clauses
             ]
@@ -836,7 +839,8 @@ class Parallel:
                  stages: list[str], reject_attrs: bool, apply: bool,
                  skip_matte: bool = False,
                  price_rounding_only: bool = False,
-                 skip_price: bool = False) -> None:
+                 skip_price: bool = False,
+                 approve_from_rejected: bool = False) -> None:
         import queue
         import threading
 
@@ -851,6 +855,7 @@ class Parallel:
         self.skip_matte = skip_matte
         self.price_rounding_only = price_rounding_only
         self.skip_price = skip_price
+        self.approve_from_rejected = approve_from_rejected
         self.submitted = 0
         # Set by the first worker that sees a run-level stop — the canary or
         # a vision outage. The main loop reads it before every submit and the
@@ -928,6 +933,7 @@ class Parallel:
                                       skip_matte=self.skip_matte,
                                       price_rounding_only=self.price_rounding_only,
                                       skip_price=self.skip_price,
+                                      approve_from_rejected=self.approve_from_rejected,
                                       silent=True, section=section_of(row))
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             with lock:
@@ -1116,6 +1122,15 @@ def main() -> int:
                           ".99 and fixes it when it does not; the grade window "
                           "is not consulted. Passes repair_product.py's flag of "
                           "the same name straight through."))
+    ap.add_argument("--approve-rejected", action="store_true",
+                    help=("accept products in the REJECTED tab and, with --apply "
+                          "--approve, approve the ones that pass straight from "
+                          "Rejected to Approved — they never show in Review. "
+                          "vnyx-api approves only from REVIEW, so the stage is "
+                          "set to REVIEW for the approval call alone and put back "
+                          "to REJECTED when the product is not approved. "
+                          "Decision-rejected products are still refused, and an "
+                          "Archived product stays Archived (25 Oct 2026)."))
     ap.add_argument("--no-price", action="store_true",
                     help=("skip the price step ENTIRELY — not even the .99 "
                           "rounding. The price is left exactly as it is. The "
@@ -1254,6 +1269,11 @@ def main() -> int:
     # the eligibility predicate alone, and `stages` (which becomes
     # `allow_stage`) is left as it was.
     eligible_stages = [*stages, "APPROVED"] if args.include_approved else stages
+    # REJECTED is selectable with --approve-rejected and, like APPROVED, never
+    # handed to the pre-flight as a stage to move FROM: repair() flips the stage
+    # to REVIEW for the approval call alone (see its `approve_from_rejected`).
+    if args.approve_rejected:
+        eligible_stages = [*eligible_stages, "REJECTED"]
 
     ok = held = failed = skipped = 0
     pool: Parallel | None = None
@@ -1429,7 +1449,8 @@ def main() -> int:
                                 args.reject_missing_attrs, args.apply,
                                 skip_matte=args.no_matte,
                                 price_rounding_only=args.price_rounding_only,
-                                skip_price=args.no_price)
+                                skip_price=args.no_price,
+                                approve_from_rejected=args.approve_rejected)
             if pool.abort:
                 # A worker saw a run-level stop. The row this iteration just
                 # enqueued would otherwise sit QUEUED with nothing to claim it.
@@ -1554,6 +1575,7 @@ def main() -> int:
                                   skip_matte=args.no_matte,
                                   price_rounding_only=args.price_rounding_only,
                                   skip_price=args.no_price,
+                                  approve_from_rejected=args.approve_rejected,
                                   section=section_of(row))
 
         after = db.fetch_one(
