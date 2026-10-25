@@ -108,3 +108,17 @@ def _vision_cache_off(monkeypatch):
     vision_cache.reset()
     yield
     vision_cache.reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_status_read(monkeypatch):
+    """repair()'s approve step reads the product's VNYX status fresh (25 Oct 2026,
+    ARCHIVED_UNTOUCHED). Tests drive repair() against a fake DSN, so the read is
+    answered here — "Draft", the ordinary case — and a test that needs Archived
+    sets it itself."""
+    try:
+        from scripts import repair_product as rp
+    except Exception:  # noqa: BLE001 — a test that never imports it is unaffected
+        return
+    monkeypatch.setattr(rp, "vnyx_status", lambda dsn, pid: "Draft")
+    monkeypatch.setattr(rp, "vnyx_sellable", lambda dsn, pid: 0)
