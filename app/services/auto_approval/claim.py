@@ -116,6 +116,10 @@ def review_statuses(stages: list[str] | None) -> list[str]:
     out = ["PENDING", "PENDING_DECISON"]
     if stages and "APPROVED" in stages:
         out.append("ACCEPTED")
+    # run_from_sheet --approve-rejected (25 Oct 2026): a Rejected product's
+    # review state is REJECTED by definition, exactly as APPROVED's is ACCEPTED.
+    if stages and "REJECTED" in stages:
+        out.append("REJECTED")
     return out
 
 
