@@ -7,6 +7,7 @@ internally contradictory — e.g. a "Women Top" mannequin on a pair of men's jea
 
 from __future__ import annotations
 
+import html
 import re
 from typing import Any
 
@@ -36,6 +37,11 @@ def _norm_code(value: str | None) -> str:
 
 def _is_placeholder(value: Any, pol: dict[str, Any]) -> bool:
     return str(value or "").strip().lower() in pol["confidence"]["placeholders"]
+
+
+def _squash(value: Any) -> str:
+    """Whitespace collapsed and trimmed — how two titles compare (TEXT.009/010)."""
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def _alnum(value: str) -> str:
@@ -767,6 +773,50 @@ def check_copy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
                          f"'{filed_under}' ({fam_record})."),
                 detail={"title_family": fam_title, "record_family": fam_record,
                         "filed_under": filed_under},
+            ))
+
+    # TEXT.009 — the title is not the one the tenant's format produces.
+    #
+    # Settings → Title & Description (26 Oct 2026): with the format on, every
+    # title is BUILT from it — the category's own format when one matches, else
+    # the default — so any other title is stale (written before the record or
+    # the format changed) or hand-typed. The copy step rebuilds it from the same
+    # format. Silent while the format is off or produces nothing.
+    fmt = p.copy_format or {}
+    expected = fmt.get("expectedTitle")
+    if expected and _squash(p.title) != _squash(expected):
+        where = (f"the '{fmt.get('matchedCategory')}' format"
+                 if fmt.get("titleSource") == "category" else "the default format")
+        out.append(Finding(
+            rule_id="TEXT.009", severity=Severity.MEDIUM, fields=["title"],
+            message=f"Title '{p.title}' does not follow {where}: expected '{expected}'.",
+            detail={"expected": expected, "source": fmt.get("titleSource"),
+                    "matched_category": fmt.get("matchedCategory")},
+        ))
+
+    # TEXT.010 — the description's sections are not the tenant's sections.
+    #
+    # The generator writes one <h2> per active section and strips any other, so
+    # a missing or extra heading means the copy predates the tenant's current
+    # section list. Names compare case-insensitively, entities decoded.
+    sections = fmt.get("sections") or []
+    if sections and (p.description or "").strip():
+        found = [_squash(html.unescape(re.sub(r"<[^>]+>", "", h))).lower()
+                 for h in re.findall(r"<h2[^>]*>(.*?)</h2>", p.description,
+                                     flags=re.I | re.S)]
+        want = [_squash(s).lower() for s in sections]
+        missing = [s for s, k in zip(sections, want) if k not in found]
+        extra = [h for h in found if h and h not in want]
+        if missing or extra:
+            parts = []
+            if missing:
+                parts.append(f"missing {', '.join(missing)}")
+            if extra:
+                parts.append(f"has sections the tenant does not use ({', '.join(extra)})")
+            out.append(Finding(
+                rule_id="TEXT.010", severity=Severity.LOW, fields=["description"],
+                message=f"Description sections differ from the settings: {'; '.join(parts)}.",
+                detail={"missing": missing, "extra": extra, "expected": sections},
             ))
 
     if not (p.description or "").strip():

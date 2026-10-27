@@ -635,6 +635,9 @@ imagery:
   # that was four calls to produce two useful cut-outs.
   #
   # Widen this to `garment_views` to go back to matting everything.
+  # Capture views a category configured as product images (SIDE, SHOEXSIDE…,
+  # 23 Oct 2026) are added per product on top of this list — vnyx-api cuts them
+  # out, so Hermes judges and re-cuts them like FRONT and BACK.
   matte_views: ["FRONT", "BACK"]
 
   # Size charts filed under view OTHER — 904 of them on the measured tenant.
@@ -1661,14 +1664,23 @@ readiness:
     # vnyx-api now sets the flag only when the asserted order actually differs
     # from the cache (deploy ①); once the flags have been re-earned, `true`.
     respect_manual: false
+  # The chain's `shoe model` step (26 Oct 2026): a FOOTWEAR product whose
+  # `model` is empty gets the model line from the resale identifier (Gemini,
+  # one vision call, ~$0.001) — "Air Zoom Spiridon Kukini Cage 2 Stussy", no
+  # brand, no colourway. Never overwrites a model already set. Below
+  # `min_confidence` (low | medium | high) the guess is reported, not written.
+  shoe_model:
+    enabled: true
+    min_confidence: high
   copy:
     enabled: true
     # The `copy` step regenerates the title and description from the CURRENT
     # record when this run changed any of these (the title template's inputs)…
-    trigger_fields: [gender, masterCategory, category, subCategory, size, color, brand]
+    trigger_fields: [gender, masterCategory, category, subCategory, size, color, brand,
+                     model, playerName, playerNumber]
     # …or when the copy already disagrees with the record. TEXT.008 is new:
     # the title's own size or garment word contradicts the record.
-    trigger_rules: [TEXT.002, TEXT.003, TEXT.006, TEXT.007, TEXT.008]
+    trigger_rules: [TEXT.002, TEXT.003, TEXT.006, TEXT.007, TEXT.008, TEXT.009, TEXT.010]
 
   # --- phase 3: the cut-outs (docs/READINESS-PLAN.md §4 step 3) ---------------
   #

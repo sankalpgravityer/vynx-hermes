@@ -64,11 +64,25 @@ DEFAULT_SEQUENCE: list[dict[str, Any]] = [
     {"shot": "closeup", "count": 1, "enabled": True},
 ]
 
-# The fixed media slots, in catalogue (= default) order.
+# The legacy five slots, in catalogue (= default) order. Since 23 Oct 2026 a
+# CATEGORY's slots come from its own capture views (`slotsForViews`: a `side`
+# view earns `original_decision_side` / `original_photobooth_side`); these five
+# are only what the tenant-wide default and pre-existing sequences carry, and
+# what `normalize_sequence` appends — as vnyx-api's resolver does.
 MEDIA_SLOT_KEYS = [
     "original_decision_front", "original_decision_back",
     "original_photobooth_front", "original_photobooth_back", "labels",
 ]
+_DYNAMIC_SLOT_RE = re.compile(r"^original_(decision|photobooth)_[a-z][a-z0-9_]*$")
+
+# The eleven views the ProductMedia enum always had. Any other view is a capture
+# view a tenant configured (Category Settings), whose role comes from settings.
+LEGACY_VIEWS = frozenset({
+    "FRONT", "BACK", "LABEL", "SIZE_CHART", "AI_FRONT", "AI_BACK", "AI_FRONT_34",
+    "AI_BACK_34", "AI_CLOSEUP", "VIDEO_TURNTABLE", "OTHER",
+})
+# Written by the pipeline, never an operator capture — so never a slot.
+_PIPELINE_ONLY_VIEWS = LEGACY_VIEWS - {"FRONT", "BACK", "LABEL"}
 
 # A render with no shot key and no recognised url suffix: its view's shot.
 LEGACY_VIEW_TO_SHOT = {
@@ -81,6 +95,57 @@ GARMENT_VIEWS = ("FRONT", "BACK", "OTHER")
 
 def is_shot(value: Any) -> bool:
     return isinstance(value, str) and value in SHOT_CATALOG
+
+
+def is_media_slot_key(value: Any) -> bool:
+    """Shape, not catalogue membership — a category's own slots are data (isMediaSlotKey)."""
+    return isinstance(value, str) and (value == "labels" or bool(_DYNAMIC_SLOT_RE.match(value)))
+
+
+def role_of(view: Any, roles: dict[str, str] | None = None) -> str:
+    """mediaRoleOf: RENDER / GARMENT / REFERENCE. A legacy view's role is fixed; any other
+    view takes the role its capture setting gives it, GARMENT when none does."""
+    v = str(view or "").upper()
+    if v.startswith("AI_"):
+        return "RENDER"
+    if v in ("LABEL", "SIZE_CHART"):
+        return "REFERENCE"
+    if v in LEGACY_VIEWS:
+        return "GARMENT"
+    return (roles or {}).get(v, "GARMENT")
+
+
+def is_garment_still(view: Any, roles: dict[str, str] | None = None) -> bool:
+    """isGarmentStill: depicts the product and is a still (FRONT/BACK/OTHER + configured views)."""
+    return role_of(view, roles) == "GARMENT" and str(view or "").upper() != "VIDEO_TURNTABLE"
+
+
+def is_extra_garment_view(view: Any, roles: dict[str, str] | None = None) -> bool:
+    """A garment photo under a CONFIGURED capture view (SIDE, SHOEXSIDE, …) — not a legacy one."""
+    return str(view or "").upper() not in LEGACY_VIEWS and is_garment_still(view, roles)
+
+
+def is_cutout_view(view: Any, roles: dict[str, str] | None = None) -> bool:
+    """A view whose photos are cut out: FRONT, BACK and every configured garment view —
+    backfill-bg-removal.ts's `isCutoutView`. OTHER stays out (an untyped asset)."""
+    return str(view or "").upper() in ("FRONT", "BACK") or is_extra_garment_view(view, roles)
+
+
+def view_roles(settings_rows: Iterable[Any]) -> dict[str, str]:
+    """allViewRoleEntries + refreshViewRoles: every tenant's Category Settings views (defaults
+    first, then overrides) -> {VIEW: role}. Process-wide in vnyx-api, so the first role a key
+    gets wins across tenants; a legacy view's role is never overridden."""
+    out: dict[str, str] = {}
+    for settings in settings_rows:
+        views = settings.get("views") if isinstance(settings, dict) else None
+        for v in views if isinstance(views, list) else []:
+            if not isinstance(v, dict) or not isinstance(v.get("key"), str):
+                continue
+            k = v["key"].strip().upper()
+            if not k or k in LEGACY_VIEWS or k in out:
+                continue
+            out[k] = "REFERENCE" if v.get("isProductImage") is False else "GARMENT"
+    return out
 
 
 def _clamp(value: Any) -> int:
@@ -104,14 +169,18 @@ def parse_sequence(value: Any) -> list[dict[str, Any]] | None:
     return entries if any(e["enabled"] for e in entries) else None
 
 
-def normalize_sequence(value: Any) -> list[dict[str, Any]]:
-    """Every slot exactly once (first position wins, missing ones appended enabled)."""
+def normalize_sequence(value: Any, expected_slots: list[str] | None = None) -> list[dict[str, Any]]:
+    """Every expected slot exactly once (first position wins, missing ones appended enabled).
+
+    A slot of the right SHAPE that is not expected — a category's own `original_*_side`, or one
+    whose view was since removed — is KEPT where it stands, never stripped (23 Oct 2026)."""
+    expected = MEDIA_SLOT_KEYS if expected_slots is None else expected_slots
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for e in value if isinstance(value, list) else []:
         if not isinstance(e, dict):
             continue
-        if e.get("slot") in MEDIA_SLOT_KEYS:
+        if is_media_slot_key(e.get("slot")):
             if e["slot"] in seen:
                 continue
             seen.add(e["slot"])
@@ -120,7 +189,7 @@ def normalize_sequence(value: Any) -> list[dict[str, Any]]:
             out.append({"shot": e["shot"], "count": _clamp(e.get("count", 1)),
                         "promptNote": e.get("promptNote") if isinstance(e.get("promptNote"), str) else None,
                         "enabled": e.get("enabled") is not False})
-    out.extend({"slot": s, "enabled": True} for s in MEDIA_SLOT_KEYS if s not in seen)
+    out.extend({"slot": s, "enabled": True} for s in expected if s not in seen)
     return out
 
 
@@ -430,28 +499,46 @@ def build_display_plan(lines: Any) -> DisplayPlan:
 
 
 def slot_for_row(view: str, origin: str | None) -> str | None:
+    """media-slots.ts slotForRow (23 Oct 2026): mechanical, not a lookup — the row's own view,
+    lower-cased and namespaced by origin, so a SIDE taken at decision is `original_decision_side`.
+    Pipeline views (renders, charts, video, OTHER) and other origins have none."""
     if view == "LABEL":
         return "labels"
+    if view in _PIPELINE_ONLY_VIEWS or not view:
+        return None
     origin = (origin or "").upper()
-    if origin == "DECISION" and view in ("FRONT", "BACK"):
+    if origin == "DECISION":
         return f"original_decision_{view.lower()}"
-    if origin in ("PHOTOBOOTH", "WEB") and view in ("FRONT", "BACK"):
+    if origin in ("PHOTOBOOTH", "WEB"):
         return f"original_photobooth_{view.lower()}"
     return None
 
 
+# viewRank for a configured view: after OTHER, before video (12 + 2·(1 − 1/(1+p)), p = the
+# view's position — 0 here, as vnyx-api's gallery rebuild passes none).
+_DYNAMIC_VIEW_RANK = 12
+
+
+def _band(view: str, roles: dict[str, str] | None) -> int:
+    if view in _BAND_RANK:
+        return _BAND_RANK[view]
+    return {"RENDER": 0, "REFERENCE": 3}.get(role_of(view, roles), 1)
+
+
 def canonical_rank(view: str, origin: str | None, processing: str | None,
-                   origin_order: list[str] | None = None) -> int:
+                   origin_order: list[str] | None = None,
+                   roles: dict[str, str] | None = None) -> int:
     order = [o.upper() for o in (origin_order or ORIGIN_ORDER)]
     o = (origin or "").upper()
     o_rank = order.index(o) if o in order else len(order)
-    v_rank = _VIEW_RANK.get(view, 99)
-    band = _BAND_RANK.get(view, 5)
+    v_rank = _VIEW_RANK.get(view, _DYNAMIC_VIEW_RANK)
+    band = _band(view, roles)
     inner = o_rank * 1000 + v_rank * 10 if band == 1 else v_rank * 1000 + o_rank * 10
     return _PROCESSING_RANK.get(processing or "RAW", 2) * 1_000_000 + band * 100_000 + inner
 
 
-def display_order(rows: list[Any], lines: Any, origin_order: list[str] | None = None) -> list[Any]:
+def display_order(rows: list[Any], lines: Any, origin_order: list[str] | None = None,
+                  roles: dict[str, str] | None = None) -> list[Any]:
     """The live rows in the order rebuildMediaCache writes `Product.images`: rows of a
     disabled slot dropped; the nth render of a shot (by position) at that shot's nth
     ordinal; then canonical rank, then position."""
@@ -483,7 +570,7 @@ def display_order(rows: list[Any], lines: Any, origin_order: list[str] | None = 
         slot = slot_for_row(view, _get(r, "origin"))
         if slot:
             return dp.slot_ordinal.get(slot, dp.end_ordinal)
-        if view in GARMENT_VIEWS:
+        if is_garment_still(view, roles):
             return dp.after_originals_ordinal
         if view == "VIDEO_TURNTABLE":
             return dp.end_ordinal
@@ -491,6 +578,7 @@ def display_order(rows: list[Any], lines: Any, origin_order: list[str] | None = 
 
     return sorted(visible, key=lambda r: (
         ordinal(r),
-        canonical_rank(str(_get(r, "view")), _get(r, "origin"), _get(r, "processing"), origin_order),
+        canonical_rank(str(_get(r, "view")), _get(r, "origin"), _get(r, "processing"),
+                       origin_order, roles),
         int(_get(r, "position") or 0),
     ))

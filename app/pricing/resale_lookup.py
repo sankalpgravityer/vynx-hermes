@@ -114,7 +114,11 @@ ID_SHOE_EXTRA = """
 This item is FOOTWEAR. Its article_code is the STYLE CODE printed on the size label inside the
 tongue or on the box (e.g. Nike DD1391-100, adidas GY7658, New Balance M990GL6). model = the
 shoe's full name as StockX lists it (e.g. "Dunk Low Retro White Black"). search_terms: the
-StockX product name, and the style code."""
+StockX product name, and the style code.
+Also add "model_name": the model line for a product title — the model and any collaboration,
+WITHOUT the brand and WITHOUT the colourway (e.g. "Dunk Low Retro", "Air Max 90",
+"Air Zoom Spiridon Kukini Cage 2 Stussy", "Samba OG"). Identify it from the silhouette,
+the design and any collaboration branding as well as from labels; "" when you cannot tell."""
 
 _BLOCK_FORMAT = """Answer in EXACTLY this format, one block per listing (up to 6), then the summary lines:
 
@@ -541,7 +545,7 @@ def identify(item: dict, key: str, usage: Usage) -> tuple[dict | None, str | Non
         ident = {}
     if not ident:
         return None, f"identify: no JSON in the reply (finish={cand.get('finishReason')})"
-    for k in ("brand", "model", "article_code", "era", "id_confidence", "resale_interest",
+    for k in ("brand", "model", "model_name", "article_code", "era", "id_confidence", "resale_interest",
               "interest_reason", "authenticity_concerns", "catalogue_corrections"):
         if k in ident:
             ident[k] = _as_text(ident[k])
@@ -1176,3 +1180,46 @@ def probe() -> dict[str, Any]:
     return {"ok": not err and bool(queries), "error": err, "model": config()["search_model"],
             "queries": queries[:5], "searches": n, "citations": len(cites),
             "reply": text[:300].replace("\n", " ")}
+
+
+# --------------------------------------------------------------------------- #
+# The shoe's model name, for the catalogue (26 Oct 2026)
+# --------------------------------------------------------------------------- #
+_CONFIDENCE_RANK = {"low": 0, "medium": 1, "high": 2}
+
+
+def shoe_model(payload: dict[str, Any], min_confidence: str = "high") -> dict[str, Any]:
+    """The model line of a FOOTWEAR product from its photos — the identify call alone,
+    no search, nothing cached or charged to the search ledger.
+
+    -> {"model_name", "confidence", "accepted", "article_code", "error", "cost_usd"}.
+    `accepted` only when the identifier's own confidence reaches `min_confidence`;
+    a name below it is reported, never written.
+    """
+    item = item_from_payload(payload)
+    out: dict[str, Any] = {"model_name": "", "confidence": "", "accepted": False,
+                           "article_code": "", "error": None, "cost_usd": 0.0}
+    if not item.get("footwear"):
+        out["error"] = "not footwear"
+        return out
+    key = api_key()
+    if not key:
+        out["error"] = "no Gemini key (GEMINI_API_KEY / HERMES_RESALE_GEMINI_API_KEY)"
+        return out
+    usage = Usage()
+    ident, err = identify(item, key, usage)
+    out["cost_usd"] = round(usage.cost_usd(config()), 4)
+    if err or not ident:
+        out["error"] = err or "no answer"
+        return out
+    name = _as_text(ident.get("model_name")).strip()
+    brand = str(item.get("brand") or "").strip()
+    # Never the brand twice in a title: "Nike Air Max 90" -> "Air Max 90".
+    if brand and name.lower().startswith(brand.lower() + " "):
+        name = name[len(brand):].strip()
+    conf = str(ident.get("id_confidence") or "").lower()
+    out.update(model_name=name, confidence=conf,
+               article_code=_as_text(ident.get("article_code")),
+               accepted=bool(name) and _CONFIDENCE_RANK.get(conf, -1)
+               >= _CONFIDENCE_RANK.get(min_confidence, 2))
+    return out

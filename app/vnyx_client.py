@@ -329,6 +329,14 @@ def to_snapshot(
         shot_sequence=(_first(raw, "shotSequence", "shot_sequence")
                        if isinstance(_first(raw, "shotSequence", "shot_sequence"), dict)
                        else None),
+        # The tenant's title format + description sections for this product —
+        # product_audit resolves it; the review feed does not send it.
+        copy_format=(_first(raw, "copyFormat", "copy_format")
+                     if isinstance(_first(raw, "copyFormat", "copy_format"), dict)
+                     else None),
+        view_roles={str(k).upper(): str(v) for k, v in
+                    (_first(raw, "viewRoles", "view_roles") or {}).items()}
+                   if isinstance(_first(raw, "viewRoles", "view_roles"), dict) else {},
 
         confidence=confidence,
         provenance=provenance,

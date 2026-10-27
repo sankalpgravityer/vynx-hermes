@@ -69,6 +69,8 @@ RULE_MAP: dict[str, tuple[str, str, str]] = {
     "TEXT.006": ("TITLE_STALE", "high", "copy"),
     "TEXT.007": ("TITLE_STALE", "medium", "copy"),
     "TEXT.008": ("TITLE_STALE", "medium", "copy"),
+    "TEXT.009": ("TITLE_OFF_FORMAT", "medium", "copy"),
+    "TEXT.010": ("DESCRIPTION_OFF_FORMAT", "low", "copy"),
 }
 
 MEANING: dict[str, str] = {
@@ -98,6 +100,8 @@ MEANING: dict[str, str] = {
     "NO_GARMENT_PHOTO": "no garment photograph to render from",
     "SIZE_CHART_MISSING": "the size chart is not on the product, or the guide has none",
     "TITLE_STALE": "the title disagrees with, or omits, the record (TEXT rules)",
+    "TITLE_OFF_FORMAT": "the title is not the one the tenant's title format builds (TEXT.009)",
+    "DESCRIPTION_OFF_FORMAT": "the description's sections are not the tenant's sections (TEXT.010)",
     "RULE": "another Hermes rule blocks this product today",
 }
 

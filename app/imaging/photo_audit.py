@@ -788,7 +788,17 @@ def select_images(media: list[dict[str, Any]], pol: dict[str, Any] | None,
         photos = len(chosen)
 
     if cfg["gallery"]["enabled"]:
-        for view in cfg["gallery"]["views"]:
+        # A capture view a category configured (SIDE…, 23 Oct 2026) that has a
+        # cut-out is looked at like FRONT and BACK, right after them.
+        from app.rules.shot_sequence import is_extra_garment_view
+
+        views = list(cfg["gallery"]["views"])
+        extra = list(dict.fromkeys(
+            str(m.get("view")) for m in live
+            if is_extra_garment_view(m.get("view")) and m.get("processing") == "BG_REMOVED"))
+        at = views.index("BACK") + 1 if "BACK" in views else len(views)
+        views[at:at] = [v for v in extra if v not in views]
+        for view in views:
             if len(chosen) >= int(cfg["gallery"]["max_images"]):
                 break
             if view in _EXPECT_RENDER:

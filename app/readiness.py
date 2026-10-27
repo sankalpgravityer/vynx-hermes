@@ -126,9 +126,11 @@ _DEFAULTS: dict[str, Any] = {
         # A change to any of these this run means the title template's inputs
         # moved; the title and description are regenerated from the record.
         "trigger_fields": ["gender", "masterCategory", "category", "subCategory",
-                           "size", "color", "brand"],
+                           "size", "color", "brand", "model", "playerName",
+                           "playerNumber"],
         # Or the copy already disagrees with the record.
-        "trigger_rules": ["TEXT.002", "TEXT.003", "TEXT.006", "TEXT.007", "TEXT.008"],
+        "trigger_rules": ["TEXT.002", "TEXT.003", "TEXT.006", "TEXT.007", "TEXT.008",
+                          "TEXT.009", "TEXT.010"],
     },
     # The model's build against the garment's size (the gate's `model_build`).
     "body_size": {
