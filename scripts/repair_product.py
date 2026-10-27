@@ -754,7 +754,11 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
     # them here would report every matted view as still having a raw beside it.
     live = [m for m in media if m["mediaType"] == "IMAGE"
             and m.get("isCurrent", True) and not m.get("deletedAt")]
-    garments = [m for m in live if m["view"] in ("FRONT", "BACK", "OTHER")]
+    # FRONT/BACK/OTHER and every capture view a category configured as a product
+    # image (SIDE…, 23 Oct 2026) — vnyx-api's backfill-bg-removal cuts those out too.
+    roles = record.get("viewRoles") or {}
+    garments = [m for m in live if m["view"] in ("FRONT", "BACK", "OTHER")
+                or shot_sequence.is_extra_garment_view(m["view"], roles)]
     render_rows = [m for m in live if m["view"].startswith("AI_")]
     renders = {m["view"] for m in render_rows}
 
@@ -787,10 +791,10 @@ def needs_from(loaded: dict[str, Any]) -> dict[str, Any]:
     # visible rather than mysterious.
     leftover_raw = len([r for r in raws if r["view"] in matted_views and r not in unmatted_rows])
     # The views whose cut-out EXISTS and can therefore be judged (readiness
-    # phase 3): on its canvas, on the tenant's backdrop. FRONT/BACK only — the
-    # views generation seeds from and the matte step pays for.
+    # phase 3): on its canvas, on the tenant's backdrop. FRONT/BACK and the
+    # configured garment views — the views the matte step cuts out.
     cutout_views = sorted({m["view"] for m in garments
-                           if m["view"] in ("FRONT", "BACK") and m["processing"] != "RAW"})
+                           if shot_sequence.is_cutout_view(m["view"], roles) and m["processing"] != "RAW"})
     # Garment PHOTOGRAPHS on file — what a render is seeded from (readiness
     # phase 4). A size chart filed under OTHER is not one (imagery.is_size_chart).
     markers = [str(k).lower() for k in
@@ -1634,6 +1638,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     master_why = ("" if _readiness.enabled(policy())
                   else "disabled in policy (readiness.enabled)")
     step("master", master_why, _master)
+
+    def _view_roles() -> dict[str, str]:
+        """Capture view -> role, as the loader read it (configured views, 23 Oct 2026)."""
+        return (state.get("loaded") or {}).get("record", {}).get("viewRoles") or {}
 
     # ---- 1. matte ---------------------------------------------------------
     #
@@ -2782,7 +2790,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 "--replace", "--keep-better"]
         # Only the views the audit named: with the paid methods, re-cutting a sound
         # view is a bill for nothing.
-        named = [v for v in views if v in ("FRONT", "BACK")]
+        named = [v for v in views if shot_sequence.is_cutout_view(v, _view_roles())]
         if named and remote_supports("matteViews"):
             args.extend(["--views", ",".join(named)])
         if plan:
@@ -2962,7 +2970,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         if first.action != "bad":
             return _ci.summary(first)
 
-        views = [v for v in dict.fromkeys(b.split()[0] for b in first.bad_views) if v in ("FRONT", "BACK")]
+        views = [v for v in dict.fromkeys(b.split()[0] for b in first.bad_views)
+                 if shot_sequence.is_cutout_view(v, _view_roles())]
         cfg = _ci.config(policy())
         found = "; ".join(first.reasons)
         why_not = ""
@@ -2971,7 +2980,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         elif skip_matte:
             why_not = "--no-matte"
         elif not views:
-            why_not = "no FRONT/BACK view to re-cut"
+            why_not = "no FRONT/BACK or configured garment view to re-cut"
         elif not remote_supports("keepBetter"):
             why_not = "this vnyx-api cannot take --keep-better"
         if why_not:
@@ -3385,6 +3394,60 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                  else "disabled in policy (readiness.gallery)")
     step("order", order_why, _order)
 
+    # ---- 4d'. shoe model -------------------------------------------------
+    #
+    # A SHOE'S MODEL NAME (26 Oct 2026). The bulk extractor answers `model` among
+    # seventeen fields and plays safe: BOA-007064, a Stüssy x Nike Air Zoom
+    # Spiridon Kukini Cage 2 recognisable from its cage and tongue logo alone,
+    # came back with model "" at 0%. The resale identifier asks the one question
+    # — what shoe is this, as StockX names it — and is far better at it. Only
+    # an EMPTY model is filled, never one a person or the extractor wrote, and
+    # only at the identifier's own `min_confidence`. The copy step below then
+    # rebuilds the title and description because `model` changed.
+    shoe_model_report: dict[str, Any] = {}
+
+    def _shoe_model() -> str:
+        from app.pricing import resale_lookup as _rl
+
+        fresh = needs(dsn, product_id)["loaded"]
+        got = _rl.shoe_model(fresh, str(shoe_cfg.get("min_confidence") or "high"))
+        shoe_model_report.update(got)
+        if got["error"]:
+            raise StepFailed(f'could not identify the shoe — {got["error"]}')
+        if not got["accepted"]:
+            return (f'not confident enough to write ({got["confidence"] or "no"} confidence'
+                    + (f', guessed "{got["model_name"]}"' if got["model_name"] else "")
+                    + f'; needs {shoe_cfg.get("min_confidence") or "high"})')
+        if apply:
+            outcome = product_audit.apply_plan(
+                dsn, product_id,
+                [{"kind": "set_property", "field": "model", "value": got["model_name"],
+                  "reason": "SHOE_MODEL"}],
+                fresh["record"].get("updatedAt"))
+            if outcome["conflict"]:
+                raise StepFailed(outcome.get("message", "changed mid-repair"))
+            if outcome["skipped"]:
+                raise StepFailed("; ".join(s.get("why", "?") for s in outcome["skipped"]))
+        return (("" if apply else "would ") + f'set model "{got["model_name"]}" '
+                f'({got["confidence"]} confidence'
+                + (f', style code {got["article_code"]}' if got["article_code"] else "")
+                + f', ${got["cost_usd"]})')
+
+    shoe_cfg = (_rd.config(policy()).get("shoe_model") or {})
+    _rec = state["loaded"]["record"]
+    from app.rules.imagery import is_footwear as _is_footwear
+
+    if not shoe_cfg.get("enabled", True):
+        shoe_why = "disabled in policy (readiness.shoe_model)"
+    elif not _is_footwear(_rec.get("masterCategory"), _rec.get("category"),
+                          _rec.get("subCategory")):
+        shoe_why = "not footwear"
+    elif str(_rec.get("model") or "").strip():
+        shoe_why = f'model already set ("{_rec.get("model")}")'
+    else:
+        shoe_why = ""
+    step("shoe model", shoe_why, _shoe_model)
+
     # ---- 4e. copy ---------------------------------------------------------
     #
     # THE TITLE AND DESCRIPTION, FROM THE SETTLED RECORD (readiness phase 5,
@@ -3426,7 +3489,15 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         from app.rules.consistency import check_copy
 
         why = ", ".join([*(f"{f} changed" for f in copy_report["changed"]), *copy_report["rules"]])
-        ok, _, payload = run_step(vnyx_api, "regenerate-copy.ts", [*common, *live],
+        # ONE HALF when only one is off: TEXT.009 alone is the title not
+        # matching the tenant's format (no model call to rebuild it), TEXT.010
+        # alone is the description's sections. Anything else rewrites both.
+        triggers = set(copy_report["triggers"])
+        half = (["--title"] if triggers == {"TEXT.009"}
+                else ["--description"] if triggers == {"TEXT.010"} else [])
+        what = {"--title": "title", "--description": "description"}.get(
+            half[0] if half else "", "title and description")
+        ok, _, payload = run_step(vnyx_api, "regenerate-copy.ts", [*common, *live, *half],
                                   timeout_s=180, quiet=quiet, results_name="copy.json")
         if payload is None:
             raise StepFailed("regenerate-copy.ts returned no result"
@@ -3435,7 +3506,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             raise StepFailed(f'{payload.get("outcome") or "failed"}: '
                              f'{payload.get("error") or ", ".join(payload.get("failed") or []) or "no detail"}')
         if not apply:
-            return f"would regenerate title and description ({why})"
+            expected = (payload.get("title") or {}).get("expected")
+            return (f"would regenerate {what} ({why})"
+                    + (f' — title would be "{expected}"' if expected and half != ["--description"] else ""))
         copy_report["ran"] = True
         title = payload.get("title") or {}
         copy_report["title_before"], copy_report["title_after"] = title.get("before"), title.get("after")
@@ -3444,8 +3517,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         after = sorted({f.rule_id for f in check_copy(_snapshot_now(), policy())
                         if f.rule_id.startswith("TEXT.")})
         copy_report["rules_after"] = after
-        return (f'regenerated title and description ({why}) — title now '
-                f'"{title.get("after")}"; TEXT rules after: {", ".join(after) or "clean"}')
+        return (f'regenerated {what} ({why}) — title now '
+                f'"{title.get("after") or title.get("before")}"; '
+                f'TEXT rules after: {", ".join(after) or "clean"}')
 
     if not (_rd.config(policy()).get("copy") or {}).get("enabled", True):
         copy_why = "disabled in policy (readiness.copy)"

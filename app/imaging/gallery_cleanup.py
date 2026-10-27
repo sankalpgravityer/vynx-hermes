@@ -72,8 +72,16 @@ def live(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [r for r in rows if not r.get("deletedAt") and r["id"] not in sources]
 
 
+def _garment_view(view: Any) -> bool:
+    """FRONT/BACK/OTHER, or a capture view a category configured (SIDE…, 23 Oct 2026) —
+    only a garment view is ever cut out, so a cut row under one is a garment cut-out."""
+    from app.rules.shot_sequence import is_extra_garment_view
+
+    return view in GARMENT or is_extra_garment_view(view)
+
+
 def is_cutout(row: dict[str, Any]) -> bool:
-    return row.get("view") in GARMENT and row.get("processing") in CUT
+    return _garment_view(row.get("view")) and row.get("processing") in CUT
 
 
 def legacy_duplicates(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -144,7 +152,7 @@ def listing_cutouts(rows: list[dict[str, Any]], sent: list[str]) -> list[dict[st
     in_cache = set(sent or [])
     shown = [r for r in keep if r.get("url") in in_cache]
     covered = {r.get("view") for r in shown}
-    extra = [r for r in keep if r not in shown and r.get("view") in ("FRONT", "BACK")
+    extra = [r for r in keep if r not in shown and r.get("view") != "OTHER"
              and r.get("view") not in covered]
     return [*shown, *extra]
 

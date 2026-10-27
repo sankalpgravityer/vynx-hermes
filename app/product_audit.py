@@ -87,7 +87,7 @@ from psycopg.types.json import Jsonb
 from app import approval
 from app.config import ROOT
 from app.rules import gate as _gate
-from app.rules import shot_sequence
+from app.rules import shot_sequence, title_template
 
 log = logging.getLogger("hermes.product-audit")
 
@@ -113,6 +113,8 @@ PROPERTY_ALIASES: dict[str, tuple[str, ...]] = {
     "fit": ("fit",),
     "condition": ("condition",),
     "model": ("model",),
+    "playerName": ("player_name", "playerName"),
+    "playerNumber": ("player_number", "playerNumber"),
     "supplier": ("supplier",),
     "sizeType": ("size_type", "sizeType"),
     "productType": ("producttype", "product_type", "productType"),
@@ -347,7 +349,11 @@ SELECT id::text, url, view::text, origin::text, processing::text, "mediaType"::t
  WHERE "productId" = %s::uuid
    AND "deletedAt" IS NULL
    AND ("isCurrent" = true
-        OR (processing = 'RAW' AND view IN ('FRONT', 'BACK', 'OTHER')))
+        OR (processing = 'RAW'
+            -- FRONT/BACK/OTHER and any configured capture view (SIDE…, 23 Oct 2026):
+            -- every garment photo's archived original, never a label/chart/render.
+            AND view::text NOT IN ('LABEL', 'SIZE_CHART', 'VIDEO_TURNTABLE')
+            AND view::text NOT LIKE 'AI\\_%%'))
  ORDER BY "isCurrent" DESC, position
 """
 
@@ -450,6 +456,31 @@ SELECT s.shots, c.name, p.name, g.name
  WHERE s."tenantId" = %s::uuid
 """
 
+# Defaults first, then overrides — the order allViewRoleEntries reads them in,
+# so the first role a view key gets is the same one vnyx-api keeps.
+VIEW_ROLE_SETTINGS_SQL = """
+SELECT settings FROM (
+  SELECT settings, 0 AS tier, "createdAt" FROM "CategorySettingsDefault"
+  UNION ALL
+  SELECT settings, 1 AS tier, "createdAt" FROM "CategorySettings"
+) s ORDER BY tier, "createdAt"
+"""
+
+COPY_SETTINGS_SQL = """
+SELECT "titleTemplate", sections
+  FROM "DescriptionSettings"
+ WHERE "tenantId" = %s::uuid
+"""
+
+TITLE_OVERRIDES_SQL = """
+SELECT o.template, c.name, p.name, g.name
+  FROM "TitleTemplateOverride" o
+  JOIN "Category" c ON c.id = o."categoryId" AND c."deletedAt" IS NULL
+  LEFT JOIN "Category" p ON p.id = c."parentId"
+  LEFT JOIN "Category" g ON g.id = p."parentId"
+ WHERE o."tenantId" = %s::uuid
+"""
+
 # The tenant's working vocabulary: which subcategory values its live products
 # actually carry, and how often. The tree says what MAY be chosen; this says what
 # IS chosen, and when a title names two valid options the planner prefers the
@@ -545,6 +576,37 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
     except psycopg.Error:
         shot_overrides = []
 
+    # THE TENANT'S COPY FORMAT (26 Oct 2026): Settings → Title & Description —
+    # the title format, its category overrides, and the description sections.
+    # Same savepoint reasoning: a database without the tables loads with no
+    # format, and the copy rules stay silent.
+    copy_settings: dict[str, Any] = {"title_template": None, "title_overrides": [],
+                                     "sections": None}
+    try:
+        with cur.connection.transaction():
+            cur.execute(COPY_SETTINGS_SQL, (tenant_id,))
+            settings_row = cur.fetchone()
+            cur.execute(TITLE_OVERRIDES_SQL, (tenant_id,))
+            copy_settings = {
+                "title_template": settings_row[0] if settings_row else None,
+                "sections": settings_row[1] if settings_row else None,
+                "title_overrides": title_template.override_candidates(cur.fetchall()),
+            }
+    except psycopg.Error:
+        pass
+
+    # CAPTURE VIEW ROLES (23 Oct 2026): what a configured view (SIDE, SHOEXSIDE…)
+    # is — a garment photo or reference material — from every tenant's Category
+    # Settings, as vnyx-api's process-wide refreshViewRoles reads them. Same
+    # savepoint reasoning; without the tables every such view is a garment photo.
+    roles: dict[str, str] = {}
+    try:
+        with cur.connection.transaction():
+            cur.execute(VIEW_ROLE_SETTINGS_SQL)
+            roles = shot_sequence.view_roles(r[0] for r in cur.fetchall())
+    except psycopg.Error:
+        roles = {}
+
     categories: dict[str, dict[str, list[str]]] = {}
     for path, depth in paths:
         parts = path.split(">")
@@ -600,6 +662,8 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
         # Kept whole so the chart state can resolve a guide by id.
         "guides": guides,
         "shot_overrides": shot_overrides,
+        "copy_settings": copy_settings,
+        "view_roles": roles,
     }
 
 
@@ -714,6 +778,18 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
         category=category, sub_category=sub_category,
         master_category=master_category, mannequin_type=mannequin,
     )
+    # THE TITLE THE TENANT'S FORMAT PRODUCES for this product, and the sections
+    # its description must carry — read by TEXT.009 / TEXT.010.
+    copy_settings = ctx.get("copy_settings") or {}
+    copy_format = title_template.resolve(
+        default_template=copy_settings.get("title_template"),
+        overrides=copy_settings.get("title_overrides") or [],
+        sections=copy_settings.get("sections"),
+        props=props, brand_relation=brand_relation, category=category,
+        sub_category=sub_category, master_category=master_category,
+        mannequin_type=mannequin, sizing_guide=sizing_guide,
+        international_size=international_size, sku=sku,
+    )
     # What is ON the product. The archived originals ride along in `media` for
     # the cut-out pairing (see MEDIA_SQL) and count as nothing here.
     live_rows = [m for m in media if m["isCurrent"]]
@@ -803,6 +879,8 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
         "fit": read_property(props, "fit"),
         "condition": read_property(props, "condition"),
         "model": read_property(props, "model"),
+        "playerName": read_property(props, "playerName"),
+        "playerNumber": read_property(props, "playerNumber"),
         "supplier": read_property(props, "supplier"),
         "brandRelation": brand_relation,
 
@@ -824,6 +902,10 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
         "imageSettings": image_settings if isinstance(image_settings, dict) else {},
         # Which renders the product gets, how many, and the gallery order.
         "shotSequence": sequence.as_dict(),
+        # Settings → Title & Description, resolved for this product.
+        "copyFormat": copy_format,
+        # Capture view -> role, for views outside the legacy eleven.
+        "viewRoles": ctx.get("view_roles") or {},
         "createdAt": created_at.isoformat() if created_at else None,
         "updatedAt": updated_at.isoformat() if updated_at else None,
 
@@ -897,7 +979,11 @@ SELECT "productId"::text, id::text, url, view::text, origin::text, processing::t
  WHERE "productId" = ANY(%s::uuid[])
    AND "deletedAt" IS NULL
    AND ("isCurrent" = true
-        OR (processing = 'RAW' AND view IN ('FRONT', 'BACK', 'OTHER')))
+        OR (processing = 'RAW'
+            -- FRONT/BACK/OTHER and any configured capture view (SIDE…, 23 Oct 2026):
+            -- every garment photo's archived original, never a label/chart/render.
+            AND view::text NOT IN ('LABEL', 'SIZE_CHART', 'VIDEO_TURNTABLE')
+            AND view::text NOT LIKE 'AI\\_%%'))
  ORDER BY "productId", "isCurrent" DESC, position
 """
 

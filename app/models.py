@@ -325,6 +325,13 @@ class ProductSnapshot(BaseModel):
     # It says which renders the product gets, how many, and the gallery order;
     # see app/rules/shot_sequence.py. None: the fixed views, as before.
     shot_sequence: dict[str, Any] | None = None
+    # Settings → Title & Description resolved for this product (26 Oct 2026) —
+    # `{expectedTitle, titleSource, matchedCategory, sections}`; see
+    # app/rules/title_template.py. None: not supplied, TEXT.009/010 stay silent.
+    copy_format: dict[str, Any] | None = None
+    # Capture view -> role (GARMENT / REFERENCE) for the views a tenant configured
+    # in Category Settings (23 Oct 2026). Empty: every such view is a garment photo.
+    view_roles: dict[str, str] = Field(default_factory=dict)
 
     # sidecars
     confidence: dict[str, float] = Field(default_factory=dict)

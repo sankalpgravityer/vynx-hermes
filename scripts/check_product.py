@@ -79,6 +79,8 @@ STEP_FIX: dict[str, tuple[str | None, str]] = {
     "TEXT.006": ("copy", "regenerate the title and description from the record"),
     "TEXT.007": ("copy", "regenerate the title and description from the record"),
     "TEXT.008": ("copy", "regenerate the title and description from the record"),
+    "TEXT.009": ("copy", "rebuild the title from the tenant's title format"),
+    "TEXT.010": ("copy", "rewrite the description with the tenant's sections"),
     "TEXT.004": ("extract", "write the description from the care label and cut-outs"),
     "PRICE.001": ("price", "clamp the selling price to the grade's window"),
     "PRICE.002": ("price", "clamp the selling price to the grade's window"),

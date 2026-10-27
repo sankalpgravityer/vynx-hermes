@@ -109,12 +109,23 @@ def live_media(p: ProductSnapshot) -> list[MediaAsset]:
 
 
 def garment_photos(p: ProductSnapshot, pol: dict[str, Any]) -> list[MediaAsset]:
-    """The photographs generation is seeded from and matting applies to."""
+    """The photographs generation is seeded from and matting applies to: `garment_views`
+    plus every CAPTURE VIEW a category configured as a product image (SIDE…, 23 Oct 2026),
+    which vnyx-api cuts out like FRONT and BACK."""
     views = set(_cfg(pol).get("garment_views") or [])
     return [
         m for m in live_media(p)
-        if m.view in views and not is_size_chart(m.url, pol)
+        if (m.view in views or shot_sequence.is_extra_garment_view(m.view, p.view_roles))
+        and not is_size_chart(m.url, pol)
     ]
+
+
+def cutout_views(p: ProductSnapshot, pol: dict[str, Any]) -> set[str]:
+    """The views whose cut-outs are judged and re-cut: `matte_views` (FRONT/BACK) plus the
+    product's configured garment views."""
+    base = set(_cfg(pol).get("matte_views") or ["FRONT", "BACK"])
+    return base | {m.view for m in live_media(p)
+                   if shot_sequence.is_extra_garment_view(m.view, p.view_roles)}
 
 
 def ai_renders(p: ProductSnapshot) -> list[MediaAsset]:
@@ -226,7 +237,7 @@ def cutout_pairs(
     across views, and a cut-out filed under OTHER is not a FRONT (see
     `orphan_cutouts`).
     """
-    views = set(_cfg(pol).get("matte_views") or ["FRONT", "BACK"])
+    views = cutout_views(p, pol)
     by_id = {m.id: m for m in p.media if m.id}
     cutouts = [m for m in garment_photos(p, pol)
                if m.view in views and m.processing != "RAW"]
@@ -576,13 +587,16 @@ def gallery_enabled(pol: dict[str, Any] | None) -> bool:
     return readiness.enabled(pol) and bool(gallery_config(pol).get("enabled", True))
 
 
-def gallery_key(m: MediaAsset, pol: dict[str, Any] | None) -> tuple[int, ...]:
-    """vnyx-api's compareForDisplay, as a sort key."""
+def gallery_key(m: MediaAsset, pol: dict[str, Any] | None,
+                roles: dict[str, str] | None = None) -> tuple[int, ...]:
+    """vnyx-api's compareForDisplay, as a sort key. A configured capture view (SIDE…) sits in
+    its role's band and just after OTHER (bandRank / viewRank, 23 Oct 2026)."""
     origins = [str(o).upper() for o in (gallery_config(pol).get("origin_order") or [])]
     origin = str(m.origin or "").upper()
     origin_rank = origins.index(origin) if origin in origins else len(origins)
-    band = _GALLERY_BAND.get(m.view, 5)
-    view = _GALLERY_VIEW_RANK.get(m.view, 99)
+    band = (_GALLERY_BAND[m.view] if m.view in _GALLERY_BAND
+            else {"RENDER": 0, "REFERENCE": 3}.get(shot_sequence.role_of(m.view, roles), 1))
+    view = _GALLERY_VIEW_RANK.get(m.view, 12)
     inner = (origin_rank, view) if band == _GARMENT_BAND else (view, origin_rank)
     return (0 if m.processing != "RAW" else 1, band, *inner, m.position)
 
@@ -603,8 +617,9 @@ def gallery_order(p: ProductSnapshot, pol: dict[str, Any] | None) -> list[MediaA
     resolved = sequence_of(p, pol)
     if resolved is not None:
         origins = [str(o).upper() for o in (gallery_config(pol).get("origin_order") or [])] or None
-        return shot_sequence.display_order(live_media(p), resolved.lines, origins)
-    return sorted(live_media(p), key=lambda m: gallery_key(m, pol))
+        return shot_sequence.display_order(live_media(p), resolved.lines, origins,
+                                           roles=p.view_roles)
+    return sorted(live_media(p), key=lambda m: gallery_key(m, pol, p.view_roles))
 
 
 def gallery_divergence(actual_urls: list[str],
