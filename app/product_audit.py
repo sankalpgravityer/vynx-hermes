@@ -157,6 +157,8 @@ _PROPERTY_KEYS: dict[str, str] = {
     "fit": "fit",
     "condition": "condition",
     "model": "model",
+    "player_name": "player_name",
+    "player_number": "player_number",
     "supplier": "supplier",
 }
 
@@ -456,6 +458,11 @@ SELECT s.shots, c.name, p.name, g.name
  WHERE s."tenantId" = %s::uuid
 """
 
+TENANT_PROPERTY_KEYS_SQL = 'SELECT key FROM "Property" WHERE "tenantId" = %s::uuid'
+DEFAULT_PROPERTY_LIST_SQL = """
+SELECT settings->'properties' FROM "CategorySettingsDefault" WHERE "tenantId" = %s::uuid
+"""
+
 # Defaults first, then overrides — the order allViewRoleEntries reads them in,
 # so the first role a view key gets is the same one vnyx-api keeps.
 VIEW_ROLE_SETTINGS_SQL = """
@@ -595,6 +602,23 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
     except psycopg.Error:
         pass
 
+    # THE TENANT'S PROPERTY KEYS and its default Category Properties list
+    # (27 Oct 2026): the chain's `player` step writes `player_name` /
+    # `player_number` only for a tenant that owns them — the analyzer never asks
+    # for a property the tenant lacks, and a list that leaves one out narrows it
+    # away. Savepoint: a database without the settings table has no list.
+    property_keys: list[str] = []
+    property_list: list[str] | None = None
+    try:
+        with cur.connection.transaction():
+            cur.execute(TENANT_PROPERTY_KEYS_SQL, (tenant_id,))
+            property_keys = [r[0] for r in cur.fetchall() if r[0]]
+            cur.execute(DEFAULT_PROPERTY_LIST_SQL, (tenant_id,))
+            row = cur.fetchone()
+            property_list = list(row[0]) if row and isinstance(row[0], list) else None
+    except psycopg.Error:
+        pass
+
     # CAPTURE VIEW ROLES (23 Oct 2026): what a configured view (SIDE, SHOEXSIDE…)
     # is — a garment photo or reference material — from every tenant's Category
     # Settings, as vnyx-api's process-wide refreshViewRoles reads them. Same
@@ -664,6 +688,8 @@ def load_tenant_context(cur, tenant_id: str) -> dict[str, Any]:
         "shot_overrides": shot_overrides,
         "copy_settings": copy_settings,
         "view_roles": roles,
+        "property_keys": property_keys,
+        "property_list": property_list,
     }
 
 
@@ -906,6 +932,10 @@ def build(row: tuple, variant: tuple | None, placement: tuple,
         "copyFormat": copy_format,
         # Capture view -> role, for views outside the legacy eleven.
         "viewRoles": ctx.get("view_roles") or {},
+        # The tenant's own property keys, and its default Category Properties
+        # list (None: no list, every key applies) — read by the `player` step.
+        "tenantPropertyKeys": ctx.get("property_keys") or [],
+        "defaultPropertyList": ctx.get("property_list"),
         "createdAt": created_at.isoformat() if created_at else None,
         "updatedAt": updated_at.isoformat() if updated_at else None,
 
