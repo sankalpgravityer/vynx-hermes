@@ -1672,6 +1672,17 @@ readiness:
   shoe_model:
     enabled: true
     min_confidence: high
+  # The chain's `player` step (27 Oct 2026): a jersey whose player_name /
+  # player_number are empty gets them read off its back and front photographs
+  # (Gemini, OpenAI on an outage; one cached vision call). Only for a tenant
+  # that owns the properties; never overwrites; moves a player name the
+  # extractor filed under `model`. The copy step then rebuilds the title and
+  # description, and sync pushes it. `garments`: words in the category or
+  # subcategory that make a product worth asking about.
+  player:
+    enabled: true
+    min_confidence: 85
+    garments: [jersey, tank, t-shirt, tee, shirt, top, polo, hoodie, sweat]
   copy:
     enabled: true
     # The `copy` step regenerates the title and description from the CURRENT

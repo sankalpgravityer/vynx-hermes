@@ -3394,6 +3394,109 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                  else "disabled in policy (readiness.gallery)")
     step("order", order_why, _order)
 
+    # ---- 4d''. player -----------------------------------------------------
+    #
+    # A JERSEY'S PLAYER (27 Oct 2026). Products generated before the tenant had
+    # `player_name` / `player_number` carry neither, and some carry the name in
+    # `model` instead (TST-000078: model "Harden" on a Rockets #13), so the title
+    # format's Player chips stay empty and the title never names the player.
+    # The bulk extractor is not re-run on an approved product, so this reads the
+    # lettering off the back and front photographs (app/llm/player_print) and
+    # writes what it reads at `min_confidence` — only for a tenant that owns the
+    # properties, only into fields that are EMPTY, and it moves a player name out
+    # of `model`. The copy step below then rebuilds the title and description
+    # (playerName / playerNumber / model are its trigger fields), and the sync
+    # step pushes the product to Shopify.
+    player_report: dict[str, Any] = {}
+    player_cfg = (_rd.config(policy()).get("player") or {})
+    # Fields a DRY RUN's player / shoe-model step would have written: the copy
+    # step's trigger reads them, so a preview shows the copy that would follow.
+    planned_fields: set[str] = set()
+
+    def _alnum(text: Any) -> str:
+        return "".join(ch for ch in str(text or "").lower() if ch.isalnum())
+
+    def _player_photos(loaded: dict[str, Any]) -> list[str]:
+        """BACK first (the lettering), then FRONT; the photograph before its cut-out."""
+        out: list[str] = []
+        for view in ("BACK", "FRONT"):
+            rows = [m for m in loaded["media"] if m.get("view") == view and m.get("url")
+                    and (m.get("mediaType") or "IMAGE") == "IMAGE" and not m.get("deletedAt")]
+            rows.sort(key=lambda m: (0 if m.get("processing") == "RAW" else 1,
+                                     0 if m.get("isCurrent", True) else 1))
+            if rows:
+                out.append(rows[0]["url"])
+        return out
+
+    def _player() -> str:
+        from app.llm import player_print
+
+        fresh = needs(dsn, product_id)["loaded"]
+        rec = fresh["record"]
+        got = player_print.read(_player_photos(fresh),
+                                min_confidence=int(player_cfg.get("min_confidence") or 85))
+        player_report.update(got)
+        if got.get("unavailable") and not got.get("provider"):
+            vision_unavailable.append("player")
+        if got.get("error"):
+            raise StepFailed(got["error"])
+        found = {k: got[k] for k in player_keys
+                 if got.get(k) and not str(rec.get(_PLAYER_FIELD[k]) or "").strip()}
+        if not found:
+            rejected = got.get("rejected") or {}
+            return ("no player lettering read"
+                    + (f" (below {player_cfg.get('min_confidence') or 85}%: {rejected})" if rejected else "")
+                    + (f' — {got.get("team")} shirt' if got.get("team") else ""))
+        plan = [{"kind": "set_property", "field": k, "value": v, "reason": "PLAYER_PRINT"}
+                for k, v in found.items()]
+        # The name the extractor filed under `model` before these fields existed.
+        model = str(rec.get("model") or "").strip()
+        name = got.get("player_name") or ""
+        moved = bool(model and name and _alnum(model) in {
+            _alnum(name), _alnum(f'{name}{got.get("player_number") or ""}')})
+        if moved:
+            plan.append({"kind": "set_property", "field": "model", "value": "",
+                         "reason": "PLAYER_PRINT"})
+        if apply:
+            outcome = product_audit.apply_plan(dsn, product_id, plan, rec.get("updatedAt"))
+            if outcome["conflict"]:
+                raise StepFailed(outcome.get("message", "changed mid-repair"))
+            if outcome["skipped"]:
+                raise StepFailed("; ".join(s.get("why", "?") for s in outcome["skipped"]))
+        else:
+            planned_fields.update(_PLAYER_FIELD[k] for k in found)
+            if moved:
+                planned_fields.add("model")
+        return (("" if apply else "would ") + "set "
+                + ", ".join(f'{k}={v!r}' for k, v in found.items())
+                + (f' and cleared model {model!r} (the player, not a model)' if moved else "")
+                + f' (read by {got.get("provider")})')
+
+    _PLAYER_FIELD = {"player_name": "playerName", "player_number": "playerNumber"}
+    _prec = state["loaded"]["record"]
+    _plist = _prec.get("defaultPropertyList")
+    player_keys = [k for k in _PLAYER_FIELD
+                   if k in (_prec.get("tenantPropertyKeys") or [])
+                   and (_plist is None or k in _plist)]
+    _garment = f'{_prec.get("category") or ""} {_prec.get("subCategory") or ""}'.lower()
+    _kinds = [str(w).lower() for w in (player_cfg.get("garments") or [])]
+    from app.rules.imagery import is_footwear as _is_fw
+
+    if not player_cfg.get("enabled", True):
+        player_why = "disabled in policy (readiness.player)"
+    elif not player_keys:
+        player_why = ("the tenant has no player_name / player_number property, or its default "
+                      "Category Properties list leaves them out")
+    elif _is_fw(_prec.get("masterCategory"), _prec.get("category"), _prec.get("subCategory")):
+        player_why = "footwear"
+    elif _kinds and not any(w in _garment for w in _kinds):
+        player_why = "not a jersey-type garment (readiness.player.garments)"
+    elif all(str(_prec.get(_PLAYER_FIELD[k]) or "").strip() for k in player_keys):
+        player_why = "player already set"
+    else:
+        player_why = ""
+    step("player", player_why, _player)
+
     # ---- 4d'. shoe model -------------------------------------------------
     #
     # A SHOE'S MODEL NAME (26 Oct 2026). The bulk extractor answers `model` among
@@ -3428,6 +3531,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                 raise StepFailed(outcome.get("message", "changed mid-repair"))
             if outcome["skipped"]:
                 raise StepFailed("; ".join(s.get("why", "?") for s in outcome["skipped"]))
+        else:
+            planned_fields.add("model")
         return (("" if apply else "would ") + f'set model "{got["model_name"]}" '
                 f'({got["confidence"]} confidence'
                 + (f', style code {got["article_code"]}' if got["article_code"] else "")
@@ -3476,7 +3581,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         fresh = needs(dsn, product_id)["loaded"]
         now_rec = fresh["record"]
         changed = [f for f in (cfg.get("trigger_fields") or [])
-                   if _norm(before_rec.get(f)) != _norm(now_rec.get(f))]
+                   if _norm(before_rec.get(f)) != _norm(now_rec.get(f))
+                   or (not apply and f in planned_fields)]
         from app.vnyx_client import to_snapshot
 
         snap = to_snapshot({**now_rec, "media": fresh["media"]}, catalog=fresh.get("catalog"),
@@ -3507,6 +3613,11 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
                              f'{payload.get("error") or ", ".join(payload.get("failed") or []) or "no detail"}')
         if not apply:
             expected = (payload.get("title") or {}).get("expected")
+            # The script built `expected` from the STORED record; with fields an
+            # earlier step only planned (dry run) that title is the old one.
+            if planned_fields:
+                return (f"would regenerate {what} ({why}) — the title is rebuilt from the "
+                        f"tenant's format once {', '.join(sorted(planned_fields))} are written")
             return (f"would regenerate {what} ({why})"
                     + (f' — title would be "{expected}"' if expected and half != ["--description"] else ""))
         copy_report["ran"] = True
