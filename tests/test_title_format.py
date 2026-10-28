@@ -103,3 +103,24 @@ def test_text010_missing_and_extra_sections():
     hit = rules("t", "<h2>Product Details</h2><h2>Shipping</h2>", cf)["TEXT.010"]
     assert hit.detail["missing"] == ["Size & Fit"]
     assert hit.detail["extra"] == ["shipping"]
+
+
+# ---- TEXT.003: the size a title advertises (28 Oct 2026) ----------------------
+
+def size_rule(title, size):
+    snap = to_snapshot({"id": "p", "title": title, "size": size, "summary": "<p>x</p>",
+                        "brand": "x", "color": "x", "subCategory": "x"})
+    return [f for f in check_copy(snap, policy()) if f.rule_id == "TEXT.003"]
+
+
+def test_text003_ignores_digits_inside_a_code_or_model():
+    assert not size_rule("ModeQueen MQ1263 Black / Red Women 37", "37")   # KLE-002772
+    assert not size_rule("Vintage Levi's 501 Blue Jeans Men 32", "32")
+
+
+def test_text003_waist_and_length_both_in_the_title():
+    assert not size_rule("Vintage Levi's Blue Jeans Men 32 34", "32")
+
+
+def test_text003_still_fires_on_a_real_mismatch():
+    assert size_rule("Vintage Levi's Blue Jeans Men 34", "32")

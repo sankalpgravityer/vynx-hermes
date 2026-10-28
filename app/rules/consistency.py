@@ -14,6 +14,8 @@ from typing import Any
 from app.models import Finding, ProductSnapshot, Severity
 
 _NUM = re.compile(r"(\d+)")
+# A number that is a word of its own — not the digits inside "MQ1263" or "501XX".
+_STANDALONE_NUM = re.compile(r"(?<![A-Za-z0-9])(\d{1,3})(?![A-Za-z0-9])")
 
 # A rig value that means "none chosen" — approve-products.ts's PLACEHOLDER set.
 _RIG_PLACEHOLDERS = {"", "unknown", "n/a", "na", "none", "null", "-", "tbd"}
@@ -728,14 +730,19 @@ def check_copy(p: ProductSnapshot, pol: dict[str, Any]) -> list[Finding]:
                 detail={"token": token, "stem": stem},
             ))
 
-    size_in_title = _int(title)
+    # TEXT.003 — a number in the title that is not the size. STANDALONE numbers
+    # only (28 Oct 2026): the first digit run of "ModeQueen MQ1263 … Women 37" was
+    # the style code's 1263, and "Levi's 501 Blue Jeans Men 32" read as size 501.
+    # The title advertises the size when ANY standalone number in it is the size
+    # ("Jeans Men 32 34" is waist then length).
+    title_numbers = [int(n) for n in _STANDALONE_NUM.findall(title)]
     size_field = _int(p.size) or _int(p.waist)
-    if size_in_title and size_field and size_in_title != size_field:
+    if title_numbers and size_field and size_field not in title_numbers:
         out.append(Finding(
             rule_id="TEXT.003", severity=Severity.HIGH, fields=["title", "size"],
-            message=f"Title advertises size {size_in_title} but the size field "
+            message=f"Title advertises size {title_numbers[-1]} but the size field "
                     f"says {size_field}.",
-            detail={},
+            detail={"title_numbers": title_numbers},
         ))
 
     # TEXT.008 — the title CONTRADICTS the record (readiness phase 5).

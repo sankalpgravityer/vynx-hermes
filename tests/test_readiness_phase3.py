@@ -1587,7 +1587,11 @@ def test_settle_runs_reconcile_again_when_the_rig_still_disagrees(wired, monkeyp
     r = _repair(apply=True)
     step = next(s for s in r["steps"] if s["step"] == "settle")
     assert step["ran"] and "TAX.005" in step["note"]
-    assert len(seen) == 2                                  # reconcile, then settle
+    # reconcile, then once more BEFORE the renders (presettle, 28 Oct 2026 — so a
+    # re-render is drawn on the settled rig), then settle after them.
+    pre = next(s for s in r["steps"] if s["step"] == "presettle")
+    assert pre["ran"] and "TAX.005" in pre["note"]
+    assert len(seen) == 3
     assert not any("--render-gender" in a for a in seen[1:])
 
 

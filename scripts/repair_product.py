@@ -3052,6 +3052,49 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         cutcheck_why = ""
     step("cutcheck", cutcheck_why, _cutcheck)
 
+    SETTLE_RULES = {"TAX.003", "TAX.004", "TAX.005", "TAX.007", "SIZE.002", "SIZE.011",
+                    "SIZE.013", "SIZE.014", "SIZE.015", "SIZE.016", "SIZE.017", "DRIFT.001",
+                    "DATA.010"}
+    settle_rules: list[str] = []
+
+    def _settle_needed() -> list[str]:
+        from app import approval
+
+        fresh = needs(dsn, product_id)["loaded"]
+        gate = approval.run_gate({**fresh["record"], "media": fresh["media"]},
+                                 catalog=fresh.get("catalog"),
+                                 imagery_settings=fresh.get("imagery_settings"),
+                                 llm=None, severity_overrides=severity_overrides)
+        blocking = {f.get("rule_id") for f in gate.get("blocking") or []}
+        writes = {a.get("reason") for a in gate.get("repair_plan") or []
+                  if a.get("kind") in ("set_column", "set_property", "create_size_chart")}
+        return sorted(blocking & SETTLE_RULES & writes)
+
+    # ---- 4c-. settle before the renders -----------------------------------
+    #
+    # A RE-FILE THIS RUN MUST REACH THE RIG BEFORE ANYTHING IS RENDERED (28 Oct
+    # 2026). KLE-002772, heels filed as Jeans: reconcile moved it to Shoes >
+    # Heels, but its mannequin ("Bottom") and size chart followed only in the
+    # settle step AFTER regen — so the re-render was drawn on a bottoms rig and
+    # came back as trousers again. When reconcile ran and the record still
+    # disagrees with its own category (mannequin, chart, path), reconcile runs
+    # once more here, before regen; settle below still checks after the renders.
+    def _presettle() -> str:
+        return f"{', '.join(presettle_rules)} open before the renders — {_reconcile({})}"
+
+    presettle_rules: list[str] = []
+    if not apply:
+        presettle_why = "dry run"
+    elif "reconcile" not in [s.get("step") for s in steps if s.get("ran")]:
+        presettle_why = "reconcile did not run this pass"
+    else:
+        try:
+            presettle_rules = _settle_needed()
+            presettle_why = "" if presettle_rules else "the category, chart and rig agree"
+        except Exception as exc:  # noqa: BLE001 — a failed look is not a reason to fail the chain
+            presettle_why = f"could not re-read the record ({type(exc).__name__}: {exc})"[:200]
+    step("presettle", presettle_why, _presettle)
+
     # ---- 4c. regen --------------------------------------------------------
     #
     # THE ONE PAID RETRY (readiness phase 4, docs/READINESS-PLAN.md §4 step 5).
@@ -3295,23 +3338,6 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     # that record. So when the record NOW still has one of these disagreements and
     # the gate has a write for it, reconcile runs once more — no render hint, so the
     # master stands and everything else follows it.
-    SETTLE_RULES = {"TAX.003", "TAX.004", "TAX.005", "TAX.007", "SIZE.002", "SIZE.011",
-                    "SIZE.013", "SIZE.014", "SIZE.015", "SIZE.016", "SIZE.017", "DRIFT.001",
-                    "DATA.010"}
-    settle_rules: list[str] = []
-
-    def _settle_needed() -> list[str]:
-        from app import approval
-
-        fresh = needs(dsn, product_id)["loaded"]
-        gate = approval.run_gate({**fresh["record"], "media": fresh["media"]},
-                                 catalog=fresh.get("catalog"),
-                                 imagery_settings=fresh.get("imagery_settings"),
-                                 llm=None, severity_overrides=severity_overrides)
-        blocking = {f.get("rule_id") for f in gate.get("blocking") or []}
-        writes = {a.get("reason") for a in gate.get("repair_plan") or []
-                  if a.get("kind") in ("set_column", "set_property", "create_size_chart")}
-        return sorted(blocking & SETTLE_RULES & writes)
 
     def _settle() -> str:
         return f"{', '.join(settle_rules)} still open after the renders — {_reconcile({})}"
