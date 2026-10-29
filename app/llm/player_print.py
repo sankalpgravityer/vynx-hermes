@@ -18,6 +18,7 @@ import base64
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -129,10 +130,11 @@ def _model_name(provider: str, pol: dict[str, Any]) -> str:
 
 
 def _clean_name(value: Any) -> str:
-    """'HARDEN' -> 'Harden', 'LE BRON' -> 'Le Bron'; keeps O'Neal / Antetokounmpo intact."""
+    """'HARDEN' -> 'Harden', "O'NEAL" -> "O'Neal", 'SMITH-JONES' -> 'Smith-Jones';
+    mixed case as printed ("McDavid") is kept."""
     text = " ".join(str(value or "").split())
-    return " ".join(w[:1].upper() + w[1:].lower() if w.isupper() or w.islower() else w
-                    for w in text.split(" "))
+    return " ".join(re.sub(r"[A-Za-z]+", lambda m: m.group(0).capitalize(), w)
+                    if w.isupper() or w.islower() else w for w in text.split(" "))
 
 
 def read(photo_urls: list[str], *, min_confidence: int = 85) -> dict[str, Any]:
