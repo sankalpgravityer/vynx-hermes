@@ -391,6 +391,430 @@ class PromptContext:
     identity_from_reference: bool = False
 
 
+# --------------------------------------------------------------------------- #
+# Product-focused on-model views for accessories and footwear (28 Oct 2026)
+# --------------------------------------------------------------------------- #
+# The twin of vnyx-api's shot-prompt.ts (WORN / productFocusFraming): a bag, a
+# cap or a pair of shoes keeps the AI model in every view; the camera zooms in on
+# the body part the product sits on, in a clear ladder (full widest, ¾ medium,
+# close-up tight); each view takes a different pose that shows the product off;
+# and the side a view names is the side of the PRODUCT (VIN-001600's backpack,
+# BOA-007894's hat). _WORN is the same table word for word — change both together.
+
+def is_product_focus(category: str | None, sub_category: str | None) -> bool:
+    """True for the products whose views are framed on the product, not the body."""
+    return classify_garment_type(category, sub_category) in ("footwear", "accessory")
+
+
+_VIEW_SHOT = {"front": "full_front", "back": "full_back", "front34": "three_quarter_front",
+              "back34": "three_quarter_back", "closeup": "closeup"}
+
+_WORN: dict[str, dict[str, Any]] = {'backpack': {'noun': 'backpack',
+              'full': 'from the top of the head down to the knees — the whole backpack and how it '
+                      'sits on the body',
+              'threeQuarter': 'from the top of the head down to the hips — the backpack large in '
+                              'the frame',
+              'closeup': 'TIGHT on the backpack: from the shoulders down to the bottom of the bag, '
+                         'the backpack filling about 70% of the image',
+              'front': 'the model has their BACK to the camera, wearing the backpack on BOTH '
+                       "shoulders: the backpack's OUTER FRONT PANEL faces the camera — its front "
+                       'pockets, zips, logo and any lash points',
+              'back': 'the model stands turned about 45 degrees to the camera, wearing the '
+                      'backpack normally on their BACK with both straps over BOTH shoulders — the '
+                      'STRAP SIDE as it looks worn: the shoulder strap running over the near '
+                      'shoulder and down the chest, the strap padding and buckles, and the side of '
+                      'the bag sitting behind the body. The bag hangs BEHIND the body: it is NEVER '
+                      'worn on the chest or the stomach',
+              'side': 'the model is turned 90 degrees to the camera, wearing the backpack on both '
+                      'shoulders: its side profile shows the depth of the pack, the side pockets '
+                      'and where the straps attach',
+              'sideByShot': {'three_quarter_back': 'the model HOLDS the backpack up by its top '
+                                                   'grab handle in front of the body, so its '
+                                                   'PADDED BACK PANEL and BOTH shoulder straps '
+                                                   'face the camera — the side that rests against '
+                                                   'the back, hidden when worn',
+                             'closeup_back': 'the model HOLDS the backpack up by its top grab '
+                                             'handle, its PADDED BACK PANEL and the tops of BOTH '
+                                             'shoulder straps facing the camera'},
+              'cropByShot': {'three_quarter_back': 'from the chest down to the knees, the held '
+                                                   'backpack filling most of the frame',
+                             'closeup_back': 'TIGHT on the held backpack: its padded back panel '
+                                             'and the tops of the shoulder straps filling about '
+                                             '75% of the image'},
+              'poses': {'full_front': 'walking away from the camera mid-stride, looking back over '
+                                      'one shoulder',
+                        'three_quarter_front': 'turned about 45 degrees away from the camera, one '
+                                               'hand pulling down on a shoulder strap',
+                        'closeup': 'standing with the back to the camera, both thumbs hooked under '
+                                   'the shoulder straps',
+                        'full_back': 'standing at an angle to the camera, one thumb hooked under '
+                                     'the near shoulder strap at chest height, looking ahead',
+                        'three_quarter_back': 'standing at a slight angle, holding the backpack up '
+                                              'by its grab handle at chest height',
+                        'closeup_back': 'holding the backpack up by its grab handle with one hand, '
+                                        'the other hand under its base',
+                        'full_side': "walking in profile mid-stride, the backpack's depth and side "
+                                     'pockets showing',
+                        'three_quarter_side': 'standing in profile, one hand on the shoulder '
+                                              'strap'}},
+ 'footwear': {'noun': 'shoes',
+              'full': 'from the WAIST down to the floor — the WHOLE legs from the hips to the '
+                      'shoes, the shoes taking about a quarter of the image height; the head and '
+                      'chest OUT of frame. Trousers or jeans end at or above the ankle so the '
+                      'shoes are never covered',
+              'threeQuarter': 'from just below the KNEE down to the floor — the shins and both '
+                              'shoes, the shoes taking about half of the image height',
+              'closeup': 'TIGHT on the shoes: from just above the ankle down to the floor, the '
+                         'camera at floor level, the shoes filling about 75% of the image',
+              'front': 'the TOES of the shoes point towards the camera — the toe boxes, the laces '
+                       'or fastening and the front of the soles',
+              'back': 'the model faces directly AWAY from the camera (the face is not visible): '
+                      'the HEELS of the shoes face the camera — the heel counters, heel tabs, back '
+                      'seams and any back branding',
+              'side': 'the model is turned 90 degrees to the camera: the OUTER SIDE PROFILE of the '
+                      'shoes — the full silhouette, the side panels, the midsole and the outsole '
+                      'edge',
+              'poses': {'full_front': 'walking towards the camera mid-stride, one foot forward',
+                        'three_quarter_front': 'standing with one foot forward and turned out, the '
+                                               'toe of the front shoe angled towards the camera',
+                        'closeup': 'one foot forward resting on its heel with the toe lifted, the '
+                                   'other flat, so the toe box and the sole edge both show',
+                        'full_back': 'walking away from the camera, the back heel lifted mid-step '
+                                     'so its heel and outsole show',
+                        'three_quarter_back': 'standing at an angle away from the camera, weight '
+                                              'on one leg, the other heel slightly raised',
+                        'closeup_back': 'rising onto the toes of one foot so its heel counter and '
+                                        'outsole face the camera',
+                        'full_side': 'standing in profile with one foot a step ahead, the outer '
+                                     'sides of both shoes showing',
+                        'three_quarter_side': 'in profile, the near heel slightly lifted so the '
+                                              'midsole and outsole show'}},
+ 'bag': {'noun': 'bag',
+         'full': 'from the top of the head down to the knees — the whole bag and how it is carried',
+         'threeQuarter': 'from the top of the head down to the hips — the bag large in the frame',
+         'closeup': 'TIGHT on the bag where it is carried, the bag filling about 70% of the image; '
+                    'the face is out of frame',
+         'front': "the bag's FRONT PANEL faces the camera — the main closure, logo and handles or "
+                  'strap',
+         'back': 'the bag is turned so its REAR PANEL faces the camera — any back pocket and the '
+                 'strap or handle attachments; the model may face the camera or away from it, '
+                 'whichever shows the rear panel best',
+         'side': 'the bag is seen side-on as carried: its depth (gusset) and where the handles or '
+                 'strap attach',
+         'poses': {'full_front': 'walking towards the camera, the bag on the shoulder',
+                   'three_quarter_front': 'turned about 45 degrees, holding the bag slightly out '
+                                          'from the body by its handle',
+                   'closeup': "one hand resting on the bag's flap or handle, the bag against the "
+                              'hip',
+                   'full_back': 'standing with the bag on the shoulder, turned so its rear panel '
+                                'faces the camera',
+                   'three_quarter_back': 'turned about 45 degrees away, the bag hanging at the '
+                                         'side',
+                   'closeup_back': 'holding the bag up by its handle, the rear panel towards the '
+                                   'lens',
+                   'full_side': 'standing in profile, the bag on the near shoulder',
+                   'three_quarter_side': 'in profile, holding the bag by its handle at the side'}},
+ 'headwear': {'noun': 'hat',
+              'full': 'from the top of the hat down to the waist — the upper body, the hat clearly '
+                      'visible on the head',
+              'threeQuarter': 'from the top of the hat down to the upper chest — head and '
+                              'shoulders, the hat large in the frame',
+              'closeup': 'TIGHT on the hat: from just above the crown down to the nose, the hat '
+                         'filling about 70% of the image',
+              'front': 'the FRONT of the hat faces the camera — the front panel or crown face, the '
+                       'peak or brim and any logo or embroidery',
+              'back': 'the model faces directly AWAY from the camera (the face is not visible): '
+                      'the BACK of the hat — the rear of the crown with the strap, snapback, '
+                      'buckle or elastic closure and the back seam',
+              'side': 'the model is turned 90 degrees to the camera: the hat in side profile — the '
+                      'height and shape of the crown and the length of the peak or brim',
+              'poses': {'full_front': 'standing relaxed, one hand lightly touching the brim or the '
+                                      'side of the hat, looking at the camera',
+                        'three_quarter_front': 'the head turned about 45 degrees, chin slightly '
+                                               'raised so the crown and the front of the hat catch '
+                                               'the light',
+                        'closeup': 'the head tilted slightly down towards the lens so the front of '
+                                   'the hat and its logo face the camera, eyes looking up',
+                        'full_back': 'standing with the back to the camera, head level, one hand '
+                                     'in a pocket',
+                        'three_quarter_back': 'the head turned about 45 degrees away, looking over '
+                                              'the shoulder so the back and one side of the hat '
+                                              'show',
+                        'closeup_back': 'the head bowed slightly forward so the back of the hat '
+                                        'and its closure face the lens',
+                        'full_side': 'standing in profile, head level, so the length of the brim '
+                                     'or peak and the shape of the crown read against the '
+                                     'background',
+                        'three_quarter_side': 'in profile, chin slightly lowered, the side of the '
+                                              'hat filling more of the frame'}},
+ 'wallet': {'noun': 'wallet',
+            'full': 'from the chin down to the hips, the wallet held in front of the body',
+            'threeQuarter': 'from the chest down to the waist, the wallet large in the frame',
+            'closeup': 'TIGHT on the wallet in the hand, filling about 70% of the image',
+            'front': "the wallet's FRONT face is towards the camera and not covered by the fingers",
+            'back': 'the wallet is turned over in the hand so its BACK face is towards the camera',
+            'side': 'the wallet held edge-on, showing its thickness and stitching',
+            'poses': {'full_front': 'a natural, relaxed pose that presents the wallet clearly to '
+                                    'the camera',
+                      'three_quarter_front': 'a different pose from the full shot — the body '
+                                             'turned about 45 degrees, the wallet angled to the '
+                                             'light',
+                      'closeup': 'a still pose that brings the wallet close to the lens',
+                      'full_back': 'turned away from the camera so the back of the wallet shows '
+                                   'clearly',
+                      'three_quarter_back': 'turned about 45 degrees away, looking back over the '
+                                            'shoulder',
+                      'closeup_back': 'a still pose with the back of the wallet close to the lens',
+                      'full_side': 'standing in profile, turned 90 degrees, so the side of the '
+                                   'wallet reads clearly',
+                      'three_quarter_side': 'in profile at a closer distance, the side of the '
+                                            'wallet sharp against the background'}},
+ 'belt': {'noun': 'belt',
+          'full': 'from the chest down to the knees, the belt at the centre of the frame',
+          'threeQuarter': 'from the ribs down to the upper thigh, the belt large in the frame',
+          'closeup': 'TIGHT on the buckle and the belt at the waist, filling about 60% of the '
+                     'image',
+          'front': 'the top is tucked in: the BUCKLE and the front of the belt face the camera',
+          'back': 'the model faces directly AWAY from the camera (the face is not visible), the '
+                  'top tucked in: the belt across the BACK of the waist',
+          'side': 'the model is turned 90 degrees: the belt at the side of the waist',
+          'poses': {'full_front': 'a natural, relaxed pose that presents the belt clearly to the '
+                                  'camera',
+                    'three_quarter_front': 'a different pose from the full shot — the body turned '
+                                           'about 45 degrees, the belt angled to the light',
+                    'closeup': 'a still pose that brings the belt close to the lens',
+                    'full_back': 'turned away from the camera so the back of the belt shows '
+                                 'clearly',
+                    'three_quarter_back': 'turned about 45 degrees away, looking back over the '
+                                          'shoulder',
+                    'closeup_back': 'a still pose with the back of the belt close to the lens',
+                    'full_side': 'standing in profile, turned 90 degrees, so the side of the belt '
+                                 'reads clearly',
+                    'three_quarter_side': 'in profile at a closer distance, the side of the belt '
+                                          'sharp against the background'}},
+ 'eyewear': {'noun': 'glasses',
+             'full': 'from the top of the head down to the waist',
+             'threeQuarter': 'from the top of the head down to the shoulders',
+             'closeup': 'TIGHT on the glasses: from the forehead down to the chin, the glasses '
+                        'filling about 60% of the width',
+             'front': 'the FRONT of the frames and the lenses face the camera',
+             'back': 'the head seen from behind at a three-quarter angle: the temple arms resting '
+                     'over the ears and the back of the frames',
+             'side': 'the model is turned 90 degrees: a temple arm and the hinge in profile',
+             'poses': {'full_front': 'a natural, relaxed pose that presents the glasses clearly to '
+                                     'the camera',
+                       'three_quarter_front': 'a different pose from the full shot — the body '
+                                              'turned about 45 degrees, the glasses angled to the '
+                                              'light',
+                       'closeup': 'a still pose that brings the glasses close to the lens',
+                       'full_back': 'turned away from the camera so the back of the glasses shows '
+                                    'clearly',
+                       'three_quarter_back': 'turned about 45 degrees away, looking back over the '
+                                             'shoulder',
+                       'closeup_back': 'a still pose with the back of the glasses close to the '
+                                       'lens',
+                       'full_side': 'standing in profile, turned 90 degrees, so the side of the '
+                                    'glasses reads clearly',
+                       'three_quarter_side': 'in profile at a closer distance, the side of the '
+                                             'glasses sharp against the background'}},
+ 'watch': {'noun': 'watch',
+           'full': 'from the top of the head down to the waist, the wrist with the watch raised in '
+                   'front of the chest',
+           'threeQuarter': 'from the chest down to the waist, the forearm across the body',
+           'closeup': 'TIGHT on the wrist, the watch filling about 70% of the image',
+           'front': 'the DIAL faces the camera, with the case, bezel and strap',
+           'back': 'the inside of the wrist is turned to the camera: the strap and the clasp',
+           'side': 'the side of the case with the crown',
+           'poses': {'full_front': 'a natural, relaxed pose that presents the watch clearly to the '
+                                   'camera',
+                     'three_quarter_front': 'a different pose from the full shot — the body turned '
+                                            'about 45 degrees, the watch angled to the light',
+                     'closeup': 'a still pose that brings the watch close to the lens',
+                     'full_back': 'turned away from the camera so the back of the watch shows '
+                                  'clearly',
+                     'three_quarter_back': 'turned about 45 degrees away, looking back over the '
+                                           'shoulder',
+                     'closeup_back': 'a still pose with the back of the watch close to the lens',
+                     'full_side': 'standing in profile, turned 90 degrees, so the side of the '
+                                  'watch reads clearly',
+                     'three_quarter_side': 'in profile at a closer distance, the side of the watch '
+                                           'sharp against the background'}},
+ 'jewellery': {'noun': 'piece of jewellery',
+               'full': 'around where the piece is worn — head to waist for the neck and ears, '
+                       'chest to hips for the wrist and hands',
+               'threeQuarter': 'closer around where the piece is worn — chin to chest, or the '
+                               'forearm and hand',
+               'closeup': 'TIGHT on the piece as worn, filling about 70% of the image',
+               'front': 'the FRONT of the piece — the face, stone or pendant — is towards the '
+                        'camera',
+               'back': 'the clasp or the back of the piece as worn',
+               'side': 'the piece in profile as worn',
+               'poses': {'full_front': 'a natural, relaxed pose that presents the piece of '
+                                       'jewellery clearly to the camera',
+                         'three_quarter_front': 'a different pose from the full shot — the body '
+                                                'turned about 45 degrees, the piece of jewellery '
+                                                'angled to the light',
+                         'closeup': 'a still pose that brings the piece of jewellery close to the '
+                                    'lens',
+                         'full_back': 'turned away from the camera so the back of the piece of '
+                                      'jewellery shows clearly',
+                         'three_quarter_back': 'turned about 45 degrees away, looking back over '
+                                               'the shoulder',
+                         'closeup_back': 'a still pose with the back of the piece of jewellery '
+                                         'close to the lens',
+                         'full_side': 'standing in profile, turned 90 degrees, so the side of the '
+                                      'piece of jewellery reads clearly',
+                         'three_quarter_side': 'in profile at a closer distance, the side of the '
+                                               'piece of jewellery sharp against the background'}},
+ 'scarf': {'noun': 'scarf',
+           'full': 'from the top of the head down to the waist',
+           'threeQuarter': 'from the top of the head down to the chest',
+           'closeup': 'TIGHT on the scarf at the neck, its pattern and weave filling about 70% of '
+                      'the image',
+           'front': 'the scarf at the neck and shoulders faces the camera',
+           'back': 'the model faces directly AWAY from the camera (the face is not visible): the '
+                   'scarf over the back of the neck and shoulders',
+           'side': 'the model is turned 90 degrees: the scarf at the neck in profile',
+           'poses': {'full_front': 'a natural, relaxed pose that presents the scarf clearly to the '
+                                   'camera',
+                     'three_quarter_front': 'a different pose from the full shot — the body turned '
+                                            'about 45 degrees, the scarf angled to the light',
+                     'closeup': 'a still pose that brings the scarf close to the lens',
+                     'full_back': 'turned away from the camera so the back of the scarf shows '
+                                  'clearly',
+                     'three_quarter_back': 'turned about 45 degrees away, looking back over the '
+                                           'shoulder',
+                     'closeup_back': 'a still pose with the back of the scarf close to the lens',
+                     'full_side': 'standing in profile, turned 90 degrees, so the side of the '
+                                  'scarf reads clearly',
+                     'three_quarter_side': 'in profile at a closer distance, the side of the scarf '
+                                           'sharp against the background'}},
+ 'gloves': {'noun': 'gloves',
+            'full': 'from the top of the head down to the hips, the gloved hands held in front of '
+                    'the body',
+            'threeQuarter': 'from the chest down to the hips, the gloved hands large in the frame',
+            'closeup': 'TIGHT on the gloved hands, filling about 75% of the image',
+            'front': 'the BACKS of the gloved hands face the camera',
+            'back': 'the PALMS of the gloved hands face the camera',
+            'side': 'one gloved hand in profile, showing the cuff',
+            'poses': {'full_front': 'a natural, relaxed pose that presents the gloves clearly to '
+                                    'the camera',
+                      'three_quarter_front': 'a different pose from the full shot — the body '
+                                             'turned about 45 degrees, the gloves angled to the '
+                                             'light',
+                      'closeup': 'a still pose that brings the gloves close to the lens',
+                      'full_back': 'turned away from the camera so the back of the gloves shows '
+                                   'clearly',
+                      'three_quarter_back': 'turned about 45 degrees away, looking back over the '
+                                            'shoulder',
+                      'closeup_back': 'a still pose with the back of the gloves close to the lens',
+                      'full_side': 'standing in profile, turned 90 degrees, so the side of the '
+                                   'gloves reads clearly',
+                      'three_quarter_side': 'in profile at a closer distance, the side of the '
+                                            'gloves sharp against the background'}},
+ 'item': {'noun': 'item',
+          'full': 'around where the item is worn or held, from the head down to the hips',
+          'threeQuarter': 'closer around where the item is worn or held',
+          'closeup': 'TIGHT on the item as worn or held, filling about 70% of the image',
+          'front': 'the FRONT of the item faces the camera',
+          'back': 'the BACK of the item faces the camera',
+          'side': 'the item in profile',
+          'poses': {'full_front': 'a natural, relaxed pose that presents the item clearly to the '
+                                  'camera',
+                    'three_quarter_front': 'a different pose from the full shot — the body turned '
+                                           'about 45 degrees, the item angled to the light',
+                    'closeup': 'a still pose that brings the item close to the lens',
+                    'full_back': 'turned away from the camera so the back of the item shows '
+                                 'clearly',
+                    'three_quarter_back': 'turned about 45 degrees away, looking back over the '
+                                          'shoulder',
+                    'closeup_back': 'a still pose with the back of the item close to the lens',
+                    'full_side': 'standing in profile, turned 90 degrees, so the side of the item '
+                                 'reads clearly',
+                    'three_quarter_side': 'in profile at a closer distance, the side of the item '
+                                          'sharp against the background'}}}
+
+_BACKPACK_RE = re.compile(r"\b(back ?packs?|rucksacks?|daypacks?)\b", re.IGNORECASE)
+# Hermes has no garment-kind classifier, so the kind is read off the words.
+_WORN_BY_WORD: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b(bags?|handbags?|totes?|purses?|satchels?|clutch(?:es)?)\b", re.I), "bag"),
+    (re.compile(r"\b(caps?|hats?|beanies?|headwear)\b", re.I), "headwear"),
+    (re.compile(r"\bwallets?\b", re.I), "wallet"),
+    (re.compile(r"\bbelts?\b", re.I), "belt"),
+    (re.compile(r"\b(sunglasses|glasses|eyewear)\b", re.I), "eyewear"),
+    (re.compile(r"\bwatch(?:es)?\b", re.I), "watch"),
+    (re.compile(r"\bjewell?ery\b", re.I), "jewellery"),
+    (re.compile(r"\bscar(?:f|ves)\b", re.I), "scarf"),
+    (re.compile(r"\bgloves?\b", re.I), "gloves"),
+]
+
+
+def worn_framing(category: str | None, sub_category: str | None) -> dict[str, Any]:
+    """Where this product sits on the model, and how each of its sides is shown."""
+    if classify_garment_type(category, sub_category) == "footwear":
+        return _WORN["footwear"]
+    text = f"{category or ''} {sub_category or ''}"
+    # the sub-category first: "Backpacks & Bags > Bag" is a bag, "> Backpacks" a backpack
+    for value in (sub_category or "", text):
+        if _BACKPACK_RE.search(value):
+            return _WORN["backpack"]
+        for pattern, key in _WORN_BY_WORD:
+            if pattern.search(value):
+                return _WORN[key]
+    return _WORN["item"]
+
+
+_IDENTITY_TRAITS = "gender, hair type, hair color, skin tone, body type, tattoos, piercings"
+
+_PRODUCT_FOCUS_EMPHASIS = (
+    " FRAMING TAKES PRIORITY: the crop, the pose and the side of the product are set by this "
+    "shot, not by the reference images. Where a reference shows the model further away, in "
+    "another pose or from another side, the instructions above win."
+)
+
+
+def product_focus_framing(view: str, wf: dict[str, Any], has_front_reference: bool) -> str:
+    """The crop, zoom, side of the product and pose for one view — vnyx-api's productFocusFraming."""
+    n = wf["noun"]
+    shot = _VIEW_SHOT[view]
+    rear = view in ("back", "back34")
+    out = (
+        f". CRITICAL: Keep the EXACT SAME {n}, material, colour and details as the product photos, "
+        f"and the EXACT SAME model as the reference render (identical {_IDENTITY_TRAITS}) — take "
+        "ONLY the model's identity from that render, never its framing, pose or distance."
+        if has_front_reference else
+        f". Remember the model's characteristics ({_IDENTITY_TRAITS}) as they must be used "
+        "identically in the other views."
+    )
+    crop = (wf.get("cropByShot", {}).get(shot)
+            or (wf["full"] if view in ("front", "back")
+                else wf["threeQuarter"] if view in ("front34", "back34")
+                else wf["closeup"]))
+    out += (f" PRODUCT-FOCUSED FRAMING: this photograph is about the {n}, worn or held by the "
+            f"model. Frame it {crop}. Make the {n} the subject — large, sharp and fully in frame; "
+            f"the model is there to show the {n} as worn. Never a distant full-length picture in "
+            f"which the {n} ends up small.")
+    out += (" ZOOM: this is the WIDEST of this product's shots." if view in ("front", "back")
+            else " ZOOM: MEDIUM — clearly closer than the full shot and clearly wider than the "
+                 "close-up." if view in ("front34", "back34")
+            else " ZOOM: the TIGHTEST of this product's shots — much closer than the "
+                 "three-quarter shot, so the two never look alike.")
+    side = wf.get("sideByShot", {}).get(shot) or (wf["back"] if rear else wf["front"])
+    out += (f' BACK OF THE {n.upper()}: {side}. "Back" here is the back of the PRODUCT — not '
+            "necessarily the model's back." if rear
+            else f" FRONT OF THE {n.upper()}: {side}.")
+    if view in ("front34", "back34"):
+        out += (" THREE-QUARTER ANGLE: the camera is about 45 degrees round from that position, so "
+                f"the {'back' if rear else 'front'} and one side of the {n} are seen together.")
+    if view == "closeup":
+        out += (f" CLOSE-UP: the {n}'s material, stitching, hardware and branding sharp — but the "
+                f"{n} stays recognisable, not an extreme macro.")
+    pose = wf["poses"].get(shot) or f"a natural pose that presents the {n} clearly"
+    out += (f" POSE: {pose}. Every shot of this product uses a DIFFERENT pose, chosen to show "
+            f"the {n} at its best — never the same stiff stance twice.")
+    return out + _PRODUCT_FOCUS_EMPHASIS
+
+
 def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> str:
     """The full instruction for one view.
 
@@ -562,7 +986,11 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
             "product."
         )
 
-    if not is_kids and s.body_type:
+    # Accessories and footwear: on the model, framed on the product (28 Oct 2026).
+    focus = is_product_focus(ctx.category, ctx.sub_category)
+
+    # A shoe crop shows no torso, so a body-size paragraph would argue for one.
+    if not is_kids and s.body_type and not (focus and is_footwear):
         descriptor = BODY_TYPE_DESCRIPTORS.get(s.body_type.lower())
         if descriptor:
             prompt += (
@@ -607,7 +1035,10 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
     is_back_view = view in ("back", "back34")
     is_three_quarter = view in ("front34", "back34")
 
-    if view == "closeup":
+    if focus:
+        prompt += product_focus_framing(view, worn_framing(ctx.category, ctx.sub_category),
+                                        has_front_reference)
+    elif view == "closeup":
         if is_footwear:
             close_up_framing = (
                 " Frame this as a medium CLOSE-UP of the FOOTWEAR as worn on the "
@@ -728,7 +1159,9 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
             "identically in the other views."
         )
 
-    if view in ("front", "back"):
+    if focus:
+        pass                                    # the crop is in product_focus_framing
+    elif view in ("front", "back"):
         prompt += (
             " Capture a FULL-LENGTH, full-body shot: the entire model is visible "
             "from the very top of the head/hair all the way down to the FEET, with "
@@ -804,6 +1237,8 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
                 "its full-length framing; recompose this shot tighter (knee-up)."
             )
 
+    if focus:
+        view_description = "The product is the subject, framed as described above"
     prompt += (
         f" {view_description}. High quality, realistic lighting, high resolution. "
         f"Use all provided images as reference for accurate details, colors, "

@@ -962,45 +962,43 @@ CAP = dict(category="Caps", sub_category="Cap")
 
 def test_footwear_three_quarter_views_go_to_the_floor():
     """Knee-to-floor, not knee-UP. The default ¾ view crops the feet OUT, which
-    for a shoe product removes the product."""
+    for a shoe product removes the product. 28 Oct 2026: still on the model."""
     for view in ("front34", "back34"):
         p = _prompt(view, **SHOES)
-        assert "KNEE all the way DOWN TO THE FLOOR" in p, view
-        assert "both shoes fill most of the frame" in p, view
-        # The generic knee-up language must not also be present.
+        assert "from just below the KNEE down to the floor" in p, view
+        assert "worn or held by the model" in p, view
         assert "FEET are deliberately CROPPED OUT" not in p, view
 
 
 def test_footwear_closeup_is_the_shoes_not_the_chest():
     p = _prompt("closeup", **SHOES)
-    assert "CLOSE-UP of the FOOTWEAR" in p
-    assert "mid-calf down to the floor" in p
+    assert "from just above the ankle down to the floor" in p
     assert "chest-up crop" not in p
 
 
-def test_footwear_full_body_keeps_the_hems_clear():
-    """The full-body views stay full-body so the gallery is consistent, but a
-    full-length trouser breaks over the shoe and hides the product."""
+def test_footwear_full_front_is_zoomed_to_the_waist_down():
+    """28 Oct 2026: head-to-toe left the shoes tiny — the full front is now waist
+    down, the hems still clear of the shoes."""
     p = _prompt("front", **SHOES)
     assert "CROPPED OR ROLLED trouser hems" in p
-    assert "BOTH SHOES MUST BE FULLY VISIBLE" in p
-    assert "FULL-LENGTH, full-body shot" in p
+    assert "from the WAIST down to the floor" in p
+    assert "FULL-LENGTH, full-body shot" not in p
 
 
 def test_an_accessory_is_framed_where_it_actually_SITS():
     """One class, but the crop follows the product. Framing a cap at the
     shoulder reproduces the original bug at a different height."""
-    assert "shoulder and torso" in _prompt("front34", **BAG)
-    assert "head and shoulders" in _prompt("front34", **CAP)
-    assert "waist and hips" in _prompt(
+    assert "from the top of the head down to the hips" in _prompt("front34", **BAG)
+    assert "from the top of the hat down to the upper chest" in _prompt("front34", **CAP)
+    assert "from the ribs down to the upper thigh" in _prompt(
         "front34", category="Accessories", sub_category="Belt"
     )
 
 
 def test_accessory_closeup_still_reads_as_worn():
-    p = _prompt("closeup", **BAG)
-    assert "CLOSE-UP of the ACCESSORY" in p
-    assert "reads as WORN rather than as a product cut-out" in p
+    p = _prompt("closeup", **CAP)
+    assert "TIGHT on the hat" in p
+    assert "worn or held by the model" in p
 
 
 def test_a_top_is_unaffected_by_any_of_this():
