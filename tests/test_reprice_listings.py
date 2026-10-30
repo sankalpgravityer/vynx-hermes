@@ -41,3 +41,20 @@ def test_clothing_lists_only_its_counted_listings_as_before():
     assert RP.summary(res)["listings"] == [
         {"url": "https://www.vinted.nl/items/1234567-a", "priceEur": 80.0, "status": "sold",
          "verified": "exact"}]
+
+
+def test_set_aside_rows_carry_their_price_first_and_are_capped():
+    comps = [{"url": "https://www.ebay.de/itm/1", "price_eur": 23.7, "status": "listed", "counted": True,
+              "verified": "ebay", "source": "ebay", "title": "adidas hoodie",
+              "match": {"verdict": "same", "reason": "photo"}}]
+    comps.append({"url": "https://www.ebay.de/itm/9", "price_eur": 27.99, "counted": False,
+                  "own": {"why": "our own seller account (boas-savefashionforgood)"}})
+    for i in range(10):
+        comps.append({"url": f"https://www.ebay.de/itm/{100 + i}", "price_eur": 10.0 + i, "counted": False,
+                      "match": {"verdict": "different", "reason": "another colourway"}})
+    got = RP._listings({"comps": comps})
+    assert got[0]["status"] == "listed · exact" and got[0]["priceEur"] == 23.7
+    assert got[1]["status"].startswith("€27.99 · our own listing") and got[1]["priceEur"] is None
+    assert got[2]["status"].startswith("€10.00 · different item:")
+    assert sum(1 for g in got if g["sameItem"] == "different") == 6     # capped
+    assert len(got) == 8

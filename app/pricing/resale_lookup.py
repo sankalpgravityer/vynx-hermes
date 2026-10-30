@@ -54,7 +54,10 @@ import httpx
 
 from app.config import ROOT, policy, settings
 from app.net import fetch_all, make_client
+from app.pricing import image_search as IS
+from app.pricing import own_listing as OWN
 from app.pricing import resale_rules as R
+from app.pricing import site_pages as SP
 
 log = logging.getLogger("hermes.resale")
 
@@ -67,6 +70,16 @@ DEFAULTS: dict[str, Any] = {
     "rescue_searches": 4,
     "page_check": True,
     "confirm_prices": True,
+    "same_item_check": True,
+    "match_model": None,            # None: identify_model
+    "image_search": {},             # app/pricing/image_search.py DEFAULTS
+    "direct_search": {},            # app/pricing/site_pages.py DEFAULTS (Vinted's own search)
+    # The Google text search runs only when the image search found fewer
+    # same-item listings than this (29 Oct 2026: time and cost).
+    "enough_from_images": 3,
+    "own_sellers": {},              # {tenant: [eBay seller names]} — never counted
+    "own_photo_max_distance": 15,
+    "own_price_match_distance": 20,  # this far apart still ours when the price is exactly ours
     "cache_days": 21,
     "cache_dir": ".cache/resale",
     "identify_timeout_s": 120,
@@ -89,7 +102,33 @@ def api_key() -> str:
 
 
 RESALE_SITES = ("vinted", "grailed", "vestiaire", "ebay", "depop", "marktplaats", "2dehands",
-                "kleinanzeigen", "etsy", "poshmark", "vide-dressing", "wallapop", "subito", "tise")
+                "kleinanzeigen", "etsy", "poshmark", "vide-dressing", "wallapop", "subito", "tise",
+                "thredup", "mercari", "sellpy", "zalando")   # thredup, zalando: the user's asks, 29 Oct 2026
+# Zalando sells NEW: a zalando.* page is a resale listing only when it is a
+# Zalando Pre-owned one; otherwise it is where the RETAIL NEW price comes from.
+NEW_ONLY_UNLESS = {"zalando": ("pre-owned", "preowned", "second hand", "secondhand", "tweedehands")}
+
+
+def _looks_invented(url: str, others: list[str]) -> bool:
+    """A URL the model made up rather than read: an item number of round
+    zeros (BOA-006489: four eBay links all ending /175000000000), or the same
+    path given for several different listings."""
+    p = norm_url(url)
+    if not p:
+        return True
+    if sum(1 for o in others if norm_url(o) == p) > 1:
+        return True
+    # A Google redirect token pasted into a listing path (BOA-006950:
+    # "ebay.co.uk/itm/AUZIYQFyPu84UhaXLe7...").
+    if re.search(r"/[A-Za-z0-9_-]{40,}", p):
+        return True
+    # An eBay listing is /itm/<12 digits> (or /itm/<slug>/<12 digits>): a slug
+    # with a short or no number is the model's reconstruction of a search
+    # result title, not a page (BOA-006950: ".../Patagonia-Jacke-...-Blau-156810").
+    if re.search(r"(^|\.)ebay\.[a-z.]+/itm/", p) and not re.search(r"/itm/(?:[^/]+/)?\d{12}(?:[^\d]|$)", p):
+        return True
+    m = re.search(r"(\d{9,})(?:[^\d]|$)", p)
+    return bool(m and (m.group(1).endswith("00000") or len(set(m.group(1))) <= 2))
 # Shoes are priced from StockX ONLY (the user's call, 21 Oct 2026): a shoe's
 # eBay / Grailed / Vinted listing is never counted, whatever the model reports.
 SHOE_SITES = ("stockx",)
@@ -103,6 +142,10 @@ Catalogue record (may be vague or wrong; trust the photos and label):
 Labels often carry the model name, collection or an ARTICLE CODE (e.g. Stone Island 7515..., C.P.
 Company 13CMSS...). Reply with ONLY this JSON (no markdown):
 {{"brand": "", "model": "", "article_code": "", "era": "", "id_confidence": "high|medium|low",
+ "garment_type": "what it is, e.g. sherpa fleece half-zip pullover",
+ "colourway": "the colours and where they sit, e.g. beige sherpa yoke, olive fleece body, navy chest pocket",
+ "features": ["3-6 short details that tell THIS item from similar ones by the same brand: closure,
+   pockets, logo type and position, pattern, trims, fit"],
  "search_terms": ["2-4 short queries a reseller would type to find this exact item used"],
  "resale_interest": "high|medium|low", "interest_reason": "",
  "authenticity_concerns": "", "catalogue_corrections": ""}}
@@ -126,13 +169,15 @@ _BLOCK_FORMAT = """Answer in EXACTLY this format, one block per listing (up to 6
 * Platform: <site>
 * Status: sold | listed
 * Condition: <as stated>
+* Colour: <the colours the listing names or shows, or unknown>
+* Size: <as stated, or unknown>
 * Location: <country of the seller, or unknown>
 * Price: <amount AND currency exactly as shown, e.g. 120 USD, €85, £60>
 * URL: <URL of the individual listing>
 
 ESTIMATE: €<realistic resale list price for our item>
 CONFIDENCE: high | medium | low
-RETAIL NEW: <the item's original retail price when sold new, amount AND currency as shown> | <URL of the brand or retailer page that shows it>
+RETAIL NEW: <the item's original retail price when sold new, amount AND currency as shown> | <URL of the brand's or a retailer's page that shows it — Zalando (zalando.nl / .de) or the brand's own shop first>
   (only a figure you saw on a page in your search results; do not spend extra searches on it; else: RETAIL NEW: unknown)
 REASON: <one or two sentences>"""
 
@@ -140,10 +185,11 @@ SEARCH_PROMPT = """Search Google for USED / second-hand listings of this clothin
 
 Item: {ident}
 Our item: condition {cond}, size {size}. We sell in the Netherlands / EU.
-Suggested searches: {terms}
+Suggested searches: {terms}{hints}
 
 Look on resale platforms: Vinted, Grailed, Vestiaire Collective, eBay, Depop, Marktplaats,
-Kleinanzeigen. Prefer EU listings and SOLD prices. Use at most {max_s} searches in total — be targeted.
+Kleinanzeigen, thredUP, Zalando Pre-owned. Prefer EU listings and SOLD prices. Use at most {max_s} searches in total — be targeted.{thredup}
+A listing's URL must be the real one from the results — the exact item number — never a made-up or rounded one.
 Only report listings you actually found in search results. Never invent a price or URL.
 Fewer real listings beat more guessed ones.
 
@@ -154,9 +200,10 @@ RESCUE_PROMPT = """Second, EU-focused search for USED listings of this clothing 
 Item: {ident}
 Our item: condition {cond}, size {size}.
 The first search found too few verifiable listings. Now search ONLY European resale sites:
-eBay.de / .nl / .fr / .it / .es, Vestiaire Collective, Vinted, Marktplaats, Kleinanzeigen, 2dehands.
+eBay.de / .nl / .fr / .it / .es, Vestiaire Collective, Vinted, Marktplaats, Kleinanzeigen, 2dehands,
+Zalando Pre-owned — and thredUP (thredup.com).{hints}
 Search by article code / model name, and in local language where useful (e.g. "gebraucht", "gebruikt").
-Use at most {max_s} searches. Only report listings you actually found; never invent a price or URL.
+Use at most {max_s} searches. Only report listings you actually found; never invent a price or URL.{thredup}
 
 """ + _BLOCK_FORMAT
 
@@ -232,6 +279,10 @@ def url_kind(u: str) -> str:
     # hint would otherwise claim (KLE-000346, 15 Oct 2026: a real €549 listing
     # dropped as a search page). Checked first.
     if "/s-anzeige/" in path:
+        return "listing"
+    # A Zalando product page is <slug>-<article code>.html; its category and
+    # search pages have no .html (29 Oct 2026, the user's ask).
+    if "zalando." in pu.netloc and path.endswith(".html") and not any(h in full for h in SEARCH_HINTS):
         return "listing"
     # A StockX product page is one slug, no id: stockx.com/nike-dunk-low-retro-white-black
     # (or under a region, /de-de/<slug>). One short word is a category (/sneakers).
@@ -328,6 +379,9 @@ def item_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "retail_price": rec.get("retailPriceAmount"),
         "images": [u for u, _ in picked],
         "label_images": labels[:2],
+        # The gallery (cut-outs, renders): what the channels show, so an own
+        # listing's photo is one of these (app/pricing/own_listing.py).
+        "gallery": [u for u in (rec.get("images") or []) if u][:6],
         "photo_labels": photo_labels,
         "edit_url": rec.get("editUrl"),
     }
@@ -437,11 +491,14 @@ class Usage:
         self.tokens_in = 0
         self.tokens_out = 0
         self.searches = 0
+        self.lens_searches = 0      # SerpApi; eBay image calls are free
 
     def cost_usd(self, cfg: dict) -> float:
+        lens = {**IS.DEFAULTS, **(cfg.get("image_search") or {})}["lens_price_per_search_usd"]
         return (self.tokens_in / 1e6 * cfg["token_price_in_per_1m_usd"]
                 + self.tokens_out / 1e6 * cfg["token_price_out_per_1m_usd"]
-                + self.searches / 1000 * cfg["price_per_1k_searches_usd"])
+                + self.searches / 1000 * cfg["price_per_1k_searches_usd"]
+                + self.lens_searches * float(lens))
 
 
 def _post(url: str, body: dict, key: str, timeout_s: float,
@@ -518,9 +575,10 @@ def identify(item: dict, key: str, usage: Usage) -> tuple[dict | None, str | Non
     # Which pictures went to the model, and which could not be downloaded.
     item["_photo_log"] = [{"url": u, "label": labels.get(u, "?"), "sent": bool(got.get(u))}
                           for u in urls]
-    parts = [_image_part(got[u]) for u in urls if got.get(u)]
+    parts = [_image_part(got[u], max_px=640) for u in urls if got.get(u)]
     if not parts:
         return None, "identify: no photo could be downloaded"
+    item["_photos"] = {u: b for u, b in got.items() if b}     # reused by image search + judge
     photos_sent = len(parts)
     rec = {k: item.get(k) for k in ("title", "brand", "category", "sub_category", "gender",
                                     "size", "color", "material", "condition")}
@@ -546,11 +604,14 @@ def identify(item: dict, key: str, usage: Usage) -> tuple[dict | None, str | Non
     if not ident:
         return None, f"identify: no JSON in the reply (finish={cand.get('finishReason')})"
     for k in ("brand", "model", "model_name", "article_code", "era", "id_confidence", "resale_interest",
-              "interest_reason", "authenticity_concerns", "catalogue_corrections"):
+              "interest_reason", "authenticity_concerns", "catalogue_corrections",
+              "garment_type", "colourway"):
         if k in ident:
             ident[k] = _as_text(ident[k])
-    if not isinstance(ident.get("search_terms"), list):
-        ident["search_terms"] = [t for t in [_as_text(ident.get("search_terms"))] if t]
+    for k in ("search_terms", "features"):
+        if not isinstance(ident.get(k), list):
+            ident[k] = [t for t in [_as_text(ident.get(k))] if t]
+        ident[k] = [_as_text(t) for t in ident[k] if _as_text(t)]
     ident["photos_sent"] = photos_sent
     return ident, None
 
@@ -627,6 +688,8 @@ def parse_search_answer(text: str, annotations: list[dict]) -> dict:
             "platform": field("Platform"),
             "status": status.lower().split()[0] if status else "",
             "condition": field("Condition"),
+            "colour": field("Colour"),
+            "size": field("Size"),
             "location": field("Location"),
             "price_raw": field("Price"),
             "currency": cur,
@@ -845,8 +908,11 @@ def confirm_price(comp: dict) -> dict:
 
 
 def confirm_counted_prices(comps: list[dict]) -> int:
-    """Run confirm_price on every counted listing not yet confirmed. -> how many changed."""
-    todo = [c for c in comps if c.get("counted") and "price_confirm" not in c][:10]
+    """Run confirm_price on every counted listing not yet confirmed. -> how many changed.
+    A listing from an API (eBay image search, Lens) carries the platform's own
+    price: nothing to confirm, and its page would refuse us anyway."""
+    todo = [c for c in comps if c.get("counted") and "price_confirm" not in c
+            and not c.get("source")][:10]
     if not todo:
         return 0
     with ThreadPoolExecutor(max_workers=min(6, len(todo))) as pool:
@@ -862,6 +928,188 @@ def confirm_counted_prices(comps: list[dict]) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Is the listing the SAME item? (29 Oct 2026, Phase 1 of the reprice plan)
+#
+# BOA-007078: the four "verified" listings were a different Columbia fleece
+# each (another model, another colourway, a size S), and the lookup priced the
+# item at €9.99 from them. "Verified" only ever meant "the page exists and
+# Google returned it". This asks the question that was missing.
+#
+# FROM TEXT, NOT PHOTOS. eBay, Grailed, Etsy and Kleinanzeigen refuse a page
+# fetch from us (HTTP 403) AND from Google's own url_context fetcher, so a
+# listing's photo cannot be compared. What the search does return is the
+# listing's title, condition, colour and size as the model read them in the
+# results; the judge compares those with what the identify call saw in OUR
+# photos: model, colourway, distinguishing features. One text call for all the
+# listings of a product — no tools, ~$0.005.
+#
+#   same       counts in full
+#   similar    counts for a raise, never for a cut (price_item), and never
+#              makes the confidence "high" — it is the same model but the
+#              colourway or a detail could not be confirmed
+#   different  dropped: another model, colourway, gender, or garment
+# --------------------------------------------------------------------------- #
+MATCH_PROMPT = """You are checking whether second-hand listings are the SAME ITEM as ours, for pricing.
+
+OUR ITEM (identified from our own photos and label):
+{ours}
+
+LISTINGS (the seller's title and details as read from search results; where a listing's photo was
+available it follows this text, labelled with the listing's number — judge by the photo FIRST):
+{listings}
+
+For each listing answer: is it the same product — same brand AND same model/style AND the same
+colourway — in any size and condition?
+  same      the photo shows the same garment and colourway, or the title/details name the same
+            model (or article code) and nothing contradicts the colourway or the features
+  similar   the same model in ANOTHER COLOURWAY, or the same brand and garment type and plausibly
+            the same model with the colourway or a distinguishing feature not confirmed by the
+            photo or the title/details
+  different another model, another gender's or a kids' cut, a different garment type, or a
+            bundle / a part / a counterfeit — NOT merely another colour of the same model
+A size that differs from ours is NOT a reason to say different. A listing whose title only names
+the brand and the garment type ("Columbia fleece pullover") and has no photo is "similar" at best.
+Our identification may be wrong about the model NAME: when a listing's photo shows the same garment
+under another name, it is "same", and say the name.
+Reply with ONLY a JSON array, one object per listing, in order:
+[{{"n": 1, "verdict": "same|similar|different", "reason": "one short sentence"}}, ...]"""
+
+
+def _ours_for_match(ident: dict, item: dict) -> str:
+    lines = [f"brand: {ident.get('brand') or item.get('brand') or '?'}",
+             f"model: {ident.get('model') or '?'}",
+             f"article code: {ident.get('article_code') or 'none seen'}",
+             f"garment: {ident.get('garment_type') or item.get('sub_category') or '?'}",
+             f"colourway: {ident.get('colourway') or item.get('color') or '?'}",
+             f"distinguishing features: {'; '.join(ident.get('features') or []) or '?'}",
+             f"gender/department: {item.get('gender') or '?'}",
+             f"our size: {item.get('size') or '?'}",
+             f"identification confidence: {ident.get('id_confidence') or '?'}"]
+    if item.get("_hints"):
+        lines.append("image search (eBay / Google Lens) most often calls this item: "
+                     + "; ".join(item["_hints"]))
+    return "\n".join(lines)
+
+
+def _listing_photos(comps: list[dict], item: dict | None = None) -> dict[str, bytes]:
+    """The listing photos (eBay item images, Lens thumbnails) that could be
+    downloaded, by URL — fetched once per lookup (`item["_listing_photos"]`).
+    Small and quick; a miss is a text-only judgement."""
+    cache: dict[str, bytes | None] = item.setdefault("_listing_photos", {}) if item is not None else {}
+    urls = [c["image"] for c in comps if c.get("image") and c["image"] not in cache]
+    if urls:
+        got = fetch_all(urls, timeout_s=15.0, deadline_s=40.0)
+        cache.update(got)
+    return {c["image"]: cache[c["image"]] for c in comps
+            if c.get("image") and cache.get(c["image"])}
+
+
+def mark_own_listings(item: dict, comps: list[dict]) -> int:
+    """Our own listings of this product (app/pricing/own_listing.py), by the
+    eBay seller name and by our own photos. -> how many. Never raises."""
+    cfg = config()
+    try:
+        ours = dict(item.get("_photos") or {})
+        # The first gallery pictures are the cut-outs the channels were given
+        # (BOA-006463's own listings matched the first one, 3 bits apart).
+        gallery = [u for u in (item.get("gallery") or []) if u not in ours][:3]
+        if gallery:
+            ours.update({u: b for u, b in fetch_all(gallery, timeout_s=15.0, deadline_s=30.0).items() if b})
+        hashes = item.get("_own_hashes")
+        if hashes is None:
+            hashes = item["_own_hashes"] = OWN.own_hashes(ours)
+        return OWN.mark_own(comps, hashes, OWN.own_sellers_for(item.get("tenant"), cfg),
+                            _listing_photos(comps, item), int(cfg["own_photo_max_distance"]),
+                            our_price=item.get("vnyx_price"),
+                            price_match_distance=int(cfg["own_price_match_distance"]))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("own-listing check failed: %s", exc)
+        return 0
+
+
+def _listing_for_match(n: int, c: dict) -> str:
+    bits = [f"{n}. title: {c.get('title') or '?'}"]
+    for k in ("platform", "condition", "colour", "size", "location", "price_raw"):
+        v = (c.get(k) or "").strip()
+        if v and v.lower() not in ("unknown", "?", "-", "—"):
+            bits.append(f"   {k.replace('_raw', '')}: {v}")
+    return "\n".join(bits)
+
+
+JUDGE_BATCH = 6          # small batches, judged at once: ~20 photo candidates in one call's time
+
+
+def judge_matches(ident: dict, item: dict, comps: list[dict], key: str, usage: Usage) -> int:
+    """Every candidate listing without a verdict, JUDGE_BATCH a call (the
+    image search can bring 20+). Sets c["match"] = {"verdict", "reason"}.
+    -> how many were judged. Never raises: a failed call leaves its listings
+    unjudged, which `summarise` treats as before."""
+    todo = [c for c in comps if c.get("candidate") and not c.get("match")]
+    if not todo:
+        return 0
+    _listing_photos(todo, item)                 # one download for every batch
+    batches = [todo[i:i + JUDGE_BATCH] for i in range(0, len(todo), JUDGE_BATCH)]
+    if len(batches) == 1:
+        return _judge_batch(ident, item, batches[0], key, usage)
+    with ThreadPoolExecutor(max_workers=min(4, len(batches))) as pool:   # batches at once
+        return sum(pool.map(lambda b: _judge_batch(ident, item, b, key, usage), batches))
+
+
+def _judge_batch(ident: dict, item: dict, todo: list[dict], key: str, usage: Usage) -> int:
+    cfg = config()
+    prompt = MATCH_PROMPT.format(
+        ours=_ours_for_match(ident, item),
+        listings="\n".join(_listing_for_match(i + 1, c) for i, c in enumerate(todo)))
+    parts: list[dict] = [{"text": prompt}]
+    # Our front photo, then each listing's photo that could be fetched
+    # (29 Oct 2026, Phase 2): the judge compares pictures where it can.
+    ours = item.get("_photos") or {}
+    front = next((ours[u] for u in (item.get("images") or []) if ours.get(u)), None)
+    photos = _listing_photos(todo, item)
+    if front and photos:
+        parts.append({"text": "OUR ITEM, photo:"})
+        parts.append(_image_part(front, max_px=512))
+        for i, c in enumerate(todo):
+            b = photos.get(c.get("image") or "")
+            if b:
+                c["photo_judged"] = True
+                parts.append({"text": f"Listing {i + 1}, photo:"})
+                parts.append(_image_part(b, max_px=384))
+    js, err = _post(f"{API}/models/{cfg.get('match_model') or cfg['identify_model']}:generateContent",
+                    {"contents": [{"parts": parts}],
+                     "generationConfig": {"temperature": 0.1, "maxOutputTokens": 4096,
+                                          "responseMimeType": "application/json"}},
+                    key, float(cfg["identify_timeout_s"]), tries=2)
+    if err:
+        log.warning("same-item check failed: %s", err)
+        for c in todo:
+            c["match"] = {"verdict": "unchecked", "reason": f"check failed: {err[:120]}"}
+        return 0
+    um = js.get("usageMetadata") or {}
+    usage.tokens_in += um.get("promptTokenCount", 0) or 0
+    usage.tokens_out += (um.get("candidatesTokenCount", 0) or 0) + (um.get("thoughtsTokenCount", 0) or 0)
+    cand = (js.get("candidates") or [{}])[0]
+    text = "".join(p.get("text", "") for p in (cand.get("content") or {}).get("parts", [])
+                   if isinstance(p, dict))
+    try:
+        m = re.search(r"\[.*\]", re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M), re.S)
+        rows = json.loads(m.group(0)) if m else []
+    except Exception:  # noqa: BLE001
+        rows = []
+    by_n = {int(r.get("n", 0)): r for r in rows if isinstance(r, dict)}
+    judged = 0
+    for i, c in enumerate(todo):
+        r = by_n.get(i + 1)
+        v = str((r or {}).get("verdict") or "").strip().lower()
+        if v in ("same", "similar", "different"):
+            c["match"] = {"verdict": v, "reason": _as_text((r or {}).get("reason"))[:300]}
+            judged += 1
+        else:
+            c["match"] = {"verdict": "unchecked", "reason": "no verdict in the reply"}
+    return judged
+
+
+# --------------------------------------------------------------------------- #
 # Which listings count
 # --------------------------------------------------------------------------- #
 def summarise(item: dict, res: dict, grounding: dict) -> dict:
@@ -871,16 +1119,19 @@ def summarise(item: dict, res: dict, grounding: dict) -> dict:
     on a resale site (for a shoe: StockX, and nothing else), its URL is an
     individual listing, and it is grounded: the exact page Google cited
     (`exact`), a listing on a cited site (`site`), or a page we opened that
-    shows the price (`page`).
+    shows the price (`page`). That makes it a `candidate`; since 29 Oct 2026
+    it also needs the same-item judge not to have called it `different`.
     """
     sites = SHOE_SITES if item.get("footwear") else RESALE_SITES
     comps = [c for c in (res.get("comps") or []) if isinstance(c, dict)]
     good = []
-    searched = bool(grounding.get("queries"))
+    searched = (bool(grounding.get("queries")) or bool(grounding.get("image_searches"))
+                or bool(grounding.get("direct_searches")))
     src = grounding.get("sources") or []
     src_urls = {norm_url(x["url"]) for x in src if x.get("url")}
     gdomains = {d.lower().removeprefix("www.") for d in grounding.get("domains", [])}
     gdomains |= {domain(x["url"]) for x in src if x.get("url")}
+    claimed: set[str] = set()
     for c in comps:
         if c.get("price_raw"):
             amt, cur = R.parse_price(c["price_raw"])
@@ -893,39 +1144,70 @@ def summarise(item: dict, res: dict, grounding: dict) -> dict:
         d = domain(u)
         c["domain"] = d
         c["resale_site"] = any(k in d for k in sites)
+        for site, words in NEW_ONLY_UNLESS.items():
+            if site in d:
+                text = (u + " " + str(c.get("title") or "") + " " + str(c.get("condition") or "")).lower()
+                c["resale_site"] = any(w in text for w in words)
         c["kind"] = url_kind(u)
         site_ok = bool(d) and any(d == g or d.endswith("." + g) or g.endswith("." + d)
                                   for g in gdomains if g)
         cited = [x for x in (c.get("cited") or []) if x]
-        if "cited" in c:
+        if c.get("source") in ("ebay", "lens", "lens+ebay", "vinted", "lens+page", "page"):
+            # From an API, a site's own search, or the listing page itself —
+            # not from the model's reading of a results page: the listing
+            # exists, with the price the platform showed.
+            c["verified"] = c["source"]
+        elif "cited" in c:
             if norm_url(u) in {norm_url(x) for x in cited}:
                 c["verified"] = "exact"
             else:
-                same = [x for x in cited if domain(x) == d and url_kind(x) == "listing"]
+                same = [x for x in cited if domain(x) == d and url_kind(x) == "listing"
+                        and norm_url(x) not in claimed]
                 if same:                    # the model typed the URL wrong; the cited one is real
                     c["url_as_written"], u = u, same[0]
                     c["url"], c["kind"] = u, url_kind(u)
                     c["verified"] = "exact"
+                    claimed.add(norm_url(u))    # one cited page stands in for ONE listing
                 else:
                     c["verified"] = "site" if any(domain(x) == d for x in cited) else "none"
         else:
             c["verified"] = "exact" if norm_url(u) in src_urls else ("site" if site_ok else "none")
+        if c["verified"] == "site" and _looks_invented(u, [str(x.get("url") or "") for x in comps]):
+            # On a cited site, but the page itself is the model's invention.
+            c["verified"], c["invented"] = "none", True
         if c["verified"] == "none" and (c.get("page_check") or {}).get("ok"):
             c["verified"] = "page"
         c["grounded"] = c["verified"] != "none"
-        c["counted"] = bool(searched and p > 0 and c["resale_site"] and c["kind"] == "listing"
-                            and c["grounded"]
-                            and (c.get("price_confirm") or {}).get("ok") is not False)
+        # "site" (the site was in the results, the page itself was not) is
+        # not enough to count since 29 Oct 2026: its price is only what the
+        # model read in a snippet, and its link may not open (BOA-006950).
+        # Such a listing is shown as unconfirmed; it counts once a page check
+        # shows the price (`page`).
+        c["unconfirmed"] = c["verified"] == "site"
+        c["candidate"] = bool(searched and p > 0 and c["resale_site"] and c["kind"] == "listing"
+                              and c["grounded"] and not c["unconfirmed"]
+                              and (c.get("price_confirm") or {}).get("ok") is not False)
+        verdict = (c.get("match") or {}).get("verdict")
+        if c.get("own"):                # our own listing of this product: never evidence
+            c["candidate"] = False
+        c["counted"] = c["candidate"] and verdict != "different"
         if c["counted"]:
-            good.append((p, c.get("status") == "sold", c["verified"] == "exact"))
-    sold = [p for p, s, _ in good if s]
-    listed = [p for p, s, _ in good if not s]
+            good.append((p, c.get("status") == "sold", c["verified"] in ("exact", "ebay", "lens", "lens+ebay", "vinted", "lens+page", "page"),
+                         verdict in ("same", None, "unchecked")))
+    sold = [p for p, s, *_ in good if s]
+    listed = [p for p, s, *_ in good if not s]
     pts = sold + [p * R.ASKING_FACTOR for p in listed]
-    n_exact = sum(1 for *_, e in good if e)
+    n_exact = sum(1 for _, _, e, _ in good if e)
+    n_same = sum(1 for *_, m in good if m)
+    n_different = sum(1 for c in comps
+                      if c.get("candidate") and (c.get("match") or {}).get("verdict") == "different")
+    n_own = sum(1 for c in comps if c.get("own"))
+    judged = any(c.get("match") for c in comps)
     if not searched:
         conf = "no search"           # answered from memory: nothing here is evidence
     elif len(good) >= 3 and res.get("estimate_confidence") != "low":
-        conf = "high" if (len(sold) >= 1 or n_exact >= 2) else "medium"
+        # "high" needs the listings to be the item, not only to exist.
+        conf = "high" if (len(sold) >= 1 or n_exact >= 2) and n_same >= 2 else "medium"
     elif len(good) >= 2:
         conf = "medium"
     elif len(good) == 1:
@@ -937,12 +1219,20 @@ def summarise(item: dict, res: dict, grounding: dict) -> dict:
               else R.price_item(counted, item.get("condition", ""), item.get("vnyx_price")))
     return {"comp_median_eur": round(st.median(pts), 2) if pts else None,
             "n_comps": len(good), "n_sold": len(sold), "n_exact": n_exact,
+            "n_same": n_same if judged else None, "n_different": n_different, "n_own": n_own,
             "n_offered": len(comps), "confidence": conf, **priced}
 
 
 # --------------------------------------------------------------------------- #
 # One item, end to end
 # --------------------------------------------------------------------------- #
+def thredup_target(item: dict) -> bool:
+    """A women's or kids' item (VNYX stores gender as "Women", '["women"]',
+    '["men", "women"]' ...): where thredUP has stock worth a search."""
+    g = str(item.get("gender") or "").lower()
+    return any(w in g for w in ("women", "girl", "boy", "kid", "child", "baby"))
+
+
 def _decision(vnyx: float | None, final: float | None, tier: str, tier_reason: str) -> str:
     if not final:
         return "No new price: no verified listings found. Keep the VNYX price."
@@ -957,8 +1247,12 @@ def _decision(vnyx: float | None, final: float | None, tier: str, tier_reason: s
 
 
 def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
-           identify_only: bool = False) -> dict[str, Any]:
-    """Identify, search, verify, price. Never raises; an `error` key says why."""
+           identify_only: bool = False, same_item: bool | None = None,
+           image: bool | None = None) -> dict[str, Any]:
+    """Identify, search, verify, price. Never raises; an `error` key says why.
+
+    `same_item` / `image` override the policy's same_item_check and the image
+    search (the CLI's flags, to compare a lookup with and without them)."""
     cfg = config()
     started = time.perf_counter()
     usage = Usage()
@@ -985,11 +1279,21 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
     if not item.get("images") and not item.get("label_images"):
         return done(error="the product has no photos to identify it from")
 
-    ident, err = identify(item, key, usage)
+    timings: dict[str, float] = out.setdefault("timings", {})
+
+    def timed(name: str, fn, *a, **k):
+        t0 = time.perf_counter()
+        try:
+            return fn(*a, **k)
+        finally:
+            timings[name] = round(timings.get(name, 0.0) + time.perf_counter() - t0, 1)
+
+    ident, err = timed("identify", identify, item, key, usage)
     if err:
         return done(error=err)
     out["identified"] = {k: ident.get(k, "") for k in ("brand", "model", "article_code", "era",
-                                                         "id_confidence")}
+                                                         "id_confidence", "garment_type",
+                                                         "colourway", "features")}
     out.update({k: ident.get(k, "") for k in ("resale_interest", "interest_reason",
                                               "authenticity_concerns", "catalogue_corrections")})
     out["search_terms"] = ident.get("search_terms") or []
@@ -1006,6 +1310,34 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
     out["price_source"] = "StockX only (footwear)" if shoe else "resale sites"
     search_prompt, rescue_prompt = ((SHOE_SEARCH_PROMPT, SHOE_RESCUE_PROMPT) if shoe
                                     else (SEARCH_PROMPT, RESCUE_PROMPT))
+    # The same-item judge: not for a shoe, whose StockX page is matched by its
+    # style code already.
+    judge = (cfg["same_item_check"] if same_item is None else same_item) and not shoe
+    out["same_item_check"] = bool(judge)
+
+    def judge_now(res: dict, grounding: dict) -> None:
+        summarise(item, res, grounding)               # sets each listing's `candidate`
+        timed("own_check", mark_own_listings, item, res["comps"])
+        if judge:
+            summarise(item, res, grounding)
+            timed("judge", judge_matches, ident, item, res["comps"], key, usage)
+
+    # The image search (Phase 2): not for a shoe (StockX only), not on a cache
+    # hit (the cached listings already include it, judged).
+    # thredUP (the user's ask, 29 Oct 2026): named in both search rounds, and
+    # for a women's or kids' item one search is spent on it outright — that is
+    # most of what thredUP sells.
+    thredup_txt = ("\nThis is a women's or kids' item: run ONE of the searches as "
+                   "site:thredup.com <brand> <item>, and report what it shows."
+                   if thredup_target(item) else "")
+    icfg = {**IS.DEFAULTS, **(cfg.get("image_search") or {})}
+    # Only with a key in .env: without EBAY_PRICE_CLIENT_ID/_SECRET and
+    # SERPAPI_KEY the text search is the whole lookup, as before 29 Oct, and
+    # no "no eBay keys" note is written on every product.
+    have_keys = (icfg["ebay"] and all(IS.ebay_credentials())) or (icfg["lens"] and bool(IS.serpapi_key()))
+    use_image = (have_keys if image is None else image) and not shoe
+    hints_txt = ""
+
     ckey = cache_key(ident, footwear=shoe)
     cached = None if fresh else cache_get(ckey)
     if cached:
@@ -1014,47 +1346,122 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
         if cfg["confirm_prices"]:               # listings cached before 15 Oct were never confirmed
             summarise(item, res, grounding)
             confirm_counted_prices(res["comps"])
+        judge_now(res, grounding)                 # listings cached before 29 Oct were never judged
     else:
-        res, grounding, err = search_round(
-            search_prompt.format(ident=desc, cond=item.get("condition"), size=item.get("size"),
-                                 terms="; ".join(terms[:4]), max_s=cfg["max_searches"]),
-            key, usage)
-        if err:
-            return done(error="search: " + err)
-        first = summarise(item, res, grounding)
-        if page_checks:
-            run_page_checks(res["comps"])
-            first = summarise(item, res, grounding)
-        # Too few verified: one EU-only round, merged in. A shoe: a 2nd StockX
-        # round when the first found no StockX retail price.
-        if (not res.get("retail_new_eur")) if shoe else first["n_comps"] < 2:
-            r2, g2, err2 = search_round(
-                rescue_prompt.format(ident=desc, cond=item.get("condition"),
-                                     size=item.get("size"), max_s=cfg["rescue_searches"]),
-                key, usage)
-            if not err2:
-                seen = {norm_url(c.get("url")) for c in res["comps"]}
-                res["comps"] += [c for c in r2["comps"] if norm_url(c.get("url")) not in seen]
-                grounding["queries"] += g2["queries"]
-                grounding["search_count"] += g2["search_count"]
-                grounding["sources"] += g2["sources"]
-                grounding["domains"] = sorted(set(grounding["domains"]) | set(g2["domains"]))
-                grounding["raw_answer"] += (f"\n\n--- {'StockX round 2' if shoe else 'EU round'} ---\n"
-                                            + g2["raw_answer"])
-                grounding["rescue"] = True
-                if not res.get("retail_new_eur") and r2.get("retail_new_eur"):
-                    res.update({k: r2.get(k) for k in ("retail_new_eur", "retail_raw",
-                                                       "retail_url", "retail_cited",
-                                                       "retail_style")})
-                if not res.get("resale_estimate_eur"):
-                    res.update({k: r2.get(k) for k in ("resale_estimate_eur", "estimate_confidence",
-                                                       "retail_new_eur", "reasoning")})
+        # ORDER (29 Oct 2026): the photo sources first — eBay's image search
+        # is free and Lens a cent, together ~10 s — and the Google text search
+        # (the slow, paid part: ~$0.07-0.13 and 30-60 s) only when they found
+        # fewer than `enough_from_images` same-item listings.
+        img: dict[str, Any] = {"comps": [], "hints": [], "ebay_calls": 0, "lens_calls": 0,
+                               "notes": []}
+        if use_image:
+            photos = item.get("_photos") or {}
+            front_url = next((u for u in (item.get("images") or []) if photos.get(u)), "")
+            img = timed("image_search", IS.image_search, photos.get(front_url), front_url,
+                        ident.get("brand") or item.get("brand") or "", icfg)
+            usage.lens_searches += img["lens_calls"]
+            item["_hints"] = img["hints"]
+            if img["hints"]:
+                hints_txt = ("\nImage search (eBay / Google Lens) most often calls this item: "
+                             + "; ".join(img["hints"]) + " — search those names too.")
+        out["image_search"] = {
+            "on": bool(use_image), "ebay": sum(1 for c in img["comps"] if c["source"] == "ebay"),
+            "lens": sum(1 for c in img["comps"] if c["source"].startswith("lens")),
+            "hints": img["hints"], "notes": img["notes"]}
+        # The readable sites' OWN search (29 Oct 2026, Vinted): no key, one
+        # GET a query, EU listings with price and photo — the evidence this
+        # lookup had least of. Queries: brand + model, and brand + what the
+        # image search calls it.
+        dcfg = {**SP.DEFAULTS, **(cfg.get("direct_search") or {})}
+        brand_q = ident.get("brand") or item.get("brand") or ""
+        queries = [f"{brand_q} {ident.get('model') or ident.get('garment_type') or ''}".strip()]
+        if img["hints"]:
+            queries.append(f"{brand_q} {img['hints'][0]}".strip())
+        direct = (timed("direct_search", SP.direct_search, queries, dcfg)
+                  if dcfg["vinted"] else {"comps": [], "calls": 0, "notes": []})
+        out["direct_search"] = {"on": bool(dcfg["vinted"]), "queries": queries,
+                                "vinted": len(direct["comps"]), "notes": direct["notes"]}
+        seen_direct = {norm_url(c["url"]) for c in direct["comps"]}
+        res = {"comps": direct["comps"] + [c for c in img["comps"]
+                                           if norm_url(c["url"]) not in seen_direct],
+               "estimate_confidence": "low"}
+        grounding: dict[str, Any] = {"queries": [], "domains": [], "n_sources": 0,
+                                     "search_count": 0, "sources": [], "raw_answer": ""}
+        if use_image:
+            grounding["image_searches"] = {"ebay": img["ebay_calls"], "lens": img["lens_calls"]}
+            # A Lens match on Marktplaats or Vinted came without a price: the
+            # page shows it.
+            timed("page_prices", SP.price_readable_pages, res["comps"])
+        if direct["calls"]:
+            grounding["direct_searches"] = {"vinted": direct["calls"]}
+        if use_image or direct["calls"]:
+            judge_now(res, grounding)
+        got = summarise(item, res, grounding)
+        n_from_images = got["n_same"] if got["n_same"] is not None else got["n_comps"]
+        need_text = n_from_images < int(cfg["enough_from_images"])
+        out["text_search"] = {"ran": need_text, "same_from_images": n_from_images,
+                              "enough": int(cfg["enough_from_images"])}
+
+        def merge_round(r2: dict, g2: dict, label: str) -> None:
+            seen = {norm_url(c.get("url")) for c in res["comps"]}
+            res["comps"] += [c for c in r2["comps"] if norm_url(c.get("url")) not in seen]
+            for k in ("resale_estimate_eur", "estimate_confidence", "reasoning"):
+                if r2.get(k) and (not res.get(k) or res.get(k) == "low"):
+                    res[k] = r2[k]
+            if not res.get("retail_new_eur") and r2.get("retail_new_eur"):
+                res.update({k: r2.get(k) for k in ("retail_new_eur", "retail_raw", "retail_url",
+                                                   "retail_cited", "retail_style")})
+            grounding["queries"] += g2["queries"]
+            grounding["search_count"] += g2["search_count"]
+            grounding["sources"] += g2["sources"]
+            grounding["n_sources"] = len(grounding["sources"])
+            grounding["domains"] = sorted(set(grounding["domains"]) | set(g2["domains"]))
+            grounding["raw_answer"] += (f"\n\n--- {label} ---\n" if grounding["raw_answer"] else "") \
+                + g2["raw_answer"]
+
+        if need_text:
+            r1, g1, err = timed("text_search", search_round,
+                                search_prompt.format(ident=desc, cond=item.get("condition"),
+                                                     size=item.get("size"),
+                                                     terms="; ".join(terms[:4]),
+                                                     max_s=cfg["max_searches"], hints=hints_txt,
+                                                     thredup=thredup_txt),
+                                key, usage)
+            if err and not res["comps"]:
+                return done(error="search: " + err)
+            if err:
+                out["search_error"] = err
+            else:
+                merge_round(r1, g1, "Google round 1")
+                timed("page_prices", SP.price_readable_pages, res["comps"])
                 if page_checks:
                     summarise(item, res, grounding)
-                    run_page_checks(res["comps"])
+                    timed("page_checks", run_page_checks, res["comps"])
+                judge_now(res, grounding)
+            first = summarise(item, res, grounding)
+            # Too few verified: one EU-only round, merged in — but only when
+            # NOTHING was found yet; with the image search on, the EU round
+            # rarely adds a verifiable listing (its pages refuse us) and costs
+            # ~10 s and ~4 searches. A shoe: a 2nd StockX round when the
+            # first found no StockX retail price.
+            rescue_at = 1 if (img["ebay_calls"] or img["lens_calls"]) else 2
+            if (not res.get("retail_new_eur")) if shoe else first["n_comps"] < rescue_at:
+                r2, g2, err2 = timed("rescue_search", search_round,
+                                     rescue_prompt.format(ident=desc, cond=item.get("condition"),
+                                                          size=item.get("size"),
+                                                          max_s=cfg["rescue_searches"],
+                                                          hints=hints_txt, thredup=thredup_txt),
+                                     key, usage)
+                if not err2:
+                    merge_round(r2, g2, "StockX round 2" if shoe else "EU round")
+                    grounding["rescue"] = True
+                    if page_checks:
+                        summarise(item, res, grounding)
+                        timed("page_checks", run_page_checks, res["comps"])
+                    judge_now(res, grounding)         # the new round's listings
         if cfg["confirm_prices"]:
             summarise(item, res, grounding)
-            confirm_counted_prices(res["comps"])
+            timed("confirm_prices", confirm_counted_prices, res["comps"])
         # Only a search that found something is worth reusing. An empty one is
         # often a too-specific identification ("Winter Edition 2011") that the
         # next identify of the same photos may not repeat — caching it pinned
@@ -1082,7 +1489,8 @@ def lookup(item: dict, *, fresh: bool = False, check_pages: bool | None = None,
                                         out["auth_level"], cond_flag)
     else:
         tier, tier_reason = R.trust_tier(final, item.get("vnyx_price"), s["suggested_eur"],
-                                         s["confidence"], s["n_comps"], out["auth_level"], cond_flag)
+                                         s["confidence"], s["n_comps"], out["auth_level"], cond_flag,
+                                         n_same=s.get("n_same"))
         retail = judge_retail(res, grounding, final)
     return done(
         **retail,

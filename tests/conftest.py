@@ -122,3 +122,13 @@ def _no_live_status_read(monkeypatch):
         return
     monkeypatch.setattr(rp, "vnyx_status", lambda dsn, pid: "Draft")
     monkeypatch.setattr(rp, "vnyx_sellable", lambda dsn, pid: 0)
+
+
+@pytest.fixture(autouse=True)
+def _no_site_network(monkeypatch):
+    """The readable-site search and page reads (app/pricing/site_pages.py)
+    never reach the network in a test; a test that wants them stubs its own."""
+    from app.pricing import site_pages as SP
+
+    monkeypatch.setattr(SP, "fetch", lambda url, timeout_s=20.0: None)
+    monkeypatch.setattr(SP, "direct_search", lambda queries, cfg: {"comps": [], "calls": 0, "notes": []})

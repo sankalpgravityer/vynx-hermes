@@ -12,13 +12,16 @@ them (app/pricing/resale_rules.py), find the original retail price and its
 source. Then it applies the write rules below and, unless the run is a preview,
 asks vnyx-api's `reprice` step to write the selling and/or retail price.
 
-THE WRITE RULES (the user's choices, 15 Oct 2026):
-  * selling price — only on TIER A (2+ verified listings, at most 6× the current
-    price, no authenticity or grade doubt). B and C are held for a person,
-    with the lookup's numbers in the run report.
+THE WRITE RULES (the user's choices, 15 Oct 2026; widened 29 Oct 2026):
+  * selling price — every proposal is written, tier A, B or C alike (the
+    user's rule, 29 Oct 2026: "no holds, write the price"). What protects the
+    price is upstream: the same-item judge, the own-listing check, and
+    price_item's guards (a cut needs three confirmed same-item listings,
+    items under €25 are only raised). The tier is kept in the reason.
   * retail price  — only when its source page is proven (cited by Google, or
-    opened and showing the amount), and never on a tier C product: a retail
-    price for a possibly fake item means nothing.
+    opened and showing the amount).
+  * the one HOLD left: a concrete authenticity doubt from the photos
+    (auth_level "hold") — nothing is written, a person looks.
   * preview       — computes and reports, writes nothing. The default.
 
 IN THE NORMAL FLOW TOO (16 Oct 2026). The Brain's "Reprice by brand tier"
@@ -75,8 +78,15 @@ def decide(res: dict[str, Any]) -> dict[str, Any]:
     new_price, old_price = res.get("new_price"), res.get("vnyx_price")
     new_retail, old_retail = res.get("new_retail"), res.get("retail_price")
 
-    price = new_price if tier == "A" and _changed(new_price, old_price) else None
-    retail = new_retail if tier != "C" and _changed(new_retail, old_retail) else None
+    # 29 Oct 2026, the user's rule: a proposed price is WRITTEN whatever the
+    # tier — B and C included. The guards that make a proposal still stand
+    # (price_item: a cut needs three listings confirmed the same item, items
+    # under €25 are only raised, outliers dropped; the same-item judge and
+    # the own-listing check before that). The one hold left is a concrete
+    # authenticity doubt from the photos; the tier stays in the reason.
+    doubt = res.get("auth_level") == "hold"
+    price = new_price if not doubt and _changed(new_price, old_price) else None
+    retail = new_retail if not doubt and _changed(new_retail, old_retail) else None
 
     parts = []
     if new_price:
@@ -93,12 +103,18 @@ def decide(res: dict[str, Any]) -> dict[str, Any]:
                 else "no verified listings")
     reason = " · ".join([*parts, evidence])
 
-    if not new_price:
-        status, outcome = "HELD_FOR_HUMAN", "REPRICE_NO_LISTINGS"
-    elif tier == "C":
+    # A HOLD only where a person has a decision to make (the user's ask,
+    # 29 Oct 2026: products were held with "€28.99 → €28.99"). When the
+    # lookup found nothing, or agrees with the price, or a guard kept it,
+    # nothing would be written whatever the tier — the product is done, and
+    # the outcome code still says what happened. The one exception: concrete
+    # authenticity doubt from the photos, which a person should see.
+    # A "proposal" is a suggested selling price that differs from today's: a
+    # tier B/C proposal is held for a person; no proposal is nothing to decide.
+    if doubt:
         status, outcome = "HELD_FOR_HUMAN", "REPRICE_TIER_C"
-    elif tier != "A":
-        status, outcome = "HELD_FOR_HUMAN", "REPRICE_TIER_B"
+    elif not new_price:
+        status, outcome = "VERIFIED", "REPRICE_NO_LISTINGS"
     elif price is None and retail is None:
         status, outcome = "VERIFIED", "REPRICE_UNCHANGED"
     else:
@@ -123,9 +139,41 @@ def _listings(res: dict[str, Any]) -> list[dict[str, Any]]:
                     "status": f"StockX retail {res.get('retail_raw') or ''}".strip()
                               + ("" if res.get("new_retail") else " (not proven)"),
                     "verified": res.get("retail_verified")})
-    out += [{"url": c.get("url"), "priceEur": c.get("price_eur"), "status": c.get("status"),
-             "verified": c.get("verified")}
-            for c in res.get("comps") or [] if c.get("counted")]
+    # Every judged listing, labelled (the user's ask, 29 Oct 2026): the counted
+    # ones first — "exact" (the same item, by photo or by name) or "similar"
+    # (same model, colourway not confirmed) — then the ones set aside: our own
+    # listing of this product, and different items, each with the reason. A
+    # set-aside listing carries no priceEur, so the product page's Price
+    # scanner keeps it out of the range; its price is in the label.
+    label = {"same": "exact", "similar": "similar", "unchecked": "unchecked"}
+    comps = res.get("comps") or []
+    for c in comps:
+        if not c.get("counted"):
+            continue
+        v = (c.get("match") or {}).get("verdict")
+        tag = label.get(v or "", "") if v else ""
+        out.append({"url": c.get("url"), "priceEur": c.get("price_eur"),
+                    "status": f"{c.get('status') or 'listed'}{' · ' + tag if tag else ''}",
+                    "verified": c.get("verified"),
+                    **({"sameItem": v, "reason": (c["match"].get("reason") or "")[:300]} if v else {}),
+                    **({"source": c["source"], "title": (c.get("title") or "")[:120]}
+                       if c.get("source") else {})})
+    # The set-aside rows carry their price at the FRONT of the label (the row
+    # prints "— <label> <url>"), and at most a few of each, so the priced,
+    # counted listings are what the row is about.
+    own_rows = different_rows = 0
+    for c in comps:
+        price = money(c.get("price_eur")) if c.get("price_eur") else "no price"
+        if c.get("own") and own_rows < 3:
+            own_rows += 1
+            out.append({"url": c.get("url"), "priceEur": None, "verified": c.get("verified"),
+                        "status": f"{price} · our own listing, not evidence ({c['own'].get('why')})",
+                        "sameItem": "own", "title": (c.get("title") or "")[:120]})
+        elif (c.get("match") or {}).get("verdict") == "different" and different_rows < 6:
+            different_rows += 1
+            out.append({"url": c.get("url"), "priceEur": None, "verified": c.get("verified"),
+                        "status": f"{price} · different item: {c['match'].get('reason') or '—'}",
+                        "sameItem": "different", "title": (c.get("title") or "")[:120]})
     if shoe:
         out += [{"url": c.get("url"), "priceEur": None, "status": "StockX page, no price shown",
                  "verified": c.get("verified")}
@@ -137,7 +185,7 @@ def _listings(res: dict[str, Any]) -> list[dict[str, Any]]:
         if x["url"] and x["url"] not in seen:
             seen.add(x["url"])
             uniq.append(x)
-    return uniq[:8]
+    return uniq[:20]
 
 
 def summary(res: dict[str, Any]) -> dict[str, Any]:
@@ -154,6 +202,16 @@ def summary(res: dict[str, Any]) -> dict[str, Any]:
         # "StockX only (footwear)" for a shoe, whose evidence is the StockX
         # page's retail price (retailUrl), not listings (23 Oct 2026).
         "priceSource": res.get("price_source"), "retailRaw": res.get("retail_raw"),
+        # The same-item judge (29 Oct 2026): how many counted listings it
+        # confirmed, and the ones it dropped — with its reason, for a person.
+        "nSame": res.get("n_same"), "nOwn": res.get("n_own"),
+        "imageSearch": res.get("image_search"), "textSearch": res.get("text_search"),
+        "timings": res.get("timings"),
+        "differentItems": [{"url": c.get("url"), "priceEur": c.get("price_eur"),
+                            "title": (c.get("title") or "")[:120],
+                            "reason": (c.get("match") or {}).get("reason")}
+                           for c in res.get("comps") or []
+                           if (c.get("match") or {}).get("verdict") == "different"][:8],
         "authenticity": (res.get("authenticity_concerns") or "")[:400],
         "listings": _listings(res),
         "photos": [p.get("url") for p in res.get("photos_sent") or [] if p.get("sent")],
@@ -201,6 +259,13 @@ def apply_rules(product_id: str, res: dict[str, Any], *, preview: bool) -> dict[
                  f"{'' if res.get('new_retail') else ' (not proven)'}")
     else:
         found = f"{res.get('n_comps', 0)} verified listing(s)"
+        if res.get("n_same") is not None:
+            found += (f" — {res['n_same']} the same item"
+                      + (f", {res['n_different']} different dropped" if res.get("n_different") else "")
+                      + (f", {res['n_own']} our own listing(s) set aside" if res.get("n_own") else ""))
+        ts = res.get("text_search") or {}
+        if ts and not ts.get("ran"):
+            found += f" (image search only: {ts.get('same_from_images')} same, Google skipped)"
     steps = [{"step": "lookup", "ran": True, "ok": True,
               "note": f"{found}, {res.get('searches', 0)} searches",
               "seconds": res.get("seconds")}]
