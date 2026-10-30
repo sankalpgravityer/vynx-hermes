@@ -568,6 +568,45 @@ resale_lookup:
   # call, no cost): use the page's own price when the model read it wrong, drop
   # the listing when the page shows no price. Sites that block us (403) are kept.
   confirm_prices: true
+  # The same-item judge (29 Oct 2026): one text call comparing each listing's
+  # title/colour/size with what the identify call saw in our photos. A
+  # "different" listing is dropped; a "similar" one may raise the price but
+  # never cut it. Listing pages cannot be opened (eBay, Grailed, Etsy and
+  # Kleinanzeigen answer 403, to us and to Google's fetcher), so this is the
+  # only same-item evidence there is until the eBay image API (Phase 2).
+  same_item_check: true
+  match_model: null       # null: identify_model
+  # Search by PHOTO (29 Oct 2026, Phase 2): eBay's Browse API search_by_image
+  # (free; EBAY_PRICE_CLIENT_ID / _SECRET) and Google Lens through SerpApi
+  # (paid per search; SERPAPI_KEY). Their listings carry a photo, so the
+  # same-item judge compares pictures, and their titles tell the text search
+  # what the item is called. Not for shoes (StockX only).
+  # The Google text search (slow and paid) runs only when the image search
+  # found fewer same-item listings than this.
+  enough_from_images: 3
+  # The tenants' own seller accounts on eBay: their listings of the product
+  # are shown but never counted (BOA-006463 was priced against itself).
+  # Own listings are also caught by their photo being one of ours.
+  own_sellers:
+    BOAS: ["boas-savefashionforgood"]
+  own_photo_max_distance: 15
+  own_price_match_distance: 20   # this far apart still ours when the listing asks exactly our price
+  # The readable sites' own search (29 Oct 2026): Vinted answers a plain GET
+  # with listings, prices and photos — EU evidence with no key and no cost.
+  # Marktplaats and Vinted listing pages are read for a price when a Lens or
+  # Google result came without one.
+  direct_search:
+    vinted: true
+    vinted_domains: ["vinted.nl"]
+    limit: 10
+  image_search:
+    ebay: true
+    ebay_marketplaces: ["EBAY_DE", "EBAY_GB", "EBAY_US"]
+    ebay_limit: 8           # matches asked per marketplace
+    lens: true
+    lens_country: "nl"
+    lens_max: 12            # resale-site matches kept from Lens
+    lens_price_per_search_usd: 0.01   # for the cost line; the SerpApi plan is the truth
   cache_days: 21          # the same model in another size reuses the listings
   cache_dir: ".cache/resale"
   identify_timeout_s: 120

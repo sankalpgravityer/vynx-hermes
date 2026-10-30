@@ -36,7 +36,7 @@ EU_TLDS = ("de", "nl", "fr", "it", "es", "be", "at", "ie", "pt", "pl", "se", "dk
            "cz", "gr", "lu", "hu", "ro", "sk", "si", "lt", "lv", "ee", "hr")
 EU_SITES = ("vinted", "vestiairecollective", "marktplaats", "2dehands", "kleinanzeigen",
             "leboncoin", "vide-dressing", "wallapop", "subito", "tise", "sellpy", "zalando")
-US_SITES = ("poshmark", "mercari", "therealreal", "ebay.com")
+US_SITES = ("poshmark", "mercari", "therealreal", "ebay.com", "thredup")
 GLOBAL_SITES = ("grailed", "depop", "etsy", "stockx")
 
 # How much a listing counts, and the price level it is scaled to (EU = 1).
@@ -52,8 +52,15 @@ ASKING_WEIGHT = 0.7
 
 
 def region_of(url: str, location: str = "") -> str:
-    loc = (location or "").lower()
+    loc = (location or "").lower().strip()
     if loc:
+        # A bare ISO code (eBay's itemLocation.country: "US", "GB", "DE").
+        if loc in ("us", "ca"):
+            return "US"
+        if loc in ("gb", "uk"):
+            return "UK"
+        if loc in EU_TLDS:
+            return "EU"
         if any(w in loc for w in ("united states", "usa", " us", "canada")):
             return "US"
         if any(w in loc for w in ("united kingdom", " uk", "england", "london", "scotland")):
@@ -266,14 +273,19 @@ def price_item(comps: list[dict], our_condition: str, vnyx_price: float | None) 
     plain = st.median([c["price_eur"] for c in priced]) if priced else None
     base = eu if eu is not None else wm
     sug = round99(base) if base else None
+    # A cut needs listings that are the SAME item (29 Oct 2026): a listing the
+    # same-item judge called "similar" counts for a raise, never for a cut.
+    # Listings without a verdict (judge off, or failed) count as before.
+    n_same = sum(1 for c in priced
+                 if (c.get("match") or {}).get("verdict") in (None, "same", "unchecked"))
     note = ""
     if sug and vnyx_price and sug < vnyx_price:
         if vnyx_price < NO_CUT_BELOW:
             sug, note = vnyx_price, (f"listings ~€{base:.0f}, kept VNYX "
                                      f"(items under €{NO_CUT_BELOW:.0f} are only raised)")
-        elif len(adj) < MIN_COMPS_TO_CUT:
-            sug, note = vnyx_price, (f"listings ~€{base:.0f} but only {len(adj)} — "
-                                     f"too few to cut, kept VNYX")
+        elif n_same < MIN_COMPS_TO_CUT:
+            sug, note = vnyx_price, (f"listings ~€{base:.0f} but only {n_same} confirmed the "
+                                     f"same item — too few to cut, kept VNYX")
     flag = ""
     if sug and vnyx_price:
         r = sug / vnyx_price
@@ -376,7 +388,8 @@ def auth_level(text: str) -> str:
 # --------------------------------------------------------------------------- #
 # 6. Trust tiers — what may be accepted without a second look
 # --------------------------------------------------------------------------- #
-def trust_tier(final, vnyx, suggested, confidence, n, auth, cond_flag=False) -> tuple[str, str]:
+def trust_tier(final, vnyx, suggested, confidence, n, auth, cond_flag=False,
+               n_same=None) -> tuple[str, str]:
     """A = safe to accept; B = spot-check; C = a person must look.
 
     v3 thresholds (24 Sep 2026, from 261 of Balazs's decisions): verified raises
@@ -394,6 +407,12 @@ def trust_tier(final, vnyx, suggested, confidence, n, auth, cond_flag=False) -> 
     if not suggested:
         return "B", "estimate — no verified listings"
     n = n or 0
+    # Since 29 Oct 2026 the same-item judge says which listings ARE the item:
+    # tier A needs two of those, not two "similar" ones (BOA-006463 reached
+    # A on three similar jackets and none confirmed).
+    if n_same is not None and n_same < 2:
+        return "B", (f"only {n_same} listing{'s' if n_same != 1 else ''} confirmed the same item"
+                     f" ({n} counted)")
     if confidence in ("high", "medium") and n >= 2 and r <= 6:
         return "A", f"{n} verified listings, {r:.1f}× VNYX"
     if r > 6:

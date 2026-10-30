@@ -154,6 +154,10 @@ def money(x: Any) -> str:
 
 
 def _why_not(c: dict) -> str:
+    if c.get("own"):
+        return f"OUR OWN listing of this product: {c['own'].get('why')}"
+    if (c.get("match") or {}).get("verdict") == "different":
+        return f"different item: {c['match'].get('reason') or '—'}"
     if c.get("outlier"):
         return "outlier (over 3× from the others)"
     if not c.get("price_eur"):
@@ -164,6 +168,10 @@ def _why_not(c: dict) -> str:
         return "not a resale site"
     if c.get("kind") != "listing":
         return f"not a listing page ({c.get('kind')})"
+    if c.get("invented"):
+        return "the URL looks made up (no real item number, or a repeated one) — not a real listing"
+    if c.get("unconfirmed"):
+        return "unconfirmed: the site was in the results but not this page — the price is as the model read it"
     if not c.get("grounded"):
         pc = c.get("page_check") or {}
         return "not verified" + (f": {pc['why']}" if pc.get("why") else "")
@@ -204,9 +212,42 @@ def render(r: dict) -> str:
     if r.get("decision"):
         L.append(f"  Decision     {r['decision']}")
     if "n_comps" in r:
+        same = (f" · same item: {r['n_same']} confirmed, {r.get('n_different', 0)} different"
+                if r.get("n_same") is not None else
+                (" · same-item check OFF" if r.get("same_item_check") is False else ""))
         L.append(f"  Basis        {r.get('basis') or '—'} · {r['n_comps']} verified of "
                  f"{r.get('n_offered', 0)} found ({r.get('n_sold', 0)} sold, {r.get('n_eu', 0)} EU)"
-                 f" · confidence {r.get('confidence')}")
+                 f" · confidence {r.get('confidence')}{same}")
+        isr = r.get("image_search")
+        if isr:
+            if isr.get("on"):
+                L.append(f"  Image search eBay {isr.get('ebay', 0)} listing(s) · Lens {isr.get('lens', 0)} resale match(es)"
+                         + (f" · calls it: {'; '.join(isr['hints'])}" if isr.get("hints") else ""))
+            else:
+                L.append("  Image search OFF")
+            for n in isr.get("notes") or []:
+                L.append(f"               ! {n}")
+        ds = r.get("direct_search")
+        if ds:
+            L.append(f"  Site search  Vinted {ds.get('vinted', 0)} listing(s) for: "
+                     + " / ".join(f'"{q}"' for q in ds.get("queries") or []) if ds.get("on") else "  Site search  OFF")
+            for n in ds.get("notes") or []:
+                L.append(f"               ! {n}")
+        ts = r.get("text_search")
+        if ts:
+            L.append("  Text search  " + (f"ran (image search found {ts.get('same_from_images')} same-item "
+                                           f"listing(s), fewer than {ts.get('enough')})" if ts.get("ran")
+                                           else f"SKIPPED — image search found {ts.get('same_from_images')} "
+                                                f"same-item listings (enough: {ts.get('enough')})"))
+        if r.get("search_error"):
+            L.append(f"  Text search  FAILED: {r['search_error']}")
+        if r.get("n_own"):
+            L.append(f"  Own listings {r['n_own']} of ours found and set aside (not evidence)")
+        ident = r.get("identified") or {}
+        if ident.get("colourway") or ident.get("features"):
+            L.append(f"  Looks like   {ident.get('garment_type') or ''} · {ident.get('colourway') or ''}")
+            for f in ident.get("features") or []:
+                L.append(f"               - {f}")
         if r.get("model_estimate_eur"):
             L.append(f"  Model guess  {money(r['model_estimate_eur'])} (shown only; never used as the price)")
     for label, key in (("Flag", "price_flag"), ("Note", "price_note")):
@@ -228,10 +269,18 @@ def render(r: dict) -> str:
         L.append("  Listings")
         for c in sorted(comps, key=lambda c: not c.get("counted")):
             state = "COUNTED" if c.get("counted") else "skipped"
+            via = {"ebay": "eBay image", "lens": "Lens", "lens+ebay": "Lens+eBay", "vinted": "Vinted search",
+                   "lens+page": "Lens, price from the page", "page": "price from the page"}.get(c.get("source") or "", "")
             L.append(f"    {state:<8}{money(c.get('price_eur')):>10}  {(c.get('status') or '?'):<6} "
-                     f"{(c.get('region') or '·'):<6} {(c.get('verified') or '·'):<5}  {c.get('url') or '(no url)'}")
+                     f"{(c.get('region') or '·'):<6} {(c.get('verified') or '·'):<5}  {c.get('url') or '(no url)'}"
+                     + (f"  [{via}{', photo judged' if c.get('photo_judged') else ''}]" if via else ""))
+            if c.get("source") and c.get("title"):
+                L.append(f"            {c['title'][:110]}")
             if not c.get("counted"):
                 L.append(f"            why: {_why_not(c)}")
+            m = c.get("match")
+            if m and (c.get("counted") or m.get("verdict") != "different"):
+                L.append(f"            same item? {m.get('verdict')}: {m.get('reason') or '—'}")
             pc = c.get("price_confirm")
             if pc:
                 L.append(f"            price check: {pc.get('why')}")
@@ -243,6 +292,8 @@ def render(r: dict) -> str:
                      else "EU second round ran")
     L.append(f"  Spent        {r.get('searches', 0)} searches · ~${r.get('cost_usd', 0):.3f} · "
              f"{r.get('seconds', 0)} s" + (f" · {'; '.join(extra)}" if extra else ""))
+    if r.get("timings"):
+        L.append("  Time         " + " · ".join(f"{k} {v}s" for k, v in r["timings"].items()))
     return "\n".join(L)
 
 
@@ -298,6 +349,10 @@ def main() -> int:
                     help="ignore listings cached from the same model in the last 21 days")
     ap.add_argument("--no-page-check", action="store_true",
                     help="do not open uncited listing pages to confirm their price")
+    ap.add_argument("--no-same-item-check", action="store_true",
+                    help="skip the same-item judge (to compare with the lookup as it was before 29 Oct)")
+    ap.add_argument("--no-image-search", action="store_true",
+                    help="skip the eBay image search and Google Lens (text search only, as before)")
     ap.add_argument("--prod", action="store_true",
                     help="read the products from vnyx-prod, in a READ-ONLY session")
     ap.add_argument("--workers", type=int, default=1, help="products looked up at once (default 1)")
@@ -340,7 +395,9 @@ def main() -> int:
             return {"sku": row["sku"], "tenant": row["tenant"],
                     "error": f"could not load the product: {type(exc).__name__}: {exc}"}
         return RL.lookup(item, fresh=a.fresh, check_pages=not a.no_page_check,
-                         identify_only=a.identify_only)
+                         identify_only=a.identify_only,
+                         same_item=False if a.no_same_item_check else None,
+                         image=False if a.no_image_search else None)
 
     print(f"Looking up {len(rows)} product(s); each takes about 30-90 s ...", flush=True)
     results: list[dict] = []

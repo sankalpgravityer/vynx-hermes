@@ -60,16 +60,34 @@ def test_tier_a_writes_both_prices():
         (367.99, 256.28, "VERIFIED", "REPRICED")
 
 
-def test_tier_b_holds_the_price_but_writes_a_proven_retail():
+def test_tier_b_and_c_proposals_are_written_too():
+    """The user's rule, 29 Oct 2026: no holds — write the price, tier B or C."""
     d = reprice.decide(lookup_result(tier="B", tier_reason="only 1 listing"))
-    assert d["price"] is None and d["retail"] == 256.28
-    assert (d["status"], d["outcome"]) == ("HELD_FOR_HUMAN", "REPRICE_TIER_B")
+    assert (d["price"], d["retail"]) == (367.99, 256.28)
+    assert (d["status"], d["outcome"]) == ("VERIFIED", "REPRICED")
+    assert "tier B" in d["reason"]
+    d = reprice.decide(lookup_result(tier="C", tier_reason="big cut (0.3× VNYX)", new_price=99.99))
+    assert d["price"] == 99.99 and d["outcome"] == "REPRICED"
 
 
-def test_tier_c_writes_nothing():
-    d = reprice.decide(lookup_result(tier="C", tier_reason="authenticity or grade doubt"))
+def test_a_hold_only_where_there_is_a_decision_to_make():
+    """29 Oct 2026: products were held with '€28.99 -> €28.99'. Nothing to
+    write = done, whatever the tier; the outcome code still says why."""
+    d = reprice.decide(lookup_result(tier="B", tier_reason="only 1 listing", new_price=223.99,
+                                     new_retail=None, retail_new_eur=None))
+    assert (d["status"], d["outcome"]) == ("VERIFIED", "REPRICE_UNCHANGED")
+    assert d["price"] is None
+    # Concrete authenticity doubt is the one thing a person should always see.
+    d = reprice.decide(lookup_result(tier="C", tier_reason="authenticity or grade doubt",
+                                     new_price=223.99, new_retail=None, auth_level="hold"))
+    assert (d["status"], d["outcome"]) == ("HELD_FOR_HUMAN", "REPRICE_TIER_C")
+
+
+def test_authenticity_doubt_is_the_one_hold_left():
+    d = reprice.decide(lookup_result(tier="C", tier_reason="authenticity or grade doubt",
+                                     auth_level="hold"))
     assert d["price"] is None and d["retail"] is None
-    assert d["outcome"] == "REPRICE_TIER_C"
+    assert (d["status"], d["outcome"]) == ("HELD_FOR_HUMAN", "REPRICE_TIER_C")
 
 
 def test_an_unproven_retail_is_never_written():
@@ -78,9 +96,9 @@ def test_an_unproven_retail_is_never_written():
     assert "not proven" in d["reason"]
 
 
-def test_no_listings_is_held():
+def test_no_listings_is_done_not_held():
     d = reprice.decide(lookup_result(new_price=None, tier="", new_retail=None))
-    assert (d["status"], d["outcome"]) == ("HELD_FOR_HUMAN", "REPRICE_NO_LISTINGS")
+    assert (d["status"], d["outcome"]) == ("VERIFIED", "REPRICE_NO_LISTINGS")
 
 
 def test_same_prices_are_unchanged_not_rewritten():
@@ -241,14 +259,13 @@ def test_no_answer_from_vnyx_api_skips_it(chain):
     assert report is None and steps[0]["ran"] is False
 
 
-def test_tier_b_writes_no_selling_price_and_does_not_hold(chain):
+def test_tier_b_writes_the_selling_price_in_the_chain_too(chain):
     chain["result"] = lookup_result(tier="B", retail_verified=None, new_retail=None,
                                     retail_new_eur=None)
     steps, report = reprice.in_chain(ROW, verify_snap(["LUXURY"]))
-    assert chain["writes"] == []
-    assert report["outcome"] == "REPRICE_TIER_B"
-    assert [s["step"] for s in steps] == ["lookup", "reprice"]
-    assert "selling price left as it was" in steps[-1]["why"]
+    assert chain["writes"] == [(367.99, None)]
+    assert report["outcome"] == "REPRICED"
+    assert [s["step"] for s in steps] == ["lookup", "reprice"] and steps[-1]["ran"]
 
 
 def test_a_failed_lookup_is_a_note_not_a_failure(chain):

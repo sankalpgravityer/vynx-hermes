@@ -145,6 +145,10 @@ def test_trust_tiers():
     assert R.trust_tier(1200, 500, 1200, "high", 3, "")[0] == "C"    # over €1,000
     assert R.trust_tier(450, 50, 450, "high", 1, "")[0] == "C"       # over 8x from one listing
     assert R.trust_tier(350, 50, 350, "high", 3, "")[0] == "B"       # raise over 6x
+    # Judged: tier A needs two listings confirmed the same item, not two similar ones.
+    assert R.trust_tier(80, 50, 80, "high", 3, "", n_same=0)[0] == "B"
+    assert "0 listings confirmed" in R.trust_tier(80, 50, 80, "high", 3, "", n_same=0)[1]
+    assert R.trust_tier(80, 50, 80, "high", 3, "", n_same=2)[0] == "A"
 
 
 def test_auth_level():
