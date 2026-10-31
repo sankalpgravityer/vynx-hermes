@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -260,6 +261,16 @@ def read_sheet(path: Path, reason_col: str | None = None) -> list[dict[str, str]
                        if i_reason is not None and r[i_reason] else ""),
         })
     return out
+
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def product_entry(value: str) -> dict[str, str]:
+    """One --product value as a sheet row: a product id, or else a SKU."""
+    v = value.strip()
+    return {"id": v if _UUID_RE.match(v) else "", "sku": "" if _UUID_RE.match(v) else v,
+            "tenant": "", "reason": ""}
 
 
 def eligibility_clauses(retry: bool = False,
@@ -840,7 +851,8 @@ class Parallel:
                  skip_matte: bool = False,
                  price_rounding_only: bool = False,
                  skip_price: bool = False,
-                 approve_from_rejected: bool = False) -> None:
+                 approve_from_rejected: bool = False,
+                 force_recut: bool = False) -> None:
         import queue
         import threading
 
@@ -856,6 +868,7 @@ class Parallel:
         self.price_rounding_only = price_rounding_only
         self.skip_price = skip_price
         self.approve_from_rejected = approve_from_rejected
+        self.force_recut = force_recut
         self.submitted = 0
         # Set by the first worker that sees a run-level stop — the canary or
         # a vision outage. The main loop reads it before every submit and the
@@ -934,6 +947,7 @@ class Parallel:
                                       price_rounding_only=self.price_rounding_only,
                                       skip_price=self.skip_price,
                                       approve_from_rejected=self.approve_from_rejected,
+                                      force_recut=self.force_recut,
                                       silent=True, section=section_of(row))
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             with lock:
@@ -1084,7 +1098,11 @@ def close_run(run_id: str, reason: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--sheet", required=True, help="xlsx with a Product id or SKU column")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--sheet", help="xlsx with a Product id or SKU column")
+    src.add_argument("--product", action="append", metavar="SKU_OR_ID",
+                     help=("one product by SKU or product id, instead of a sheet. "
+                           "Repeat for a few: --product BOA-007069 --product BOA-007070"))
     ap.add_argument("--db", "--dsn", dest="db", metavar="URL",
                     help=("database URL, for parity with repair_product.py. Sets "
                           "DATABASE_URL for this process so the queue, the events "
@@ -1191,6 +1209,12 @@ def main() -> int:
     ap.add_argument("--retry", action="store_true",
                     help="re-verify a product that already has a verdict — which "
                          "a dry run leaves behind. Refuses one that is in flight.")
+    ap.add_argument("--recut", action="store_true",
+                    help=("re-cut EVERY existing cut-out, not only the ones the check "
+                          "calls bad — e.g. to give bags the v3 bag parser. Still "
+                          "behind --keep-better: a new cut-out replaces the old one "
+                          "only when it is at least as complete. Needs --apply to "
+                          "write anything."))
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     ap.add_argument("--log", metavar="FILE",
                     help="also append everything to FILE, in UTF-8. Use this "
@@ -1236,11 +1260,19 @@ def main() -> int:
             print(f"  PROBLEM: {p}")
         return 2
 
-    entries = read_sheet(Path(args.sheet),
-                         args.hold_reason_column or args.hold_column)
+    if args.product:
+        entries = [product_entry(v) for v in args.product]
+        source = "the command line"
+    else:
+        entries = read_sheet(Path(args.sheet),
+                             args.hold_reason_column or args.hold_column)
+        source = args.sheet
     if args.limit:
         entries = entries[: args.limit]
-    print(f"\n{len(entries)} product(s) in {args.sheet}")
+    print(f"\n{len(entries)} product(s) from {source}")
+    if args.recut:
+        print("re-cut        : EVERY cut-out is re-cut (--recut), kept only when "
+              "at least as complete")
 
     mode = "LIVE" if args.approve else "SHADOW"
     print(f"mode          : {mode}"
@@ -1450,7 +1482,8 @@ def main() -> int:
                                 skip_matte=args.no_matte,
                                 price_rounding_only=args.price_rounding_only,
                                 skip_price=args.no_price,
-                                approve_from_rejected=args.approve_rejected)
+                                approve_from_rejected=args.approve_rejected,
+                                force_recut=args.recut)
             if pool.abort:
                 # A worker saw a run-level stop. The row this iteration just
                 # enqueued would otherwise sit QUEUED with nothing to claim it.
@@ -1576,6 +1609,7 @@ def main() -> int:
                                   price_rounding_only=args.price_rounding_only,
                                   skip_price=args.no_price,
                                   approve_from_rejected=args.approve_rejected,
+                                  force_recut=args.recut,
                                   section=section_of(row))
 
         after = db.fetch_one(
