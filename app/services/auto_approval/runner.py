@@ -429,6 +429,8 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                skip_price: bool = False,
                approve_from_rejected: bool = False,
                force_recut: bool = False,
+               force_rerender: bool = False,
+               rerender_before: Any = None,
                silent: bool = False,
                section: str = "REVIEW") -> str | None:
     """One claimed product, start to finish. Never raises.
@@ -474,6 +476,8 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
 
     `force_recut` re-cuts every existing cut-out (run_from_sheet --recut), still
     behind --keep-better — see repair()'s parameter of the same name.
+    `force_rerender` / `rerender_before` re-make the AI images made before that
+    time (all of them when None) on the current prompt (run_from_sheet --rerender).
 
     `section` is the products-list section the run pulls from. REVIEW for
     every caller but a run the Overview scoped to Approved or Rejected. Those
@@ -670,6 +674,8 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                 skip_price=skip_price,
                 approve_from_rejected=approve_from_rejected,
                 force_recut=force_recut,
+                force_rerender=force_rerender,
+                rerender_before=rerender_before,
                 publish=rs.publish_on_approve,
                 # The agent's approvals only (this is the runner, never the
                 # manual flow): which Shopify status the approval publishes with.

@@ -173,3 +173,11 @@ def test_force_recut_reaches_repair_only_when_asked(captured):
     # 1 Nov 2026, run_from_sheet --recut: re-cut every cut-out (bags → v3).
     assert _run(captured, force_recut=True)["force_recut"] is True
     assert _run(captured)["force_recut"] is False
+
+
+def test_force_rerender_reaches_repair_only_when_asked(captured):
+    # 1 Nov 2026, run_from_sheet --rerender: re-make the AI images on the new prompt.
+    when = object()
+    seen = _run(captured, force_rerender=True, rerender_before=when)
+    assert seen["force_rerender"] is True and seen["rerender_before"] is when
+    assert _run(captured)["force_rerender"] is False
