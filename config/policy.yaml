@@ -824,11 +824,22 @@ imagery:
     # it is the product's colour in the photo, an opening (a handle, a heel's arch, the
     # space between two shoes) otherwise. 0.9: at 0.5, shaded table beside a dark sole
     # (0.53-0.89) refused 7 of 70 clean held-out cut-outs. `object: false` turns it off.
+    #
+    # THE BAG PARSER (1 Nov 2026; `cloth-seg-ft-bag`, HERMES_CLOTH_SEG_FT_BAG_PATH =
+    # cloth_seg_ft_v3.onnx). Round 3 of the fine-tune was trained with bags: on the bag
+    # test set it beats v2 by a wide margin (overlap 0.81 → 0.96, background left in on
+    # 60 → 12 photos, pieces missing on 78 → 16) and ties it on ordinary garments, but
+    # keeps the hook or the mannequin's neck on ~34 of 373 held hung garments — so bags
+    # ONLY. With `bag_parser: true` and the file configured, a bag's chain is
+    # cloth-seg-ft-bag → object-isnet → `then`; a v3 cut-out the object checks refuse
+    # falls through to IS-Net as before. Shoes stay IS-Net first; garments never see v3.
+    # No file on the machine = IS-Net alone, as before. `bag_parser: false` turns it off.
     object:
       enabled: true
       families: ["footwear", "bags"]
       origins: []
       model: "isnet-general-use"
+      bag_parser: true
       # then: ["gemini-paint", "openai-paint"]   # off since 10 Oct 2026 — see `strategies`
       then: []
       min_kept: 0.003

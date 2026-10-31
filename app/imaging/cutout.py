@@ -580,6 +580,20 @@ _CLOTH_FT_PATH = os.getenv("HERMES_CLOTH_SEG_FT_PATH", "")
 # two together decide the case the leftover check gets wrong most — see
 # `agreement_min_iou`.
 _CLOTH_FT_BACKUP_PATH = os.getenv("HERMES_CLOTH_SEG_FT_BACKUP_PATH", "")
+# THE BAG PARSER (strategy `cloth-seg-ft-bag`), 1 Nov 2026 — round 3 (cloth_seg_ft_v3.onnx)
+# FOR BAGS ONLY.
+#
+# v3 was trained with bags added to the set. Against the hand masks it beats v2 on bags
+# by a wide margin (overlap 0.81 → 0.96; background left in on 60 → 12 photos; pieces
+# missing on 78 → 16) and ties it on ordinary decision and photobooth photos (1,257:
+# 0.9921 vs 0.9925), but on held garments hung on a hanger or a mannequin it keeps
+# the hook or the neck on about 34 of 373 — so it is NOT the garment parser. Products
+# whose category is a bag (`object.families`) get it first, ahead of IS-Net's
+# whole-object cut, judged by the object checks like everything on that route; a
+# cut-out it loses falls through to `object-isnet` exactly as before. Shoes and
+# garments never see it. A path, like the two above: unset or missing, the bags
+# route is IS-Net alone, as it was.
+_CLOTH_FT_BAG_PATH = os.getenv("HERMES_CLOTH_SEG_FT_BAG_PATH", "")
 _cloth_sessions: dict[str, Any] = {}
 _cloth_unavailable: str | None = None
 
@@ -634,6 +648,20 @@ def _cloth_seg_ft_backup(data: bytes) -> tuple[bytes | None, str | None]:
     if not os.path.isfile(_CLOTH_FT_BACKUP_PATH):
         return None, f"the backup fine-tuned cloth-seg model file is missing: {_CLOTH_FT_BACKUP_PATH}"
     return _cloth_seg(data, _CLOTH_FT_BACKUP_PATH)
+
+
+def _bag_ft_available() -> bool:
+    """Is the bag parser (v3, `_CLOTH_FT_BAG_PATH`) configured and present on this machine?"""
+    return bool(_CLOTH_FT_BAG_PATH) and os.path.isfile(_CLOTH_FT_BAG_PATH)
+
+
+def _cloth_seg_ft_bag(data: bytes) -> tuple[bytes | None, str | None]:
+    """The bag parser (v3), when one is configured. Never raises."""
+    if not _CLOTH_FT_BAG_PATH:
+        return None, "the bag parser is not configured (HERMES_CLOTH_SEG_FT_BAG_PATH is unset)"
+    if not os.path.isfile(_CLOTH_FT_BAG_PATH):
+        return None, f"the bag parser model file is missing: {_CLOTH_FT_BAG_PATH}"
+    return _cloth_seg(data, _CLOTH_FT_BAG_PATH)
 
 
 def _alpha_agreement(a_png: bytes, b_png: bytes) -> float | None:
@@ -2310,12 +2338,17 @@ def _intersect_alpha(mask_png: bytes, cloth_png: bytes) -> tuple[bytes | None, s
 # because a caller may now ask for a SUBSET of them by name (`strategies` /
 # `skip`) and the endpoint has to be able to say which names exist without
 # reaching into the chain below.
-STRATEGY_NAMES = ("object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg",
-                  "gemini-mask", "openai-mask", "gemini-paint", "openai-paint")
+STRATEGY_NAMES = ("cloth-seg-ft-bag", "object-isnet", "hanger-isnet", "cloth-seg-ft", "cloth-seg-ft-backup",
+                  "cloth-seg", "gemini-mask", "openai-mask", "gemini-paint", "openai-paint")
 # The GARMENT PARSERS among them: trained to keep cloth and drop the stand and the wall,
 # so the stand and wall checks give their answers the benefit of the doubt where a colour
 # test cannot judge (`stand_parser_garment_foot`, `leftover_wall_coloured_garment`).
-PARSER_STRATEGIES = ("cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg")
+PARSER_STRATEGIES = ("cloth-seg-ft-bag", "cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg")
+# The parser for BAGS (v3, `_CLOTH_FT_BAG_PATH`, 1 Nov 2026): first on the bags route,
+# ahead of the object cut, when the model file is here and `object.bag_parser` is on.
+# Part of that route, not a separate ask: any caller whose allow-list lets `object-isnet`
+# run gets it, so vnyx-api's lists and `recut_strategies` need no change.
+BAG_PARSER = "cloth-seg-ft-bag"
 # The strategy for photographs HUNG ON THE WALL (app/imaging/hanger_cutout.py): IS-Net
 # keeps the whole garment, clips included, and only the thin hanger parts are
 # painted out. Runs first, and only when the caller says where the photo came from
@@ -2336,7 +2369,8 @@ FRAME_ONLY = "frame-only"
 def object_config(pol: dict[str, Any] | None = None) -> dict[str, Any]:
     """`imagery.cutout.object` with defaults filled in."""
     out: dict[str, Any] = {"enabled": True, "families": ["footwear", "bags"], "origins": [],
-                           "model": "isnet-general-use", "then": ["gemini-paint", "openai-paint"],
+                           "model": "isnet-general-use", "bag_parser": True,
+                           "then": ["gemini-paint", "openai-paint"],
                            "min_kept": 0.003, "max_kept": 0.70, "max_edge": 0.002,
                            "edge_frac": 0.005, "tear_coloured": 0.9}
     block = (((pol if pol is not None else policy()).get("imagery") or {})
@@ -2938,9 +2972,11 @@ def _remove_background(
     # bag on a wall hook is a WEB photo, but there is no hanger bar to find.
     family = object_route(garment, origin, ocfg)
     on_hanger = hanger_route(origin, hcfg) and not family
+    # A BAG: the bag parser (v3) before the object cut, when this machine has it.
+    bag_parsed = family == "bags" and bool(ocfg.get("bag_parser", True)) and _bag_ft_available()
     if family:
-        log.info("bg-removal: %r is %s — the object cut-out first, judged by the object checks",
-                 garment, family)
+        log.info("bg-removal: %r is %s — the %s first, judged by the object checks", garment, family,
+                 "bag parser (v3), then the object cut-out" if bag_parsed else "object cut-out")
     elif origin:
         log.info("bg-removal: origin %s — %s", origin,
                  "hung on the wall: IS-Net first" if on_hanger else "garment parser first")
@@ -2974,6 +3010,9 @@ def _remove_background(
     mask_prompt = _product_prompt(MASK_PROMPT, family)
     openai_prompt = _product_prompt(OPENAI_PROMPT, family)
     chain = (
+        # A BAG: the parser fine-tuned with bags (v3), before IS-Net. Dropped from the
+        # chain below unless `bag_parsed`.
+        (BAG_PARSER, "direct", lambda: _cloth_seg_ft_bag(data)),
         # A SHOE OR A BAG: IS-Net, the whole product. Dropped from the chain below
         # unless `family` — or the caller asked for it by name (a garment, one piece).
         (OBJECT, "direct", lambda: _object_isnet(data, ocfg, single=not family)),
@@ -3044,16 +3083,19 @@ def _remove_background(
     # Judged by the garment checks, not the object checks, when the product is not
     # a shoe or a bag.
     object_asked = bool(wanted and OBJECT in wanted
-                        and not ({"cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg"} & wanted))
-    chain = tuple(s for s in chain if (wanted is None or s[0] in wanted) and s[0] not in banned
-                  and (s[0] != HANGER or on_hanger) and (s[0] != OBJECT or family or object_asked))
+                        and not ({"cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg", BAG_PARSER} & wanted))
+    # The bag parser is the bags route's own first step: allowed wherever the object cut is.
+    allowed = (lambda n: wanted is None or n in wanted or (n == BAG_PARSER and OBJECT in wanted))
+    chain = tuple(s for s in chain if allowed(s[0]) and s[0] not in banned
+                  and (s[0] != HANGER or on_hanger) and (s[0] != OBJECT or family or object_asked)
+                  and (s[0] != BAG_PARSER or bag_parsed))
     if family:
-        # THE OBJECT CHAIN: the object strategy, then `object.then` in that order —
-        # whatever of them the caller allows. A caller that allowed none of them (an
-        # explicit `strategies` naming only cloth-seg, say) keeps the chain it asked for;
-        # the object checks below still judge it.
+        # THE OBJECT CHAIN: the bag parser (a bag, when configured), the object strategy,
+        # then `object.then` in that order — whatever of them the caller allows. A caller
+        # that allowed none of them (an explicit `strategies` naming only cloth-seg, say)
+        # keeps the chain it asked for; the object checks below still judge it.
         then = [str(n) for n in ocfg.get("then") or []]
-        mine = [s for s in chain if s[0] == OBJECT] + \
+        mine = [s for s in chain if s[0] == BAG_PARSER] + [s for s in chain if s[0] == OBJECT] + \
             sorted((s for s in chain if s[0] in then), key=lambda s: then.index(s[0]))
         if mine:
             chain = tuple(mine)

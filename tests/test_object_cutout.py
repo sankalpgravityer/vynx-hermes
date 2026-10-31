@@ -210,6 +210,9 @@ def chain(monkeypatch):
     monkeypatch.setattr(cutout, "_hanger_isnet", strat("hanger", (None, "no hanger bar found")))
     monkeypatch.setattr(cutout, "_cloth_seg_ft", strat("v2", (cut, None)))
     monkeypatch.setattr(cutout, "_cloth_seg_ft_backup", strat("v1", (cut, None)))
+    # Not configured unless a test says so: a machine whose .env points at the
+    # real v3 file would otherwise run the model inside these tests.
+    monkeypatch.setattr(cutout, "_CLOTH_FT_BAG_PATH", "")
     prompts: list[str] = []
     monkeypatch.setattr(cutout, "_gemini",
                         lambda data, t, prompt=None: (calls.append("gemini"), prompts.append(prompt),
@@ -310,6 +313,97 @@ def test_a_list_that_still_names_a_parser_keeps_the_family_gate(chain, monkeypat
     out, err, provider = cutout.remove_background(
         chain["raw"], strategies=STRATS, garment="T-Shirts & Tops Tops", origin="PHOTOBOOTH")
     assert "object" not in chain["calls"] and provider == "cloth-seg-ft"
+
+
+# --- the bag parser, v3 (1 Nov 2026) ---------------------------------------------------
+#
+# cloth_seg_ft_v3.onnx (HERMES_CLOTH_SEG_FT_BAG_PATH) was fine-tuned with bags: overlap
+# 0.81 → 0.96 against v2 on the bag test set, a tie on ordinary garments, and a hanger
+# habit on held hung garments — so it runs for BAGS ONLY, ahead of IS-Net, judged by the
+# object checks, and falls through to IS-Net when refused.
+
+@pytest.fixture
+def bag_parser(chain, monkeypatch):
+    monkeypatch.setattr(cutout, "_bag_ft_available", lambda: True)
+    monkeypatch.setattr(cutout, "_cloth_seg_ft_bag",
+                        lambda *a, **k: (chain["calls"].append("v3"), (chain["cut"], None))[1])
+    return chain
+
+
+def test_the_shipped_policy_turns_the_bag_parser_on():
+    assert cutout.object_config()["bag_parser"] is True
+    assert cutout.BAG_PARSER in cutout.STRATEGY_NAMES and cutout.BAG_PARSER in cutout.PARSER_STRATEGIES
+
+
+def test_a_bag_is_cut_by_the_bag_parser_first_and_judged_as_an_object(bag_parser, monkeypatch):
+    seen: list[str] = []
+    monkeypatch.setattr(oc, "checks", lambda *a, **k: (seen.append("object checks"), (True, "fine"))[1])
+    out, err, provider = cutout.remove_background(
+        bag_parser["raw"], strategies=STRATS, garment="Backpacks & Bags Tote Bags", origin="WEB")
+    assert provider == cutout.BAG_PARSER and out is not None, err
+    assert bag_parser["calls"] == ["v3"] and seen == ["object checks"]
+
+
+def test_a_bag_cut_out_v3_loses_goes_to_is_net(bag_parser, monkeypatch):
+    monkeypatch.setattr(cutout, "_cloth_seg_ft_bag",
+                        lambda *a, **k: (bag_parser["calls"].append("v3"), (None, "no garment found"))[1])
+    out, err, provider = cutout.remove_background(
+        bag_parser["raw"], strategies=STRATS, garment="Backpacks & Bags Backpacks", origin="WEB")
+    assert provider == cutout.OBJECT and out is not None, err
+    assert bag_parser["calls"] == ["v3", "object"]
+
+
+def test_a_v3_cut_out_the_object_checks_refuse_moves_on_to_is_net(bag_parser, monkeypatch):
+    verdicts = iter([(False, "the cut-out reaches the frame's edge"), (True, "fine")])
+    monkeypatch.setattr(oc, "checks", lambda *a, **k: next(verdicts))
+    out, err, provider = cutout.remove_background(
+        bag_parser["raw"], strategies=STRATS, garment="Accessories Wallet", origin="DECISION")
+    assert provider == cutout.OBJECT and bag_parser["calls"] == ["v3", "object"], err
+
+
+def test_the_bag_parser_runs_wherever_the_object_cut_is_allowed(bag_parser):
+    """vnyx-api's lists and `recut_strategies` name object-isnet, never v3: the bag
+    parser is that route's first step, not a separate ask."""
+    out, err, provider = cutout.remove_background(
+        bag_parser["raw"], strategies=[cutout.OBJECT], garment="Backpacks & Bags Bags", origin="WEB")
+    assert provider == cutout.BAG_PARSER and bag_parser["calls"] == ["v3"], err
+
+
+def test_shoes_and_garments_never_see_the_bag_parser(bag_parser, monkeypatch):
+    cutout.remove_background(bag_parser["raw"], strategies=STRATS, garment="Shoes Running", origin="WEB")
+    assert bag_parser["calls"] == ["object"]
+    bag_parser["calls"].clear()
+    monkeypatch.setattr(cutout, "_kept_backdrop", lambda *a, **k: (True, "ok"))
+    monkeypatch.setattr(cutout, "_torn_garment", lambda *a, **k: (False, "ok"))
+    cutout.remove_background(bag_parser["raw"], strategies=STRATS, garment="T-Shirts & Tops Tops",
+                             origin="PHOTOBOOTH")
+    assert bag_parser["calls"] == ["v2"]
+
+
+def test_no_bag_model_on_this_machine_means_is_net_alone(chain, monkeypatch):
+    monkeypatch.setattr(cutout, "_bag_ft_available", lambda: False)
+    monkeypatch.setattr(cutout, "_cloth_seg_ft_bag",
+                        lambda *a, **k: (chain["calls"].append("v3"), (chain["cut"], None))[1])
+    out, err, provider = cutout.remove_background(
+        chain["raw"], strategies=STRATS, garment="Backpacks & Bags Bags", origin="WEB")
+    assert provider == cutout.OBJECT and chain["calls"] == ["object"], err
+
+
+def test_policy_can_turn_the_bag_parser_off(bag_parser, monkeypatch):
+    off = {**cutout.object_config({}), "bag_parser": False}
+    monkeypatch.setattr(cutout, "object_config", lambda pol=None: dict(off))
+    out, err, provider = cutout.remove_background(
+        bag_parser["raw"], strategies=STRATS, garment="Backpacks & Bags Bags", origin="WEB")
+    assert provider == cutout.OBJECT and bag_parser["calls"] == ["object"], err
+
+
+def test_the_bag_parser_says_when_it_is_not_configured(monkeypatch):
+    monkeypatch.setattr(cutout, "_CLOTH_FT_BAG_PATH", "")
+    out, err = cutout._cloth_seg_ft_bag(b"")
+    assert out is None and "HERMES_CLOTH_SEG_FT_BAG_PATH" in err
+    monkeypatch.setattr(cutout, "_CLOTH_FT_BAG_PATH", "/nowhere/cloth_seg_ft_v3.onnx")
+    out, err = cutout._cloth_seg_ft_bag(b"")
+    assert out is None and "missing" in err and not cutout._bag_ft_available()
 
 
 # --- stray pieces on the garment path (6 Oct 2026) -------------------------------------
