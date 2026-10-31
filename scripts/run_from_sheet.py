@@ -266,6 +266,18 @@ def read_sheet(path: Path, reason_col: str | None = None) -> list[dict[str, str]
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
+def _when(value: str) -> Any:
+    """--rendered-before: an ISO date/time; without an offset it is UTC."""
+    from datetime import datetime, timezone
+
+    try:
+        t = datetime.fromisoformat(value.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"not a date/time: {value!r} (e.g. '2026-11-01 14:30')") from exc
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
 def product_entry(value: str) -> dict[str, str]:
     """One --product value as a sheet row: a product id, or else a SKU."""
     v = value.strip()
@@ -852,7 +864,9 @@ class Parallel:
                  price_rounding_only: bool = False,
                  skip_price: bool = False,
                  approve_from_rejected: bool = False,
-                 force_recut: bool = False) -> None:
+                 force_recut: bool = False,
+                 force_rerender: bool = False,
+                 rerender_before: Any = None) -> None:
         import queue
         import threading
 
@@ -869,6 +883,8 @@ class Parallel:
         self.skip_price = skip_price
         self.approve_from_rejected = approve_from_rejected
         self.force_recut = force_recut
+        self.force_rerender = force_rerender
+        self.rerender_before = rerender_before
         self.submitted = 0
         # Set by the first worker that sees a run-level stop — the canary or
         # a vision outage. The main loop reads it before every submit and the
@@ -948,6 +964,8 @@ class Parallel:
                                       skip_price=self.skip_price,
                                       approve_from_rejected=self.approve_from_rejected,
                                       force_recut=self.force_recut,
+                                      force_rerender=self.force_rerender,
+                                      rerender_before=self.rerender_before,
                                       silent=True, section=section_of(row))
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             with lock:
@@ -1215,6 +1233,16 @@ def main() -> int:
                           "behind --keep-better: a new cut-out replaces the old one "
                           "only when it is at least as complete. Needs --apply to "
                           "write anything."))
+    ap.add_argument("--rerender", action="store_true",
+                    help=("re-make the product's AI images on the CURRENT prompt — all of "
+                          "them, or only those made before --rendered-before — then judge "
+                          "them like any re-render: one the gate or the photo audit still "
+                          "refuses is re-rendered again on the next round. Paid: one "
+                          "render per image. Needs --apply to write anything."))
+    ap.add_argument("--rendered-before", type=_when, metavar="WHEN",
+                    help=("with --rerender: only images made before this time, e.g. the "
+                          "prompt deploy — '2026-11-01 14:30' (UTC) or an ISO time with "
+                          "an offset. A product re-run later is then not re-rendered twice."))
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     ap.add_argument("--log", metavar="FILE",
                     help="also append everything to FILE, in UTF-8. Use this "
@@ -1273,6 +1301,13 @@ def main() -> int:
     if args.recut:
         print("re-cut        : EVERY cut-out is re-cut (--recut), kept only when "
               "at least as complete")
+    if args.rendered_before and not args.rerender:
+        sys.exit("--rendered-before needs --rerender")
+    if args.rerender:
+        print("re-render     : the AI images made "
+              + (f"before {args.rendered_before:%Y-%m-%d %H:%M %Z}".strip()
+                 if args.rendered_before else "at any time")
+              + " are re-made on the current prompt (--rerender), then checked")
 
     mode = "LIVE" if args.approve else "SHADOW"
     print(f"mode          : {mode}"
@@ -1483,7 +1518,9 @@ def main() -> int:
                                 price_rounding_only=args.price_rounding_only,
                                 skip_price=args.no_price,
                                 approve_from_rejected=args.approve_rejected,
-                                force_recut=args.recut)
+                                force_recut=args.recut,
+                                force_rerender=args.rerender,
+                                rerender_before=args.rendered_before)
             if pool.abort:
                 # A worker saw a run-level stop. The row this iteration just
                 # enqueued would otherwise sit QUEUED with nothing to claim it.
@@ -1610,6 +1647,8 @@ def main() -> int:
                                   skip_price=args.no_price,
                                   approve_from_rejected=args.approve_rejected,
                                   force_recut=args.recut,
+                                  force_rerender=args.rerender,
+                                  rerender_before=args.rendered_before,
                                   section=section_of(row))
 
         after = db.fetch_one(

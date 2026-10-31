@@ -43,7 +43,8 @@ def _pool() -> rfs.Parallel:
     p.lock = threading.Lock()
     p.tally = {"ok": 0, "held": 0, "failed": 0, "retry": 0}
     p.skip_matte = p.price_rounding_only = p.skip_price = p.approve_from_rejected = False
-    p.force_recut = False
+    p.force_recut = p.force_rerender = False
+    p.rerender_before = None
     p.abort = None
     return p
 

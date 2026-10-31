@@ -1209,6 +1209,21 @@ def vnyx_status(dsn: str, product_id: str) -> str | None:
     return str(row[0]) if row and row[0] else None
 
 
+def stale_render_views(dsn: str, product_id: str, before: Any = None) -> list[str]:
+    """The AI views whose current render was made before `before` (a datetime;
+    None = every AI view on the product) — what --rerender re-makes."""
+    with product_audit.connect(dsn, read_only=True) as conn:
+        rows = conn.execute(
+            'SELECT view::text, MIN("createdAt") FROM "ProductMedia"'
+            ' WHERE "productId" = %s::uuid AND "deletedAt" IS NULL AND "isCurrent" = true'
+            "   AND view::text LIKE 'AI\\_%%' GROUP BY view", (product_id,)).fetchall()
+    def utc(t: Any) -> Any:          # naive UTC, as Prisma stores it
+        return t.astimezone(timezone.utc).replace(tzinfo=None) if t.tzinfo else t
+
+    return sorted(str(view) for view, made in rows
+                  if before is None or made is None or utc(made) < utc(before))
+
+
 def vnyx_sellable(dsn: str, product_id: str) -> int:
     """The count vnyx's stock sync would tell a channel — sellableQuantityForProduct
     (vnyx-api inventory.ts): quantity - reserved, floored at 0, over the product's
@@ -1444,6 +1459,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            # --keep-better: the new one replaces the old only when it is at least
            # as complete, so a forced re-cut can never make a product worse.
            force_recut: bool = False,
+           # RE-RENDER THE AI IMAGES (1 Nov 2026, run_from_sheet --rerender): the
+           # renders made before `rerender_before` (all of them when it is None)
+           # are re-made on the current prompt, then judged by the gate and the
+           # photo audit like any re-render — one that still looks wrong is
+           # re-rendered again on the next round, within the regen budget.
+           force_rerender: bool = False,
+           rerender_before: Any = None,
            # PRICE, .99 ONLY. The grade window is not consulted: a price outside
            # it stays where it is and only its cents move. The operator asked for
            # this for a backlog whose windows are not the question — see
@@ -3150,6 +3172,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         if gate_verdict is not None and gate_verdict.action == "regen":
             askers.append(("gate", str(gate_verdict.code), list(gate_verdict.reasons),
                            quality_gate.regen_views(gate_verdict, pol)))
+        if rerender_pending["views"] is None and force_rerender:
+            rerender_pending["views"] = stale_render_views(dsn, product_id, rerender_before)
+        if rerender_pending["views"]:
+            askers.append(("rerender", "RERENDER",
+                           ["--rerender: made before the current prompt"
+                            + (f" ({rerender_before:%Y-%m-%d %H:%M})" if rerender_before else "")],
+                           list(rerender_pending["views"])))
         if photo_verdict is not None:
             pv = photo_audit.regen_views(photo_verdict, pol)
             if pv:
@@ -3181,6 +3210,10 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             "why": "; ".join(f'{c}: {"; ".join(rs)}' for _, c, rs, _ in askers),
         }
 
+    # --rerender's views, once: asked by the first plan, cleared after round 1 so
+    # later rounds re-render only what the checks refuse.
+    rerender_pending: dict[str, Any] = {"views": None}
+
     def _regen() -> str:
         """Up to `budget` rounds: re-render what was refused, look again, repeat.
 
@@ -3202,6 +3235,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         refused, n = False, 0
         for n in range(1, budget + 1):
             note, refused = _regen_round(plan)
+            rerender_pending["views"] = []
             notes.append(note if n == 1 else f"round {n}: {note}")
             regeneration["rounds"].append({"round": n, "views": plan["views"], "refused_again": refused})
             if not apply or not refused:
@@ -3293,7 +3327,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         else:
             outcomes.append(f"gate again: {second.summary()}")
 
-        if "photos" in plan["askers"]:
+        if "photos" in plan["askers"] or "rerender" in plan["askers"]:
             second_p = _judge_photos()
             regeneration["photos_after"] = second_p.as_dict()
             photo_verdict = second_p
@@ -3321,6 +3355,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
     rounds = int(_rd.config(policy()).get("regen_rounds") or 0)
     if budget >= 1 and rounds > budget:
         budget = rounds
+    if force_rerender:
+        # the forced round, plus a round for what the checks refuse after it
+        budget = max(budget, 1) + 1
     regen_plan = _regen_plan()
     if not regen_plan["askers"]:
         regen_why = "the gate did not ask for a re-render, nor did the photo audit"
