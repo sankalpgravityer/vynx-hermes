@@ -428,6 +428,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                price_rounding_only: bool = False,
                skip_price: bool = False,
                approve_from_rejected: bool = False,
+               force_recut: bool = False,
                silent: bool = False,
                section: str = "REVIEW") -> str | None:
     """One claimed product, start to finish. Never raises.
@@ -470,6 +471,9 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     The cost it saves is real — 45s plus 168s per image on the CPU segmenter —
     and the price is that a CUTOUT_DEFECT cannot be repaired on this pass, only
     reported. `repair()` has always taken the flag; nothing passed it.
+
+    `force_recut` re-cuts every existing cut-out (run_from_sheet --recut), still
+    behind --keep-better — see repair()'s parameter of the same name.
 
     `section` is the products-list section the run pulls from. REVIEW for
     every caller but a run the Overview scoped to Approved or Rejected. Those
@@ -665,6 +669,7 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                 price_mode=price_mode,
                 skip_price=skip_price,
                 approve_from_rejected=approve_from_rejected,
+                force_recut=force_recut,
                 publish=rs.publish_on_approve,
                 # The agent's approvals only (this is the runner, never the
                 # manual flow): which Shopify status the approval publishes with.

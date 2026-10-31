@@ -1438,6 +1438,12 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
            infer: bool, min_confidence: int, skip_render: bool,
            approve: bool, skip_bin: bool,
            skip_gate: bool = False, skip_matte: bool = False,
+           # RE-CUT EVERY CUT-OUT (1 Nov 2026, run_from_sheet --recut): treat every
+           # existing cut-out as due for a redo, so a new segmenter (v3 for bags)
+           # gets its go at products whose old cut-out passed. Still behind
+           # --keep-better: the new one replaces the old only when it is at least
+           # as complete, so a forced re-cut can never make a product worse.
+           force_recut: bool = False,
            # PRICE, .99 ONLY. The grade window is not consulted: a price outside
            # it stays where it is and only its cents move. The operator asked for
            # this for a backlog whose windows are not the question — see
@@ -1713,6 +1719,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             # re-matte that FAILS leaves the measured defect on record rather
             # than nothing.
             cutout_verdict = cutout_before
+            fixable: list[str] = []
             if cutout_before.action == "bad":
                 replace = list(cutout_before.bad_views)
                 fixable = [r for r in cutout_before.reasons
@@ -1727,6 +1734,11 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             elif cutout_before.action == "unknown":
                 parts.append("cut-outs could not be measured: "
                              + "; ".join(cutout_before.reasons))
+            if force_recut:
+                forced = [v for v in state["cutout_views"] if v not in replace]
+                replace = [*replace, *forced]
+                if forced:
+                    parts.append(f're-cut {", ".join(forced)} (forced: --recut)')
         if state["unmatted"]:
             parts.append("matte " + ", ".join(state["unmatted_views"]))
 
@@ -1754,7 +1766,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         # `frame-only`: the cut-out on file is cropped and centred, ~2 s. Needs a
         # vnyx-api that forwards the strategy; an older one re-cuts as before.
         frame_views: list[str] = []
-        if replace and cutout_before is not None and remote_supports("bgStrategies", "matteViews"):
+        if (replace and cutout_before is not None and not force_recut
+                and remote_supports("bgStrategies", "matteViews")):
+            # a forced re-cut is a real re-segmentation, never just a re-frame
             frame_views = [v for v in cutout_before.frame_only_views if v in replace]
         recut_views = [v for v in replace if v not in frame_views]
         if replace:

@@ -95,3 +95,11 @@ def test_a_stage_outside_the_closed_set_is_refused():
         clauses(["REVIEW", "DELETED"])
     with pytest.raises(ValueError, match="unknown stage"):
         clauses(["'; DROP TABLE \"Product\"; --"])
+
+
+def test_product_takes_a_sku_or_an_id():
+    # 1 Nov 2026: --product runs one product (or a few) without a sheet.
+    from scripts import run_from_sheet as rfs
+    assert rfs.product_entry(" BOA-007069 ") == {"id": "", "sku": "BOA-007069", "tenant": "", "reason": ""}
+    pid = "b07fd65d-4276-4c28-88f4-2ad39d443452"
+    assert rfs.product_entry(pid) == {"id": pid, "sku": "", "tenant": "", "reason": ""}

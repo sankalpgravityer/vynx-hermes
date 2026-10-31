@@ -167,3 +167,9 @@ def test_skip_price_reaches_repair_when_asked(captured):
 
 def test_the_unattended_agent_keeps_the_price_step(captured):
     assert _run(captured)["skip_price"] is False
+
+
+def test_force_recut_reaches_repair_only_when_asked(captured):
+    # 1 Nov 2026, run_from_sheet --recut: re-cut every cut-out (bags → v3).
+    assert _run(captured, force_recut=True)["force_recut"] is True
+    assert _run(captured)["force_recut"] is False
