@@ -181,3 +181,19 @@ def test_force_rerender_reaches_repair_only_when_asked(captured):
     seen = _run(captured, force_rerender=True, rerender_before=when)
     assert seen["force_rerender"] is True and seen["rerender_before"] is when
     assert _run(captured)["force_rerender"] is False
+
+
+def test_no_care_label_with_image_work_runs_the_chain_without_approving(captured, monkeypatch):
+    # 1 Nov 2026: a bag with no care label was held before the chain, so the
+    # --recut/--rerender batch redid none of its pictures. With either flag the
+    # chain runs — approval off — and the product is still held for the label.
+    monkeypatch.setattr(runner, "_has_care_label", lambda pid: False)
+    seen = _run(captured, force_rerender=True)
+    assert seen["approve"] is False
+
+
+def test_no_care_label_without_image_work_is_held_before_the_chain(captured, monkeypatch):
+    monkeypatch.setattr(runner, "_has_care_label", lambda pid: False)
+    rs = cfgmod.settings_from_snapshot({"mode": "SHADOW", "shadowWritesRepairs": True})
+    runner.verify_one(ROW, rs, ignore_stop=True)
+    assert not captured, "the chain ran for a product the label hold should stop"

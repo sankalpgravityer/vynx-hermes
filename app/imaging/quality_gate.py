@@ -570,6 +570,13 @@ def decide(raw: dict[str, Any], *, product_gender: str | None,
         fam_seen = garment_family(garment, pol)
         filed_under = subcategory or category
         fam_filed = garment_family(filed_under, pol)
+        # A BAG OR A SHOE IS WORN WITH AN OUTFIT (1 Nov 2026, BOA-007390): the render
+        # of a crossbody bag is a model in a T-shirt, and this read named the
+        # T-shirt — a correct bag held as CATEGORY_IMAGE_MISMATCH. For these the
+        # render's "garment" is the outfit, not the product; the refile step reads
+        # the product off the cut-outs instead, which show the bag alone.
+        if {fam_filed, garment_family(category, pol)} & {"accessories", "footwear"}:
+            fam_seen = None
         if (fam_seen and fam_filed and fam_seen != fam_filed
                 and not _adjacent(fam_seen, fam_filed, pol)):
             return verdict("review", "CATEGORY_IMAGE_MISMATCH",

@@ -595,11 +595,21 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
     # in the Review tab, HELD_FOR_HUMAN with the reason, for a person to add the
     # label photograph and run it again. `readiness.no_care_label: reject` restores
     # the old move to the Rejected tab.
+    # IMAGE WORK ASKED FOR (1 Nov 2026, run_from_sheet --recut / --rerender): a bag
+    # has no care label far more often than a garment, and holding it here meant
+    # the batch re-cut and re-rendered none of them. With either flag the chain
+    # runs for the pictures — approval OFF, so it can never approve — and the
+    # product is held for the missing label afterwards, exactly as below.
+    label_hold = False
     if rs.apply and not settled and not _has_care_label(product_id):
         from app import readiness
         from app.config import policy
 
-        if str(readiness.config(policy()).get("no_care_label") or "hold").lower() != "reject":
+        hold_mode = str(readiness.config(policy()).get("no_care_label") or "hold").lower() != "reject"
+        if hold_mode and (force_recut or force_rerender):
+            label_hold = True
+            approve = False
+        elif hold_mode:
             events.emit(tenant_id, "warn",
                         f"{row['productSku']} — {_NO_LABEL}, held in Review for a person",
                         run_id=row["runId"], run_product_id=row["id"],
@@ -613,21 +623,22 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
                 expect_status=expect_status,
             )
             return
-        events.emit(tenant_id, "warn",
-                    f"{row['productSku']} — {_NO_LABEL}, rejecting",
-                    run_id=row["runId"], run_product_id=row["id"],
-                    product_id=product_id)
-        if _archive(row, _NO_LABEL):
-            _finish(
-                row,
-                Verdict("FAILED", "NO_CARE_LABEL", _NO_LABEL, False, False),
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                expect_status=expect_status,
-            )
-            return
-        # The reject step refused. Fall through and verify it normally rather
-        # than leave the row unfinished — a held product is recoverable, a
-        # stranded one is not.
+        if not hold_mode:
+            events.emit(tenant_id, "warn",
+                        f"{row['productSku']} — {_NO_LABEL}, rejecting",
+                        run_id=row["runId"], run_product_id=row["id"],
+                        product_id=product_id)
+            if _archive(row, _NO_LABEL):
+                _finish(
+                    row,
+                    Verdict("FAILED", "NO_CARE_LABEL", _NO_LABEL, False, False),
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    expect_status=expect_status,
+                )
+                return
+            # The reject step refused. Fall through and verify it normally rather
+            # than leave the row unfinished — a held product is recoverable, a
+            # stranded one is not.
 
     # REPRICE BY BRAND TIER (the Brain's switch, 16 Oct 2026). Before the chain,
     # so the price checks judge the new price. Never holds: a weak lookup is a
@@ -770,6 +781,10 @@ def verify_one(row: dict[str, Any], rs: cfgmod.RunSettings, *,
         )
 
     verdict = classify(result)
+    if label_hold and verdict.status != "FAILED":
+        verdict = Verdict("HELD_FOR_HUMAN", "NO_CARE_LABEL",
+                          f"{_NO_LABEL} — add the care-label photograph and run it again "
+                          "(the pictures were re-done on this run)", False, False)
 
     # THE CANARY. Every step above writes through vnyx-api's own update path,
     # and that path has hooks: a change to certain fields can re-queue the
