@@ -75,3 +75,14 @@ def test_category_check_can_be_switched_off():
 def test_schema_asks_for_the_garment():
     assert "garment" in qg.SCHEMA["properties"]
     assert "garment" in qg.SCHEMA["required"]
+
+
+def test_a_bag_or_a_shoe_worn_with_a_t_shirt_is_not_a_mismatch():
+    # BOA-007390 (1 Nov 2026): a crossbody bag on a model in a T-shirt read as
+    # "t-shirt" and was held. For accessories and footwear the render's garment
+    # is the outfit; the refile step reads the product off the cut-outs.
+    assert decide("t-shirt", subcategory="Bags", category="Backpacks & Bags").action == "ok"
+    assert decide("t-shirt", subcategory="Running", category="Shoes").action == "ok"
+    assert decide("jeans", subcategory="Caps, Beanies & hats", category="Accessories").action == "ok"
+    # garments are judged exactly as before
+    assert decide("dress", subcategory="T-Shirts", category="Tops").code == "CATEGORY_IMAGE_MISMATCH"
