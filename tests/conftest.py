@@ -34,6 +34,28 @@ def _no_cached_step_runner(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _no_ai_gate_network(monkeypatch):
+    """THE CUT-OUT CHAIN'S AI CHECK NEVER REACHES GEMINI FROM A TEST.
+
+    Since 3 Nov 2026 every accepted candidate is shown to the judge
+    (app/imaging/cutout_integrity.judge_pair) before the chain returns it. On a
+    machine with a real GEMINI_API_KEY in the environment, any test that runs the
+    chain would otherwise make a paid call and judge a synthetic square. The judge
+    answers "no answer" here, which the gate accepts on the pixel checks — exactly
+    the shipped `on_unavailable`. A test about the gate patches `judge_pair` or
+    `_ask_bytes` itself (tests/test_cutout_ai_check.py).
+    """
+    try:
+        from app.imaging import cutout_integrity as ci
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    monkeypatch.setattr(ci, "_ask_bytes", lambda items, category, model, headwear=False: None,
+                        raising=False)
+    yield
+
+
 @pytest.fixture
 def paid_cutout_methods():
     """The paid cut-out fallbacks as they were before 10 Oct 2026.

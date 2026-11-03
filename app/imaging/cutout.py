@@ -39,6 +39,7 @@ import io
 import logging
 import os
 import re
+import threading
 import time
 from copy import deepcopy
 from typing import Any
@@ -169,6 +170,19 @@ DEFAULTS: dict[str, Any] = {
     # drops a whole sleeve is no longer caught by comparison with the old one.
     # True restores the veto (with the photograph check in garment_kept).
     "keep_better_veto": False,
+    # --- THE AI CHECK BEFORE A CUT-OUT IS RETURNED (3 Nov 2026) -------------
+    # Every candidate that passes the pixel checks above is shown to Gemini
+    # beside the photograph it was cut from (app/imaging/cutout_integrity.py:
+    # the same judge, the same three defects, the same `_fails` rule the stored-
+    # row check holds on). A flagged candidate is refused like any other check's
+    # refusal and the next model runs; when every model is refused the caller
+    # (vnyx-api) turns to its own Gemini background removal, which is the one
+    # place a generative model is asked for pixels. `on_unavailable`: what a
+    # candidate gets when the judge cannot answer — "accept" (the pixel checks
+    # decide, the default) or "refuse". `max_concurrent`: judge calls in flight
+    # per process, 0 = no cap. `model`: null = llm.model_fast.
+    "ai_check": {"enabled": True, "model": None, "on_unavailable": "accept",
+                 "max_concurrent": 4},
     "torn_check": True,
     "torn_min": 0.0025,
     # The most one paid call (Gemini, gpt-image) may take, whatever the
@@ -270,6 +284,66 @@ def config(pol: dict[str, Any] | None = None) -> dict[str, Any]:
         if v is not None:
             out[k] = v
     return out
+
+
+def ai_check_config(cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    """`imagery.cutout.ai_check` with defaults filled in. `false` turns it off."""
+    out = deepcopy(DEFAULTS["ai_check"])
+    block = (cfg if cfg is not None else config()).get("ai_check")
+    if block is False:
+        out["enabled"] = False
+    elif isinstance(block, dict):
+        out.update({k: v for k, v in block.items() if v is not None})
+    return out
+
+
+_AI_SLOTS: dict[int, threading.BoundedSemaphore] = {}
+_AI_SLOTS_LOCK = threading.Lock()
+
+
+def _ai_slot(n: int) -> threading.BoundedSemaphore | None:
+    """One of `n` judge calls at a time per process; None = no cap."""
+    if n <= 0:
+        return None
+    with _AI_SLOTS_LOCK:
+        if n not in _AI_SLOTS:
+            _AI_SLOTS[n] = threading.BoundedSemaphore(n)
+        return _AI_SLOTS[n]
+
+
+def _ai_gate(data: bytes, out: bytes, label: str, garment: str | None,
+             acfg: dict[str, Any], verdicts: list[dict[str, Any]]) -> tuple[bool, str]:
+    """Is this candidate the whole garment, with nothing of the set left in and its
+    colour kept? (accepted, why). The judge's answer, or its absence, is appended to
+    `verdicts` so the caller can see what every model was told."""
+    from app.imaging import cutout_integrity as ci
+
+    from app.imaging import object_cutout as oc
+
+    # A CAP STAYS ON ITS DISPLAY HEAD (3 Nov 2026): the judge is told so, and a
+    # "background" finding that names the head holds nothing for headwear.
+    headwear = oc.family_of(garment, ["headwear"]) == "headwear"
+    sem = _ai_slot(int(acfg.get("max_concurrent") or 0))
+    if sem is not None:
+        sem.acquire()
+    try:
+        answer, note = ci.judge_pair(data, out, category=garment, model=acfg.get("model"),
+                                     view=label.split("#")[0], headwear=headwear)
+    finally:
+        if sem is not None:
+            sem.release()
+    if answer is None:
+        refuse = str(acfg.get("on_unavailable") or "accept").lower() == "refuse"
+        verdicts.append({"strategy": label, "ok": None, "defects": [], "note": note})
+        return (not refuse), f"AI check could not run ({note}); {'refused' if refuse else 'accepted on the pixel checks'}"
+    reasons = ci.failing(answer, headwear=headwear)
+    noted = ci.noted(answer, headwear=headwear)
+    views = (answer.get("views") or [{}])
+    verdicts.append({"strategy": label, "ok": not reasons, "defects": reasons, "noted": noted,
+                     "summary": str((views[0] if views else {}).get("summary") or "")})
+    if reasons:
+        return False, "AI check — " + "; ".join(reasons)
+    return True, ("AI check passed" + (f" (noted: {'; '.join(noted)})" if noted else ""))
 
 # Written for a SEGMENTER's job, not an artist's. Every clause is there because
 # a generative model will otherwise take liberties: re-light the garment, crop
@@ -2399,7 +2473,9 @@ def object_route(garment: str | None, origin: str | None, ocfg: dict[str, Any]) 
 # What the paid strategies are told the product is, for a shoe or a bag: their prompts
 # were written for garments ("isolate ONLY the garment"), and a hand holding the boots or
 # the hook a bag hangs from is exactly what they must be told is not the product.
-_PRODUCT_NOUN = {"footwear": "footwear: the shoes (a pair, or a single shoe)", "bags": "a bag"}
+_PRODUCT_NOUN = {"footwear": "footwear: the shoes (a pair, or a single shoe)", "bags": "a bag",
+                 "headwear": "headwear (a cap or hat) on a display head — keep the head it sits "
+                             "on as part of the product"}
 
 
 def _product_prompt(prompt: str, family: str | None) -> str:
@@ -2848,8 +2924,12 @@ def remove_background(
     garment: str | None = None,
     report: dict[str, Any] | None = None,
     origin: str | None = None,
+    ai_check: bool | None = None,
 ) -> tuple[bytes | None, str | None, str]:
     """`_remove_background`, holding one of `max_concurrent` cut-out slots.
+
+    `ai_check`: show every accepted candidate to the AI judge first (see
+    `ai_check` in DEFAULTS). None = policy; False turns it off for this call.
 
     6 Oct 2026: the server ran out of memory and the kernel killed Hermes at 7.7 GB —
     vnyx-api sends a product's photos at once and each full-size cut-out adds ~0.8 GB
@@ -2876,7 +2956,7 @@ def remove_background(
                 log.info("bg-removal: waited %.1fs for one of %d cut-out slots", waited, cap)
             return _remove_background(data, timeout_s, strategies=strategies, skip=skip,
                                       previous=previous, garment=garment, report=report,
-                                      origin=origin)
+                                      origin=origin, ai_check=ai_check)
     except ort_memory.Busy as exc:
         log.warning("bg-removal refused: Hermes is busy — %s", exc)
         return None, f"Hermes is busy: {exc}", "none"
@@ -2890,6 +2970,7 @@ def _remove_background(
     garment: str | None = None,
     report: dict[str, Any] | None = None,
     origin: str | None = None,
+    ai_check: bool | None = None,
 ) -> tuple[bytes | None, str | None, str]:
     """A cut-out, or an honest failure. Returns (png, error, provider).
 
@@ -2930,6 +3011,27 @@ def _remove_background(
                  garment, refine_why)
     # What the refinement did to each candidate, by strategy name.
     refined: dict[str, dict[str, Any]] = {}
+
+    # THE AI CHECK (3 Nov 2026, `ai_check` in DEFAULTS): every candidate the pixel
+    # checks accept is shown to the judge beside the photograph before it is
+    # returned. What it said about each one is reported whether or not a cut-out
+    # came out of the chain, so the caller can see why every model was refused.
+    acfg = ai_check_config(cfg)
+    ai_on = bool(acfg.get("enabled")) if ai_check is None else bool(ai_check)
+    ai_report: dict[str, Any] = {"ran": False, "enabled": ai_on, "flagged": False,
+                                 "model": acfg.get("model"), "verdicts": []}
+    if report is not None:
+        report["ai_check"] = ai_report
+
+    def _judged(out: bytes, label: str) -> tuple[bool, str]:
+        """The gate, or a pass when it is off. Records what it said."""
+        if not ai_on:
+            return True, ""
+        ai_report["ran"] = True
+        accepted, why = _ai_gate(data, out, label, garment, acfg, ai_report["verdicts"])
+        if not accepted:
+            ai_report["flagged"] = True
+        return accepted, why
 
     def _done(out: bytes, name: str) -> None:
         if report is not None:
@@ -2972,8 +3074,12 @@ def _remove_background(
     # bag on a wall hook is a WEB photo, but there is no hanger bar to find.
     family = object_route(garment, origin, ocfg)
     on_hanger = hanger_route(origin, hcfg) and not family
-    # A BAG: the bag parser (v3) before the object cut, when this machine has it.
-    bag_parsed = family == "bags" and bool(ocfg.get("bag_parser", True)) and _bag_ft_available()
+    # A BAG, OR A CAP ON ITS DISPLAY HEAD: the v3 parser before the object cut, when
+    # this machine has it (object_cutout.PARSER_FIRST_FAMILIES).
+    from app.imaging.object_cutout import PARSER_FIRST_FAMILIES
+
+    bag_parsed = (family in PARSER_FIRST_FAMILIES and bool(ocfg.get("bag_parser", True))
+                  and _bag_ft_available())
     if family:
         log.info("bg-removal: %r is %s — the %s first, judged by the object checks", garment, family,
                  "bag parser (v3), then the object cut-out" if bag_parsed else "object cut-out")
@@ -3392,6 +3498,16 @@ def _remove_background(
                 if on_wall and kind == "direct":
                     out = _finish_trim(data, out, name, label)
                 out = _finish_neck(data, out, origin, garment, label)
+            # THE AI CHECK, LAST — on the bytes that would be stored, after the
+            # finishing above. A flagged candidate hands over to the next model
+            # exactly like a pixel check's refusal.
+            judged, judge_why = _judged(out, label)
+            if not judged:
+                log.info("bg-removal %s refused by the AI check: %s", label, judge_why)
+                attempts.append(f"{label}: {judge_why}")
+                continue
+            if judge_why:
+                log.info("bg-removal %s: %s", label, judge_why)
             _done(out, name)
             # The photograph's own pixels carry its colour profile; a painted
             # answer is the model's picture, in the model's colours — unless its
@@ -3411,8 +3527,12 @@ def _remove_background(
                     if on_wall:
                         out = _finish_trim(data, out, "cloth-seg-ft", AGREED)
                     out = _finish_neck(data, out, origin, garment, AGREED)
-                _done(out, "cloth-seg-ft")
-                return _png_with_icc(out, _icc_of(data)), None, AGREED
+                judged, judge_why = _judged(out, AGREED)
+                if judged:
+                    _done(out, "cloth-seg-ft")
+                    return _png_with_icc(out, _icc_of(data)), None, AGREED
+                log.info("bg-removal %s refused by the AI check: %s", AGREED, judge_why)
+                attempts.append(f"{AGREED}: {judge_why}")
             # BOTH MADE A GOOD CUT-OUT AND BOTH LOST ONLY TO THE ONE ON FILE.
             # A paid strategy is asked the same "is it as complete" question
             # against the same incumbent and cannot answer it better — on

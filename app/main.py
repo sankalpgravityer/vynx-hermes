@@ -768,6 +768,12 @@ class CutoutRequest(BaseModel):
     # (`imagery.cutout.hanger`), keeping the clips; the photobooth's podium and
     # stand go to the fine-tuned cloth-seg. Omitted, the chain is as before.
     origin: str | None = None
+    # SHOW EVERY ACCEPTED CANDIDATE TO THE AI JUDGE FIRST (3 Nov 2026;
+    # `imagery.cutout.ai_check`). A flagged cut-out is refused and the next model
+    # runs; when every model is refused the answer is ok:false and the caller
+    # turns to its own Gemini background removal. Omitted, policy decides; false
+    # turns the check off for this call (a script re-cutting by hand).
+    ai_check: bool | None = None
 
 
 class CutoutResponse(BaseModel):
@@ -776,6 +782,11 @@ class CutoutResponse(BaseModel):
     provider: str = "none"
     error: str | None = None
     duration_ms: int = 0
+    # What the AI judge said about each candidate it was shown: {ran, enabled,
+    # flagged, model, verdicts: [{strategy, ok, defects, noted, summary}]}. On
+    # ok:false this is why every model was refused; on ok it names the verdict
+    # the returned cut-out passed. None when the chain did not run.
+    ai_check: dict | None = None
     # TRUE WHEN NOTHING IS WRONG AND NOTHING WAS REPLACED: every candidate was
     # a real cut-out and each had less garment than the one already on file, so
     # the existing cut-out stands. The caller must not write a row and must not
@@ -952,7 +963,7 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
     out, err, provider = cutout.remove_background(
         raw, timeout_s=req.timeout_s,
         strategies=req.strategies, skip=req.skip, previous=previous,
-        garment=req.garment, report=report, origin=req.origin)
+        garment=req.garment, report=report, origin=req.origin, ai_check=req.ai_check)
     # AFTER every check and the keep-better comparison: those judge the
     # segmentation, on the photograph's own frame; framing only moves it.
     framing_info = None
@@ -977,6 +988,7 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
                       f"centred: {err}",
                 duration_ms=int((_time.perf_counter() - started) * 1000),
                 framing=prev_info,
+                ai_check=report.get("ai_check"),
             )
         framing_info = prev_info
     return CutoutResponse(
@@ -991,6 +1003,7 @@ def imagery_remove_background(req: CutoutRequest) -> CutoutResponse:
         duration_ms=int((_time.perf_counter() - started) * 1000),
         framing=framing_info,
         refine=report.get("refine"),
+        ai_check=report.get("ai_check"),
     )
 
 
@@ -1038,9 +1051,12 @@ def _cutout_png(raw: bytes, timeout_s: float, frame: bool | None = None,
     out, err, provider = cutout.remove_background(raw, timeout_s=timeout_s, strategies=strategies,
                                                   garment=garment, report=report, origin=origin)
     ms = int((_time.perf_counter() - started) * 1000)
+    ai = report.get("ai_check") or {}
+    ai_header = "skipped" if not ai.get("ran") else ("flagged" if ai.get("flagged") else "pass")
     if out is None:
         return JSONResponse(status_code=422, content={
-            "ok": False, "error": err, "provider": provider, "duration_ms": ms})
+            "ok": False, "error": err, "provider": provider, "duration_ms": ms,
+            "ai_check": report.get("ai_check")})
 
     # THE SAME RESOLUTION AS THE PHOTOGRAPH (see _at_size), unless framing makes
     # the canvas from the cut-out's own pixels (see _sized).
@@ -1053,6 +1069,9 @@ def _cutout_png(raw: bytes, timeout_s: float, frame: bool | None = None,
         "X-Cutout-Framed": "yes" if (framing_info or {}).get("framed") else "no",
         "X-Cutout-Scale": str((framing_info or {}).get("scale", 1.0)),
         "X-Cutout-Refined": "yes" if (report.get("refine") or {}).get("refined") else "no",
+        # pass: the returned cut-out passed the AI judge; flagged: an earlier
+        # candidate was refused by it and this one passed; skipped: it did not run.
+        "X-Cutout-AI-Check": ai_header,
         "X-Duration-Ms": str(ms),
     })
 
