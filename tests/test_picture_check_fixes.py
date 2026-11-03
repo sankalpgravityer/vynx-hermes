@@ -936,7 +936,7 @@ def test_the_endpoint_carries_the_strategies_and_the_previous_cut_out(monkeypatc
     seen: dict[str, Any] = {}
 
     def fake_remove(data, timeout_s=180.0, *, strategies=None, skip=None, previous=None,
-                    garment=None, report=None, origin=None):
+                    garment=None, report=None, origin=None, ai_check=None):
         seen.update({"strategies": strategies, "skip": skip, "previous": previous,
                      "timeout": timeout_s, "garment": garment, "origin": origin})
         return None, "the existing cut-out was KEPT: nothing was as complete", cutout.KEPT_EXISTING

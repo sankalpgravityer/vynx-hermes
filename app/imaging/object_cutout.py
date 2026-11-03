@@ -43,7 +43,19 @@ FAMILIES: dict[str, re.Pattern[str]] = {
     "bags": re.compile(
         r"\b(bags?|backpacks?|rucksacks?|handbags?|totes?|purses?|satchels?|clutch(?:es)?"
         r"|wallets?)\b", re.IGNORECASE),
+    # HEADWEAR (3 Nov 2026, TST-000019, the user's call): a cap is photographed ON a
+    # display head and the head stays in the picture — the garment parsers cut the cap
+    # alone and left a small orange shape floating in the frame. Routed like bags: the
+    # v3 parser first, then IS-Net as an object, judged by the object checks, and the
+    # AI check told the head is not a defect. "Cap sleeve" is a sleeve, not a cap.
+    "headwear": re.compile(
+        r"\b(caps?(?!\s*sleeves?)|hats?|beanies?|headwear|visors?|berets?|bonnets?"
+        r"|balaclavas?|headbands?)\b", re.IGNORECASE),
 }
+
+# THE FAMILIES THE v3 PARSER CUTS FIRST, ahead of IS-Net (cutout.BAG_PARSER): the v3
+# fine-tune was trained with bags and keeps a cap and the head it sits on whole.
+PARSER_FIRST_FAMILIES = ("bags", "headwear")
 
 
 def family_of(garment: str | None, families: list[str] | None = None) -> str | None:

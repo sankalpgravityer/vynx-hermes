@@ -836,7 +836,10 @@ imagery:
     # No file on the machine = IS-Net alone, as before. `bag_parser: false` turns it off.
     object:
       enabled: true
-      families: ["footwear", "bags"]
+      # headwear (3 Nov 2026, TST-000019): a cap stays ON its display head — the v3
+      # parser first like bags, then IS-Net as an object; the AI check is told the
+      # head is not a defect (cutout_integrity `headwear`).
+      families: ["footwear", "bags", "headwear"]
       origins: []
       model: "isnet-general-use"
       bag_parser: true
@@ -859,6 +862,24 @@ imagery:
     # parallel. 4 cut-outs is ~3.5 GB on top of Hermes' ~3.5 GB. Back to 2 on an 8 GB box.
     max_concurrent: 4
     max_wait_s: 300
+    # THE AI CHECK BEFORE A CUT-OUT IS RETURNED (3 Nov 2026; app/imaging/cutout.py
+    # `_ai_gate`, app/imaging/cutout_integrity.py `judge_pair`). Every candidate the
+    # pixel checks accept — v3, IS-Net, v2, v1 — is shown to Gemini flash beside the
+    # photograph it was cut from, and held to the same three defects the stored-row
+    # integrity check holds on (a strap or waistband cut away, a dress form or stand
+    # left in, colour lost). A flagged candidate is refused and the next model runs;
+    # when every model is refused the answer is ok:false and vnyx-api turns to its
+    # own Gemini background removal (its `vnyx-gemini` provider), which is the one
+    # place a generative model is asked for pixels. Hermes never paints.
+    # One flash call per accepted candidate; a photo every model gets wrong costs up
+    # to four. `on_unavailable`: accept (the pixel checks decide) or refuse.
+    # `max_concurrent`: judge calls in flight per process. `model`: null = llm.model_fast.
+    # Off: `ai_check: false`, or `ai_check: false` on one request.
+    ai_check:
+      enabled: true
+      model: null
+      on_unavailable: accept
+      max_concurrent: 4
     # PHOTOS HUNG ON THE WALL (1 Oct 2026; app/imaging/hanger_cutout.py, the
     # `hanger-isnet` strategy). IS-Net finds the whole garment, clips included;
     # only THIN parts at the top — the bar, the hook, the wall wire — are masked,

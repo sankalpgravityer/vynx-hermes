@@ -161,7 +161,33 @@ def _prepare(data: bytes) -> tuple[bytes, bytes]:
     return jpg(whole), jpg(top)
 
 
-def _ask(pairs: list[dict[str, Any]], category: str | None, model: str) -> dict[str, Any] | None:
+def _ask(pairs: list[dict[str, Any]], category: str | None, model: str,
+         headwear: bool = False) -> dict[str, Any] | None:
+    """The stored-row form: every image is a URL and is fetched here."""
+    if not settings().gemini_api_key:
+        return None
+    items: list[tuple[str, bytes, bytes | None]] = []
+    with httpx.Client(timeout=60, follow_redirects=True) as client:
+        for pair in pairs:
+            cut = client.get(pair["cutout"]).content
+            orig = client.get(pair["original"]).content if pair.get("original") else None
+            items.append((str(pair["view"]), cut, orig))
+    return _ask_bytes(items, category, model, headwear=headwear)
+
+
+# HEADWEAR IS PHOTOGRAPHED ON A DISPLAY HEAD, AND THE HEAD STAYS (3 Nov 2026,
+# TST-000019, the user's call). Said to the judge, and `_fails` lets a background
+# finding that names the head through — see `headwear` on judge_pair / failing.
+_HEADWEAR_NOTE = ("This product is HEADWEAR (a cap, hat or beanie) photographed on a display "
+                  "head. The mannequin head, face and neck it sits on are PART OF THE PRODUCT "
+                  "PICTURE and must stay: never report the head, face or neck as background. "
+                  "Only the wall, floor, table, pole or stand below the neck count as background.")
+_HEAD = re.compile(r"\b(head|face|neck|mannequin|form|bust|dummy|skin|ear|ears|nose|chin)\b", re.I)
+
+
+def _ask_bytes(items: list[tuple[str, bytes, bytes | None]], category: str | None,
+               model: str, headwear: bool = False) -> dict[str, Any] | None:
+    """One Gemini call over (view, cut-out bytes, original bytes | None) items."""
     key = settings().gemini_api_key
     if not key:
         return None
@@ -173,21 +199,20 @@ def _ask(pairs: list[dict[str, Any]], category: str | None, model: str) -> dict[
 
     parts: list[Any] = []
     lines = [_ASK, "", f"The garment is: {category or 'a clothing item'}."]
-    with httpx.Client(timeout=60, follow_redirects=True) as client:
-        for n, pair in enumerate(pairs, 1):
-            cut = client.get(pair["cutout"]).content
-            orig = client.get(pair["original"]).content if pair.get("original") else None
-            cut_whole, cut_top = _prepare(cut)
-            if orig:
-                orig_whole, orig_top = _prepare(orig)
-                lines.append(f"View {n} = {pair['view']}: images in the order A, B, C, D below.")
-                imgs = [orig_whole, cut_whole, orig_top, cut_top]
-            else:
-                lines.append(f"View {n} = {pair['view']}: NO original on file — images B then D only; "
-                             f"judge the cut-out on its own.")
-                imgs = [cut_whole, cut_top]
-            for b in imgs:
-                parts.append(types.Part.from_bytes(data=b, mime_type="image/jpeg"))
+    if headwear:
+        lines.append(_HEADWEAR_NOTE)
+    for n, (view, cut, orig) in enumerate(items, 1):
+        cut_whole, cut_top = _prepare(cut)
+        if orig:
+            orig_whole, orig_top = _prepare(orig)
+            lines.append(f"View {n} = {view}: images in the order A, B, C, D below.")
+            imgs = [orig_whole, cut_whole, orig_top, cut_top]
+        else:
+            lines.append(f"View {n} = {view}: NO original on file — images B then D only; "
+                         f"judge the cut-out on its own.")
+            imgs = [cut_whole, cut_top]
+        for b in imgs:
+            parts.append(types.Part.from_bytes(data=b, mime_type="image/jpeg"))
     lines.append("Answer one entry per view, in the same order, with `view` set to its name.")
     args = genai_client_args()
     gclient = genai.Client(api_key=key,
@@ -201,7 +226,7 @@ def _ask(pairs: list[dict[str, Any]], category: str | None, model: str) -> dict[
 
 
 def judge(pairs: list[dict[str, Any]], *, category: str | None = None,
-          model: str | None = None) -> tuple[dict[str, Any] | None, str]:
+          model: str | None = None, headwear: bool = False) -> tuple[dict[str, Any] | None, str]:
     """`pairs`: [{view, cutout, original|None}]. Returns (answer, note); answer is
     {"views": [...]} or None when the AI could not answer (note says why)."""
     if not pairs:
@@ -209,11 +234,42 @@ def judge(pairs: list[dict[str, Any]], *, category: str | None = None,
     pol = policy()
     model = model or (pol.get("llm") or {}).get("model_fast") or "gemini-2.5-flash"
     k = cache.key("cutout-integrity", urls=[u for p in pairs for u in (p["cutout"], p.get("original") or "")],
-                  text=[model, SYSTEM, _ASK, SCHEMA, category or "", LONG_SIDE, TOP_SHARE])
+                  text=[model, SYSTEM, _ASK, SCHEMA, category or "", LONG_SIDE, TOP_SHARE,
+                        _HEADWEAR_NOTE if headwear else ""])
     try:
-        answer, hit = cache.through(k, lambda: _ask(pairs, category, model), pol=pol)
+        answer, hit = cache.through(k, lambda: _ask(pairs, category, model, headwear), pol=pol)
     except Exception as exc:  # noqa: BLE001 — a failed look concludes nothing
         log.warning("cut-out integrity check failed: %s", exc)
+        health.record_error(exc, "gemini")
+        return None, f"AI check could not run — {type(exc).__name__}: {exc}"[:200]
+    if not answer:
+        return None, "AI check could not run — no answer"
+    health.record_ok("gemini")
+    return answer, "cached" if hit else ""
+
+
+def judge_pair(raw: bytes, cutout: bytes, *, category: str | None = None,
+               model: str | None = None, view: str = "cut-out",
+               headwear: bool = False) -> tuple[dict[str, Any] | None, str]:
+    """THE SAME QUESTION, ASKED BEFORE THE CUT-OUT IS STORED (3 Nov 2026).
+
+    `raw` is the photograph and `cutout` the candidate the chain is about to return
+    (app/imaging/cutout.py, the `ai_check` gate). Bytes in, so nothing has to be
+    uploaded first; cached on the two buffers' hashes, so a re-run of the same
+    photograph through the same model is free. Returns (answer, note) like `judge`;
+    the answer holds one view, named `view`. Never raises.
+    """
+    pol = policy()
+    model = model or (pol.get("llm") or {}).get("model_fast") or "gemini-2.5-flash"
+    k = cache.key("cutout-integrity", blobs=[raw, cutout],
+                  text=[model, SYSTEM, _ASK, SCHEMA, category or "", LONG_SIDE, TOP_SHARE, view,
+                        _HEADWEAR_NOTE if headwear else ""])
+    try:
+        answer, hit = cache.through(k, lambda: _ask_bytes([(view, cutout, raw)], category, model,
+                                                          headwear=headwear),
+                                    pol=pol)
+    except Exception as exc:  # noqa: BLE001 — a failed look concludes nothing
+        log.warning("cut-out integrity check (pre-store) failed: %s", exc)
         health.record_error(exc, "gemini")
         return None, f"AI check could not run — {type(exc).__name__}: {exc}"[:200]
     if not answer:
@@ -251,13 +307,19 @@ _HOLDS_BROKEN = re.compile(r"strap|waist|belt", re.I)
 _HOLDS_BACKGROUND = re.compile(r"form|stand|mannequin|torso|dummy|bust|pole|base", re.I)
 
 
-def _fails(d: dict[str, Any]) -> bool:
+def _fails(d: dict[str, Any], headwear: bool = False) -> bool:
     """A finding that holds the product (see _HOLDS_BROKEN / _HOLDS_BACKGROUND):
     broken cloth on a strap or waistband; clear background that is the dress
-    form, its stand or a torso — never a hanger; clear lost colour."""
+    form, its stand or a torso — never a hanger; clear lost colour.
+
+    `headwear`: the display head a cap sits on is part of the picture, so a
+    background finding that names the head, face, neck or form holds nothing."""
     kind, sev = str(d.get("type") or ""), str(d.get("severity") or "")
     part = str(d.get("part") or "")
     if kind == "background" and _HANGER.search(f'{part} {d.get("where") or ""}'):
+        return False
+    # The PART, not the place: "stand, below the neck" is still a stand.
+    if headwear and kind == "background" and _HEAD.search(part):
         return False
     if kind == "cloth_broken":
         return bool(_HOLDS_BROKEN.search(part))
@@ -266,26 +328,33 @@ def _fails(d: dict[str, Any]) -> bool:
     return kind == "colour" and sev == "clear"
 
 
-def failing(answer: dict[str, Any] | None) -> list[str]:
+def failing(answer: dict[str, Any] | None, headwear: bool = False) -> list[str]:
     """The defects that hold a product, as sentences."""
     out = [_sentence(v.get("view"), d) for v in (answer or {}).get("views") or []
-           for d in v.get("defects") or [] if _fails(d)]
+           for d in v.get("defects") or [] if _fails(d, headwear)]
     return list(dict.fromkeys(out))
 
 
-def failing_views(answer: dict[str, Any] | None) -> list[str]:
+def failing_views(answer: dict[str, Any] | None, headwear: bool = False) -> list[str]:
     """The views (as named in the pairs) with a defect that holds."""
     out = [str(v.get("view") or "") for v in (answer or {}).get("views") or []
-           if any(_fails(d) for d in v.get("defects") or [])]
+           if any(_fails(d, headwear) for d in v.get("defects") or [])]
     return list(dict.fromkeys(out))
 
 
-def noted(answer: dict[str, Any] | None) -> list[str]:
+def noted(answer: dict[str, Any] | None, headwear: bool = False) -> list[str]:
     """Everything else the AI saw — reported for a person, failing nothing."""
-    fails = set(failing(answer))
+    fails = set(failing(answer, headwear))
     out = [_sentence(v.get("view"), d) for v in (answer or {}).get("views") or []
            for d in v.get("defects") or []]
     return [x for x in dict.fromkeys(out) if x not in fails]
+
+
+def is_headwear(category: str | None) -> bool:
+    """Is this product's category headwear (object_cutout.FAMILIES)?"""
+    from app.imaging import object_cutout as oc
+
+    return oc.family_of(category, ["headwear"]) == "headwear"
 
 
 # --------------------------------------------------------------------------- #
@@ -364,13 +433,17 @@ def check(rows: list[dict[str, Any]], sent: list[str], *, category: str | None,
         pairs.append({"view": view if seen[view] == 1 else f"{view} {seen[view]}",
                       "cutout": r["url"],
                       "original": gc.root_of(r, by_id)["url"] if r.get("derivedFromId") else None})
-    answer, note = judge(pairs, category=category, model=model)
+    headwear = is_headwear(category)
+    # The flag is passed only when it is set: every stand-in for `judge` in the
+    # tests and scripts keeps its (pairs, category, model) signature.
+    answer, note = judge(pairs, category=category, model=model,
+                         **({"headwear": True} if headwear else {}))
     if answer is None:
         return IntegrityVerdict("unknown", hold=hold, required=bool(cfg["required"]),
                                 unavailable=True, note=note)
-    reasons = failing(answer)
-    return IntegrityVerdict("bad" if reasons else "ok", reasons=reasons, soft=noted(answer),
-                            bad_views=failing_views(answer), hold=hold,
+    reasons = failing(answer, headwear)
+    return IntegrityVerdict("bad" if reasons else "ok", reasons=reasons, soft=noted(answer, headwear),
+                            bad_views=failing_views(answer, headwear), hold=hold,
                             required=bool(cfg["required"]), note=note)
 
 

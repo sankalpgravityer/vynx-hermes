@@ -703,6 +703,538 @@ Deploy: pull, `sudo systemctl restart hermes hermes-worker hermes-beat`. In the 
 
 ---
 
+## 18. Framing is not a re-cut; a defective cut-out is re-cut with other methods (6 Oct 2026)
+
+Midtex part 1 (100 products): the matte step took 120-200 s a product, and 9 products
+were left with a wrong cut-out (a block of studio, the mannequin below the hem, torn
+side panels, a cut-away collar or strap) that every later step passed or skipped.
+
+**Why so slow.** Almost every product was re-matted only because its cut-out was not
+cropped and centred to the standard ("fills only 54% of the frame"). That re-ran the
+whole chain per view — v2 (~6 s of model, ~5 s of PNG encoding, ~2.5 s of checks on
+a 3000x4000 locally; more on the server, two at a time), v1 when a check refused, then
+Gemini and gpt-image (paid, 30-120 s each) — to make the same cut-out again and frame
+it. Now:
+
+- `cutouts.judge` marks a view whose only problem is the framing standard
+  (`CutoutVerdict.frame_only_views`), and the matte step sends those views as
+  `--bg-strategies frame-only`: Hermes crops and centres the cut-out on file
+  (`main.EXISTING_FRAMED`) without cutting again, ~2 s. If it cannot be framed safely,
+  the view is re-cut as before.
+- PNG encoding at zlib level 6 instead of `optimize=True`: 0.39 s against 1.02 s per
+  3000x4000 save, no larger.
+
+**Why defects stayed.** Nothing ever asked a DIFFERENT method. The matte step's
+re-matte ran the default chain, got the identical answer ("neckline cut away" twice on
+MID-000053's FRONT) and stopped at STILL WRONG; the rematte step skipped whenever the
+matte step had re-cut ("the same segmenter would return the same cut"). Now the default
+chain answering the same way twice in one run ESCALATES, once, to
+`readiness.cutouts.recut_strategies`:
+
+    recut_strategies: ["object-isnet", "gemini-paint", "openai-paint"]
+
+- in the MATTE step, when the re-matte's re-check measures the same defect;
+- in the REMATTE step, when the photo audit still flags a cut-out the matte step
+  re-made this run (a flag on a product the matte step did not touch keeps the chain's
+  own answer, as before — the current chain gets its shot at a cut an older one made);
+- the flagged views only, `--keep-better` still on, never a second paid round.
+
+`object-isnet` is first and free: the whole-product IS-Net cut now runs for a GARMENT
+too when it is named without any parser (an explicit ask; the policy default and
+`url_strategies` name the parsers, so their family gate is unchanged). Measured on
+MID-000053's BACK DECISION photo — the dark layer behind the racerback read as
+background to every parser, torn on every re-cut; both paid methods were refused
+(Gemini left scene at the border, gpt-image redrew) — the IS-Net cut is whole, hanger
+kept, and passes every garment check free.
+
+**Photo audit.** A hanger, its hook or the decision panel's clamp left on a cut-out is
+accepted (`photo_audit.gallery.hangers_are_leftovers: false`, like the clips). The
+prompt now names the mannequin form below the hem and a block of the studio as `clear`
+leftovers — both were passing.
+
+**A defect the run cannot repair now HOLDS (6 Oct 2026, the operator's call):
+`readiness.cutouts.hold: block`.** MID-000053 went through a full run with its FRONT
+cut-out measurably wrong after every re-cut, flagged twice — and was approved and
+synced to Shopify, because `soft` let every finding pass as a note. Now the measured
+checks hold as CUTOUT_UNFIXABLE and the photo audit's cut-out defects as
+CUTOUT_DEFECT; outcome HELD_FOR_HUMAN. Expect more holds in the first runs after
+deploying — that is the point.
+
+**Stray pieces (same product, same day).** Gemini's keyed answer left a corner of the
+studio screen opaque at the frame's foot — dark, so every backdrop-COLOUR check passed
+it, and a fragment floated beside the tank top on the live listing. Two rules now:
+
+- a GARMENT cut-out drops any piece that is small beside the garment (< 5% of its
+  area) and clear of it (bounding-box gap > 4% of its long side) before the checks
+  (`_drop_stray_pieces`); a set's second garment is large and a detached button sits
+  close, so both stay;
+- the escalation's `object-isnet` cut of a garment is SINGLE-piece
+  (`object_cutout.Config.single_piece`) — shoes keep their pair rules.
+
+**vnyx-api** forwards `--bg-strategies` (route option `bgStrategies`, closed list of
+Hermes' method names, advertised on `/ping`) to Hermes as `strategies`. Hermes sends it
+only when `/ping` lists it, so either can deploy first; until vnyx-api is deployed the
+matte step re-cuts as before and the rematte skip stays.
+
+The photo-audit prompt changed, so every product's audit is asked once more (the cache
+key includes the prompt).
+
+---
+
+## 19. The photograph's resolution is the cut-out's to keep (7 Oct 2026)
+
+"Why is my quality degraded when we do background removal": a 674x899 FRONT cut-out
+sat beside its 3000x4000 booth photo (MID-000249 — all four of its cut-outs measure
+1/2.5 to 1/3.4 of their photographs' resolution). Two causes, two fixes:
+
+- **The old providers wrote the model's render size and nothing measured it** — the
+  canvas ratio check is blind to a same-ratio downscale by design. New measured check
+  (`cutouts.resolution_problem`, `readiness.cutouts.resolution_max: 1.6`): the
+  photograph's long side over (the registered garment scale x the cut-out's long
+  side). Over the limit, the view is re-cut from the raw at full size by the matte
+  step. Hermes' framed cut-outs measure ~1.0 whatever their canvas, so a small
+  garment's small canvas is never flagged; when the two pictures neither line up nor
+  register, nothing is said.
+- **The paid paint methods still did it**: Gemini's and gpt-image's background
+  removal return the model's ~1 MP render, and accepting one stored it. Once a paint
+  passes the framing and fidelity checks, its SILHOUETTE is now applied to the
+  original photograph like a mask strategy (`_paint_as_mask`,
+  `imagery.cutout.paint_keep_resolution`): full resolution, the photo's own colours
+  and ICC profile, the model's relighting gone with its pixels.
+
+**The mannequin's neck stub (same day, the operator's call).** Cutting the form's
+neck out of the collar opening makes the collar look torn, so the stub INSIDE the
+collar opening is now accepted — the photo-audit prompt says it is kept on purpose,
+and the leftovers filter treats "mannequin neck" like the hanger. The form below the
+hem or beside the garment still counts, and the measured neckline-loss check (garment
+fabric eaten at the collar) is unchanged.
+
+Expect the first run over an old tenant to re-cut most of its catalogue once: every
+render-size cut-out from the old providers is now flagged. That is the point — each
+re-cut takes the original's pixels through the standard framing.
+
+---
+
+## 20. The neck opening of a top, finished (7 Oct 2026)
+
+MID-000351, both FRONT cut-outs:
+
+- **PHOTOBOOTH** — the collar opening shows the booth's white mannequin neck; the parser
+  rightly cut it out, and the empty U read as a torn collar.
+- **DECISION** — the opening shows the black studio, a metal bracket and the white
+  hanger; the parser kept scattered fragments of them (black spots in the neckline).
+
+`app/imaging/neckline.py`, called by `remove_background` AFTER every check has accepted
+a cut-out (the checks still judge the segmenter's own answer), on the garment chain only:
+
+1. The body = the cut-out's largest solid piece. The collar tips = the highest point of
+   its top edge either side of a central dip. Only a real neck counts (depth 2-22% of
+   the garment's height, width 10-48% of its width, both tips above the dip) — so tank
+   tops, turtlenecks, V-neck cardigans, hoods, back views, bottoms, shoes and bags are
+   never touched (checked on 16 Midtex photos of all of those).
+2. The opening = the region the collar and the straight line between the tips enclose
+   (flood-filled, so a collar that curves outward below its tip is covered; a flood
+   that leaks through a gap in the collar does nothing).
+3. **PHOTOBOOTH** (`fill_origins`): the opening is put back from the photograph's own
+   pixels — the form, lit side and shadowed side — cut flat at the tips' line. If more
+   than `max_backdrop` (30%) of the opening is the studio (a neckline wider than the
+   form's neck), it is left open instead.
+4. **DECISION** (`clear_origins`): the opening is flooded through everything that is
+   NOT one of the garment's own colours (sampled from the collar and chest below the
+   neck) and cleared. Thin slivers left standing beside the cleared area go too. The
+   inside back of the garment, when it shows in the opening, is garment-coloured and
+   stays.
+5. **Any other origin** (the wall, an unknown one): left as it is. This was added 7 Oct
+   for MID-000430 (§21). On a wall photo the opening shows the garment's own white back
+   collar band. Clearing cut it ragged and chopped the front collar's tips flat.
+
+The keep-better guard accepts the finished cut-outs (MID-000351: 104% and 100% of the
+garment on file). Policy: `imagery.cutout.neckline` (`false` turns it off).
+
+**Existing cut-outs change only when re-cut.** No check flags an unfinished neckline, so
+products already in the catalogue keep theirs until their next re-cut, or a deliberate
+one (`backfill-bg-removal.ts --product <ids> --views FRONT --replace --keep-better
+--provider hermes --apply`).
+
+---
+
+## 21. Smooth parser edges; white trim put back on wall photos (7 Oct 2026)
+
+MID-000430's FRONT (a black Adidas tee, white V collar and cuffs, on a wire hanger
+against a white wall) showed three faults on the live listing:
+
+- **a zig-zag outline.** rembg's `predict` takes the parser's ARGMAX label map at
+  768x768 and LANCZOS-resizes the labels to the photograph — 5.2x on a 3000x4000 — so
+  every cloth-seg outline, on every origin, was a staircase of ~5 px steps with wall in
+  the risers.
+- **the collar "missing".** The white BACK collar band, seen above the front neckline
+  (the hanger's hook goes through it), was cut away: the parser scored it 0.06-0.6
+  against a wall of the same colour.
+- **a white cuff missing** on the left arm, the same way.
+
+The hanger strategy never ran: the hanger is inside the shirt, so there is no bar to
+find ("no hanger bar found in the photo") and the photo went to the parser.
+
+**1. The parser's own score, snapped to the photograph** (`_cloth_score`, `_cloth_alpha`,
+`_decontaminate`; every origin). The score is upsampled bilinearly, a guided filter
+with the photo as guide (radius 0.4% of the long side) moves it onto the photograph's
+edge, and a smoothstep over [0.44, 0.56] makes a 1-2 px antialiased edge.
+Semi-transparent edge pixels take the nearest solid garment colour, so no wall rim
+remains. Measured on a shoulder: the photo's edge at x 2071, rembg's at 2077 in steps,
+the snapped one at 2072. If the session has no raw ONNX handle, rembg's own path is
+used as before.
+
+**2. White trim put back, wall photos only** (`_recover_trim` via `_finish_trim`;
+`trim_origins` WEB, MANUAL). This runs AFTER the checks accept a parser's cut-out.
+Joined to a white collar, the trim is a white ring that the leftover check would
+rightly refuse on a podium. Colour cannot tell trim from a white wall, and texture
+could not either: the first try took the sleeve's shadow, whose own edge reads as
+texture, and left a ragged outline. An **edge** can. Trim meets the wall at a step (a
+seam, a fold, its own shadow line); a shadow fades into the wall with none.
+
+- The wall is flooded from where it is certain, through every pixel that is not an
+  edge. Certain means beyond 2x `trim_ring` (5%) of the garment's width, or scored
+  under `trim_wall_score` (0.02). An edge is a lightness gradient over `trim_edge`
+  (10).
+- Gaps narrower than `trim_gap` (0.8% of the width) are closed to the flood: at a
+  collar's corner the band's edge and the front collar's leave one.
+- Whatever the flood cannot reach, within `trim_ring` of the garment, is a candidate.
+  It is kept when the parser leaned that way on average (`trim_min_score` 0.12) and it
+  touches the garment.
+- Pieces as thin as the gap (a hanger wire, a pencil line, a band's tapering tips) are
+  opened away.
+- Edge pixels go to the nearer side, and a guided filter draws the new outline on the
+  photograph's edge.
+- More than `trim_max_add` (4%) of the garment is not trim, and nothing is added.
+- **Tops (or garments of unknown type) only.** Bottoms on a clip hanger are excluded:
+  the wall between the bar and the waistband is a closed-in strip of exactly the kind
+  this looks for (MBF-000128).
+- **Each piece must look like lost trim** (`_trim_looks_like_garment`):
+  - the garment has its colour: at least `trim_garment_share` (0.5%) of the garment's
+    pixels lie within `trim_garment_de` (10 ΔE);
+  - it is camouflaged against the wall right beside it, between `trim_wall_de` (4)
+    and `trim_wall_de_max` (15) away, and nearer the garment by `trim_margin` (2);
+  - it is at least `trim_min_piece` (0.1%) of the garment;
+  - it does not rise above the garment's top by more than `trim_above` (1% of its
+    height). What rises above a hung garment is the clip, hook or hanger.
+
+**Regression, 69 wall photos from 14 tenants (prod raws, read-only):**
+
+| version | photos with additions | wrong |
+|---|---|---|
+| edge flood alone | 59 | most: wall closed in by hanger wires or between an arm and the body, wall slivers on shoulders, wall hooks, clips, a hand |
+| + colour tests | 18 | 8 hanger clips, 2 wall wedges inside dark pieces, a wall hook |
+| + camouflage limit | 6 | 5 hanger hardware above the garment |
+| + above-the-garment rule and tops only | **1** | **none: MID-000430's band and cuff** |
+
+On MID-000430 FRONT, through the whole chain (`cloth-seg-ft+agreed`), it puts back 1.4%:
+the whole back collar band with a smooth curved top, and the cuff. It adds nothing on
+the sleeves' shadows. The thin red hanger wire is opened away, and no cloth goes with
+it.
+
+**A second sample of 69 wall photos** (drawn fresh, 43 of them tops) with the final
+rules adds pieces on 4 photos. Three are right: MID-000430's band and cuff,
+MID-000455's white mesh side panel at the hem (the trim stops at the mannequin's white
+form below it), and a bra strap. One is wrong: a strip of the white mounting board
+beside a bra (MBF-000065). That photo's parser cut-out already keeps part of the board
+and fails the leftover check, so the chain only accepts it, and so trims it, if both
+parsers agree.
+
+**What it cannot do:** MID-000430's BACK view. There the parser dropped every white
+part of the shirt, the collar and both cuffs, so the garment has no white to match the
+pieces against, and they stay out. A re-cut still gives that view smooth edges.
+
+Two other routes were tried for it and rejected:
+- **IS-Net as a second opinion** for such pieces. On the 67 other photos it vouched for
+  five pieces, and all five were a mannequin form, a mounting board or wall.
+- **Gemini paint.** It redrew the shirt (pixel match 0.08), and the fidelity gate
+  refused it.
+
+The real fix is a parser trained on wall photos; the fine-tune so far saw only decision
+and photobooth photos.
+
+**User's rule, 7 Oct: "if removing the hanger would tear the cloth, keep the hanger".**
+This step only ever ADDS garment the parser dropped near a hanger. It never removes
+cloth for the hanger's sake. The hanger's thin wire is not put back, and keeping a
+hanger is accepted everywhere it was before (`hangers_are_leftovers: false`; §14's
+clips).
+
+The same rule moved the neckline's clearing (§20) to the decision panel only. On
+MID-000430 the clearing ran after this step: it cut the band it had just put back
+ragged, and chopped the front collar's tips flat.
+
+**Cost:** the parser memoises its 768x768 score per photo and model (~1 MB, at most
+eight entries), and the finishing step re-snaps it. That adds 0.7-4 s per accepted
+wall-photo cut-out, depending on size. Policy: `imagery.cutout.cloth_edges`;
+`cloth_edges: false` restores rembg's mask, and an empty `trim_origins` turns the trim
+step off.
+
+**Existing cut-outs change only when re-cut** (same command as §20, the views
+concerned). MID-000430:
+
+```
+npx tsx scripts/backfill-bg-removal.ts --product bb731b58-62fd-4780-8745-1eb22a8cd217 --views FRONT,BACK --origins WEB --replace --keep-better --provider hermes --apply
+```
+
+---
+
+## 22. Booth photos filed as WEB: the stand kept; a cut-off render not re-made (7 Oct 2026)
+
+Midtex auto-approval of six products. Four came out right; two did not:
+
+- **MID-000442 FRONT** (black tank top): the cut-out kept the mannequin's pole, the
+  white form under the hem and the podium.
+- **MID-000445 BACK** (white tee): the same.
+- **MID-000445 AI_BACK_34:** the model was cut mid-shin, and the regen step left it.
+
+**Why the stand stayed.** Both photos are filed as **WEB**, but they were taken in the
+booth: curtain, mannequin, pole, podium. WEB means "hung on the wall" to the chain
+(§14), so the order is IS-Net's hanger cut, then Gemini, then the parsers.
+- IS-Net found no hanger bar.
+- On MID-000442, Gemini's answer kept the stand. Every check passed it: the border is
+  87% clear, and the podium is grey cloth, not the curtain's colour.
+- The re-cuts (IS-Net as an object, then the paid methods) kept the stand too.
+- MID-000445's BACK reached IS-Net through the matte step's escalation.
+
+**Fixes** (`app/imaging/cutout.py`):
+
+1. **No bar, no hung photo.** When `hanger-isnet` fails with "no hanger bar found",
+   every local cut (v2, v1, stock) is asked before the paid methods. The paid methods
+   keep their own order. A WEB photo with no bar is a model, a web image, a hanger
+   inside the shirt (MID-000430), or the booth's mannequin. The fine-tuned parsers were
+   trained on the booth.
+2. **A top that reaches the floor kept its stand** (`_kept_stand`). A top's cut-out
+   that touches the bottom `stand_band` (0.5%) of the photograph across more than
+   `stand_bottom_max` (3%) of its width is refused, and the chain moves on. This
+   catches any method that keeps the podium, including IS-Net, Gemini and the
+   escalation. It applies to tops and garments of unknown type. Bottoms are left out,
+   because trousers hung on a wall can be framed to the photo's foot. Policy:
+   `imagery.cutout.stand_check`, `stand_bottom_max`, `stand_band`.
+
+On both photos the default chain now gives `cloth-seg-ft`: the garment alone, no pole,
+form or podium. The readiness neckline check passes both, so the matte step does not
+escalate them again. Before/after images: `reports/midtex tenant/MID-000442_FRONT_stand_before_after.jpg`
+and `MID-000445_BACK_stand_before_after.jpg`.
+
+**The render.** `photo_audit.gallery.framing` was `soft` (21 Sep 2026: "where the frame
+cuts the model is not worth a paid render"), so a knee-up shot cut through the lower
+leg was recorded and never re-rendered. The user reversed this on 7 Oct. It is now
+`defect`: such a render is a RENDER_DEFECT and goes to the regen step, at one render
+per view.
+
+**Also seen:** Midtex's Brain has *Hold on bad cut-out* off, so
+`readiness.cutouts.hold` arrives `soft` ("soft — readiness.cutouts.hold" in the log).
+Those cut-out defects were flagged, and the products were approved and synced anyway.
+Switch it on in the Brain to hold such products for a person instead.
+
+**Repairing the two products:**
+```
+npx tsx scripts/backfill-bg-removal.ts --product 43492403-b3df-4d05-b880-33c070dd07c1 --views FRONT --origins WEB --replace --provider hermes --apply
+npx tsx scripts/backfill-bg-removal.ts --product 44f01516-4f41-4bca-92e3-8cedb788a700 --views BACK --origins WEB --replace --provider hermes --apply
+```
+No `--keep-better`: the cut-out on file has the stand, so it holds more "garment" than
+the correct one, and keep-better would refuse the fix. Then run auto-approval on
+MID-000445 again. The photo audit now calls the cut-off AI_BACK_34 (and AI_FRONT_34) a
+render defect, and the regen step re-makes them.
+
+---
+
+## 23. Every original gets its own cut-out: matting per view AND origin (7 Oct 2026)
+
+MID-000447, 449, 451, 456 and 460 each have three garment photos: a DECISION front, a
+WEB front and a WEB back. Both WEB photos have had cut-outs since 26 Aug. The DECISION
+front never had one, so it was missing from the Edited gallery. It was never deleted,
+just never made.
+
+The cause was "a view is covered if ANY live row for it is already processed". That
+rule lived in `backfill-bg-removal.ts` and in the chain's matte state
+(`repair_product.needs_from`). The WEB front's cut-out made FRONT read as done, so the
+DECISION front was never sent. The approval gate called it a defect all along:
+`blocking=[IMG.010]` on every one of the five.
+
+**Fix:** a RAW original is covered only by a live cut-out of its own view AND origin.
+- vnyx-api: `src/services/cutout-coverage.ts` (`rawsWithoutCutout`), used by the
+  backfill script, with tests in `test-cases/services/cutout-coverage.test.ts`.
+- Hermes: `needs_from`, so the matte step runs and says `matte FRONT (DECISION)`.
+
+A row with no origin still covers, and is covered by, its whole view, as before.
+Generation's own rule (`needs_matting_for_generation`) stays per view: a render needs
+one cut-out per view, not one per origin.
+
+Dry run on MID-000447 after the change: `FRONT RAW … 1 image(s) need a cut-out`, the
+DECISION front, and nothing else.
+
+**Scale:** 31 active Midtex products have an original with no cut-out of its own (plus
+5 archived). The list and one backfill command are in
+`reports/midtex tenant/midtex_unmatted_decision_fronts.txt`. No `--replace`, so only
+those originals are cut and nothing on file is touched. DECISION photos go to the
+garment parser first (§14 routing), and the neckline is cleared there (§20).
+
+---
+
+## 24. Cut-outs at the photograph's resolution; ten regen rounds; no label = held, not rejected (7 Oct 2026)
+
+**Small cut-outs.** 1,559 of Midtex's 2,006 current cut-outs are under half their
+photograph's size. Most are the old provider's 896x1195 from August. 66 were made today
+by "frame only": an old small cut-out was cropped and centred instead of re-cut,
+leaving it smaller still (699x933 against 3000x4000).
+- `cutouts.resolution_problem` measures the garment's scale by lining the cut-out up
+  with the photograph. When that failed it said nothing, so framing looked like the
+  view's only problem.
+- New fallback: the canvas answers from below. A cut-out under
+  1/`resolution_canvas_max` (3.0) of the photograph's long side is re-cut at full size.
+- Hermes' own cut-outs sit at 1–2x, because the framing crops the canvas but keeps the
+  photograph's pixels 1:1. The old ones sit at 3.3–6.2x.
+- `reports/midtex tenant/midtex_lowres_cutouts.txt` lists the 447 active products
+  holding such a cut-out, in 9 backfill commands of 50 products each (`--replace
+  --keep-better`).
+
+**Regen budget.** `readiness.regen_rounds` went from 3 to 10, both in policy and in the
+code default. The Brain's switch still turns regen on or off.
+
+**No care label.** The product now stays in Review: HELD_FOR_HUMAN, outcome
+`NO_CARE_LABEL`, reason "care label is missing — add the care-label photograph and run
+it again". It used to move to the Rejected tab. The check still runs before the chain,
+so no paid call is spent. `readiness.no_care_label: reject` restores the old
+behaviour. Missing brand or size after the chain is still rejected, unchanged.
+
+---
+
+## 25. The mannequin's neck on WEB photos taken in the booth (7 Oct 2026)
+
+Midtex photos filed **WEB** are often booth shots: a mannequin on its podium. Their
+cut-outs showed the hollow above the collar that MID-000351's photobooth one did, and
+read as a broken garment (MID-000480; MID-000461–479 the same). §20 puts the form back
+only on PHOTOBOOTH photos, and since §22 a WEB neckline is left as it is.
+
+**The rule (the user's): put the neck back only when a mannequin is in the photo.**
+- For WEB and MANUAL photos (`neckline.mannequin_origins`), `_mannequin_neck` looks
+  for the form's neck rising above the collar.
+- It measures a band above the collar tips' line, 2–12% of the garment's height. The
+  centre between the tips is compared with the background beside the neck at the same
+  height.
+- A mannequin needs at least `mannequin_min_fill` (0.35) of the centre to differ from
+  that background, and `mannequin_min_columns` (0.25) of its columns to differ top to
+  bottom. A hanger's crossbar fills a few rows, never whole columns.
+- If the band or the background beside it falls outside the photo, it is never a
+  mannequin. That covers a garment filling the frame, like OTR-000002.
+
+| photos | centre that differs | columns solid top to bottom |
+|---|---|---|
+| 11 on a mannequin (9 Midtex WEB + MID-000455, TST-000003) | 0.45–0.87 | 0.34–0.48 |
+| 5 hung on a wall with a neck (KIL-000338, MID-000031/425/430) | 0.09–0.15 | 0.01 |
+| OTR-000002 (filling the frame) | no room, not judged | — |
+
+When a mannequin is seen, the fill is the photobooth's: the photograph's own pixels,
+cut flat at the collar tips. All nine Midtex fronts come out filled: before/after
+sheets are in `reports/midtex tenant/neck_mannequin_side_by_side/`
+(`_overview_all_9.jpg`). PHOTOBOOTH is unchanged (always filled), and DECISION is
+unchanged (cleared).
+
+**Existing cut-outs change only when re-cut.** From vnyx-api:
+```
+npx tsx scripts/backfill-bg-removal.ts --product <ids> --views FRONT --origins WEB --replace --keep-better --provider hermes --apply
+```
+
+---
+
+## 26. Bags: the v3 fine-tune, bags only (1 Nov 2026)
+
+Round 3 of the cloth-seg fine-tune (`cloth_seg_ft_v3.onnx`) was trained with
+bags added. Measured against the hand masks:
+
+| Photo type | v3 against v2 |
+| --- | --- |
+| Decision and photobooth (1,257 ordinary photos) | tie: overlap 0.9921 vs 0.9925 |
+| Bags | overlap 0.81 → 0.96; background left in 60 → 12; pieces missing 78 → 16 |
+| Held products, missing pieces | 66 → 30 |
+| Held products on a hanger or mannequin | worse: keeps the hook or neck on ~34 of 373 |
+
+So v3 cuts **bags only**. A new strategy, `cloth-seg-ft-bag`, runs first on the
+bags route (`object.families` → "bags"), ahead of `object-isnet`, and is judged by
+the object checks like everything on that route. A v3 cut-out the checks refuse, or
+a "no garment found", falls through to IS-Net exactly as before. Shoes stay IS-Net
+first and garments never see v3: v2 and v1 are untouched.
+
+**On the server.** Copy the file and point the unit at it, next to v2 and v1:
+
+    Environment="HERMES_CLOTH_SEG_FT_BAG_PATH=/var/lib/hermes/models/cloth_seg_ft_v3.onnx"
+
+Restart the three services. Without the variable, or with the file missing, the
+bags route is IS-Net alone as it was, and the log says which:
+
+    bg-removal: 'Backpacks & Bags Tote Bags' is bags — the bag parser (v3), then the object cut-out first, judged by the object checks
+    bg-removal cloth-seg-ft-bag#1 produced a cut-out in 6.2s
+
+**Nothing to change in vnyx-api.** The bag parser is the bags route's own first
+step: any allow-list that lets `object-isnet` run (the policy default,
+`url_strategies`, `readiness.cutouts.recut_strategies`) gets it. `object.bag_parser:
+false` in policy turns it off without touching the environment.
+
+**Not done.** v3 for held garments would need a v3.1 that drops the hanger habit,
+tested on both sets, before the garment route switches.
+
+---
+
+## 27. The AI check before a cut-out is returned; Hermes first at intake (3 Nov 2026)
+
+Plan and files: `docs/HERMES-BG-FALLBACK-PLAN.md`.
+
+**In Hermes.** Every candidate the pixel checks accept — v3, IS-Net, v2, v1 — is
+now shown to the Gemini judge beside the photograph it was cut from before the
+chain returns it (`app/imaging/cutout.py` `_ai_gate`, `cutout_integrity.judge_pair`:
+the same prompt, the same three defects and the same `_fails` rule the stored-row
+`integrity` check holds on). A flagged candidate is refused like any other check's
+refusal and the next model runs. When every model is refused the answer is
+`ok:false` with every verdict in `ai_check`, and vnyx-api turns to its own Gemini
+background removal (`vnyx-gemini`, the v7 endpoint). Hermes never paints: the paid
+strategies stay out of the chain, and the gate never adds one.
+
+    bg-removal cloth-seg-ft#1 refused by the AI check: AI check — CUTOUT DEFECT — cloth-seg-ft cut-out: cloth broken (strap) [clear]
+    bg-removal cloth-seg-ft-backup#1: AI check passed
+
+Policy, `imagery.cutout.ai_check`: `enabled`, `model` (null = `llm.model_fast`),
+`on_unavailable` (`accept`: the pixel checks decide when the judge cannot answer;
+`refuse`), `max_concurrent` (judge calls in flight per process). Off for one call
+with `ai_check: false` on the request. The response carries
+`ai_check: {ran, enabled, flagged, model, verdicts: [{strategy, ok, defects, noted,
+summary}]}`; `/v1/imagery/cutout` sets `X-Cutout-AI-Check: pass|flagged|skipped`.
+
+Cost: one flash call per accepted candidate — one for a good photo, up to four for
+one every model gets wrong. The judge needs `GEMINI_API_KEY`, which the rules
+already use. No image-generation key.
+
+**In vnyx-api.** A new provider value, `hermes`, in the three tenant columns and
+the editor's Provider list. Intake — the analyze worker, the decision flow, the
+late cut-out, the editor's "Change background" and the readiness matte — goes
+through `services/hermes-cutout.ts`: `/healthz` probe cached 30 s, a 60 s breaker
+opened by a connection error / timeout / 5xx (never by `ok:false` or "busy"), an
+in-process limiter of `HERMES_BG_MAX_INFLIGHT` (4, matched to `max_concurrent`)
+with a 240 s queue wait, and the legacy chain `HERMES_BG_FALLBACK`
+(`vnyx-gemini,vnyxv2`) behind it. The agent's guarded re-matte
+(`removeBackgroundKeepingBetter`) stays strict and never falls back. The worker
+sends `origin` and `garment` like the matte step does. The editor's response
+carries `providerUsed`, `fellBack`, `fallbackReason` and `aiCheck`; the UI toasts
+them.
+
+**Rollout.** Deploy Hermes, confirm `/healthz` from the API host, deploy vnyx-api,
+then switch one tenant's `web` column to Hermes in Product settings → Image
+generation and watch `[hermes-cutout]` and `[bg-removal]` log lines for a day
+before widening.
+
+**Headwear keeps its display head (3 Nov 2026, TST-000019, the user's call).** A cap
+is photographed on a mannequin head and the head stays in the picture; the garment
+parsers cut the cap alone and left a small shape floating in the frame. `headwear`
+is now a third `object.families` entry (caps, hats, beanies, visors, berets …;
+"cap sleeve" is not a cap): the v3 parser runs first like bags, then IS-Net as an
+object, judged by the object checks, and the AI check is told the head, face and
+neck are part of the product (`cutout_integrity` `headwear`: a background finding
+naming them holds nothing, before and after storage). Measured on TST-000019's
+front: v3 kept the cap and the whole head, 10 s, AI check passed. Nothing to
+change in vnyx-api: the category hint already names the family.
+
+---
+
 ## What this does NOT cover
 
 `BG_REMOVAL_RETIRED` changes which segmenter runs. It does not re-matte the

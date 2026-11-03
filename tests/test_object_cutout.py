@@ -58,6 +58,9 @@ def pair(gap: int = 80):
     ("Shoes Sandals & Slippers", "footwear"), ("Women Boots", "footwear"),
     ("Backpacks & Bags Tote Bags", "bags"), ("Backpacks & Bags Backpacks", "bags"),
     ("Accessories Wallet", "bags"),
+    # Headwear (3 Nov 2026): a cap on its display head. A cap SLEEVE is a sleeve.
+    ("Accessories Caps, Beanies & hats", "headwear"), ("Hats Bucket Hat", "headwear"),
+    ("Accessories Visor", "headwear"), ("T-Shirts & Tops Cap Sleeve Top", None),
     # Whole words: BOOTCUT jeans are not boots and BAGGY trousers are not a bag.
     ("Bottoms Bootcut Jeans", None), ("Trousers Baggy", None),
     ("T-Shirts & Tops T-Shirts", None), ("", None), (None, None),
@@ -84,7 +87,8 @@ def test_the_route_can_be_turned_off_or_limited_by_origin():
 
 def test_the_shipped_policy_routes_shoes_and_bags():
     ocfg = cutout.object_config()
-    assert ocfg["enabled"] and set(ocfg["families"]) == {"footwear", "bags"}
+    assert ocfg["enabled"] and set(ocfg["families"]) == {"footwear", "bags", "headwear"}
+    assert set(oc.PARSER_FIRST_FAMILIES) == {"bags", "headwear"}
     assert cutout.OBJECT in cutout.config()["strategies"]
     assert cutout.OBJECT in cutout.config()["url_strategies"]
     # v2 and v1 are not in the object chain.
