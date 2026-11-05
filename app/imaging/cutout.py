@@ -183,16 +183,20 @@ DEFAULTS: dict[str, Any] = {
     # per process, 0 = no cap. `model`: null = llm.model_fast.
     "ai_check": {"enabled": True, "model": None, "on_unavailable": "accept",
                  "max_concurrent": 4},
-    # --- GEMINI WHEN THE AI CHECK REFUSES OUR MODELS (5 Nov 2026, the user) ---
+    # --- GEMINI WHEN OUR MODELS ARE REFUSED (5 Nov 2026, the user) ------------
     # These strategies join the END of every chain, whatever the caller allowed,
-    # and run ONLY when the AI check above has refused a candidate this call: our
-    # models first, Gemini only for what they got wrong. KLE-000361: v2 cut a hole
-    # in the grey ribbed waistband (grey like the booth's form); Gemini's
-    # silhouette, applied to the photograph's own pixels (`converted`), kept it
-    # whole at full size with the colours untouched. A refusal by the PIXEL checks
-    # alone does not ask Gemini — that case goes to vnyx-api's own fallback, as
-    # before. [] turns it off; the caller's `skip` and `ai_check=False` win.
+    # and run ONLY when none of our models produced a cut-out that passed every
+    # check — the AI check (KLE-000361: v2 cut a hole in a grey ribbed waistband)
+    # or the pixel checks (BOA-006449: every model's mask "tore" 0.3-0.8% of the
+    # jeans, so the old 880x1174 cut-out was kept and the product held for its
+    # resolution — a re-cut sends the cut-out on file, and with one there
+    # vnyx-api's own Gemini fallback never runs). Gemini's silhouette is applied to
+    # the photograph's own pixels (`converted`): full size, colours untouched.
+    # [] turns it off; the caller's `skip` and `ai_check=False` win.
     "ai_fallback": ["gemini-paint"],
+    # The fallback's cut-out refused ONLY by the backdrop check is accepted when it
+    # agrees with a refused v2/v1 cut-out at least this well (BOA-007642). 0 = off.
+    "ai_fallback_agreement_iou": 0.97,
     "torn_check": True,
     "torn_min": 0.0025,
     # The most one paid call (Gemini, gpt-image) may take, whatever the
@@ -3230,8 +3234,8 @@ def _remove_background(
         first = [s for s in chain if s[0] == HANGER]
         paid = sorted((s for s in chain if s[0] in then), key=lambda s: then.index(s[0]))
         chain = tuple(first + paid + [s for s in chain if s not in first and s not in paid])
-    # THE AI-CHECK FALLBACK (`ai_fallback` in DEFAULTS): appended LAST, asked only
-    # once the AI check has refused a candidate (see the loop).
+    # THE FALLBACK (`ai_fallback` in DEFAULTS): appended LAST, so it is asked only
+    # when none of our models' cut-outs was accepted.
     fallback_only: set[str] = set()
     if ai_on:
         present = {s[0] for s in chain}
@@ -3315,14 +3319,10 @@ def _remove_background(
 
     chain = list(chain)
     for idx, (name, kind, fn) in enumerate(chain):
-        if name in fallback_only and not ai_report["flagged"]:
-            # Our models' answer was refused by the pixel checks, not the AI: no
-            # Gemini call (`ai_fallback`).
-            log.info("bg-removal %s not asked: the AI check refused no candidate", name)
-            attempts.append(f"{name}: not asked — the AI check refused no candidate")
-            continue
         if name in fallback_only:
-            log.info("bg-removal: the AI check refused our models' cut-out — asking %s", name)
+            # Reached only when every model before it was refused (an accepted
+            # cut-out returns from the loop above).
+            log.info("bg-removal: none of our models' cut-outs was accepted — asking %s", name)
         for attempt in range(1, (paid_attempts if kind != "direct" else 1) + 1):
             label = f"{name}#{attempt}"
             converted = False       # a paint answer turned into a mask on the original
@@ -3491,6 +3491,24 @@ def _remove_background(
             # The border says something was removed; this says whether what
             # remains is only the product. See _kept_backdrop.
             clean, backdrop_why = (True, "") if family else _kept_backdrop(data, out, ccfg)
+            if not clean and name in fallback_only and ft_refused:
+                # GEMINI AS THE THIRD VOTE (5 Nov 2026, BOA-007642). A varsity jacket
+                # with white leather sleeves: v2, v1 and Gemini were ALL refused for
+                # a "2% region of backdrop colour #FFFFFF" — the sleeves, not a
+                # podium — and the old 896x1195 cut-out (left shoulder missing) was
+                # kept against a 3000x4000 photo. Gemini is a different vendor from
+                # our parsers, so when its outline agrees with one of their refused
+                # ones the refusal is the check's mistake, as `agreed_cut` takes it
+                # for v2 and v1. Measured there: Gemini/v1 IoU 0.980, Gemini/v2
+                # 0.967, and Gemini's was the only clean hem. The tear check, the
+                # rival check and the AI check below still have their say.
+                need = float(cfg.get("ai_fallback_agreement_iou") or 0.0)
+                best = max((_alpha_agreement(out, b) or 0.0 for b in ft_refused.values()),
+                           default=0.0)
+                if need > 0 and best >= need:
+                    log.info("bg-removal %s: the backdrop check refused it, but it agrees with our "
+                             "refused parser at IoU %.3f — the check misread the garment", label, best)
+                    clean, why = True, f"{why}; agrees with our parsers at IoU {best:.3f} ({backdrop_why})"
             if not clean:
                 log.info("bg-removal %s kept part of the set in %.1fs: %s",
                          label, took, backdrop_why)

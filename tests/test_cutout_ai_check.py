@@ -169,14 +169,20 @@ def test_a_cut_out_the_judge_passes_never_asks_gemini(chain, monkeypatch):
     assert provider == "cloth-seg-ft" and paid == []
 
 
-def test_a_pixel_refusal_alone_never_asks_gemini(chain, monkeypatch):
+def test_a_pixel_refusal_of_every_model_also_asks_gemini(chain, monkeypatch):
+    # BOA-006449: every model's mask "tore" the jeans; the old low-resolution
+    # cut-out was kept and the product stayed held. Gemini is asked last.
     paid: list[str] = []
     monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (paid.append("gemini"), (GEMINI, None))[1])
-    monkeypatch.setattr(cutout, "_is_cutout", lambda b: (False, "no garment found"))
+    refuse_ours = {"n": 0}
+
+    def is_cutout(b):
+        refuse_ours["n"] += 1
+        return (refuse_ours["n"] > 2, "the mask tore 0.3% of the garment out")
+    monkeypatch.setattr(cutout, "_is_cutout", is_cutout)
     chain(lambda cut: True)
     out, err, provider, report = run()
-    assert paid == [] and out is None
-    assert "not asked" in err
+    assert paid == ["gemini"] and provider == "gemini-paint", err
 
 
 def test_the_caller_can_skip_the_fallback(chain, monkeypatch):
@@ -318,3 +324,18 @@ def test_the_gate_tells_the_judge_about_headwear_and_lets_the_head_through(chain
     assert seen["headwear"] is True
     assert out == V2 and provider == "cloth-seg-ft", err
     assert report["ai_check"]["verdicts"][0]["ok"] is True
+
+
+@pytest.mark.parametrize("iou,accepted", [(0.975, True), (0.5, False)])
+def test_gemini_refused_only_by_the_backdrop_check_is_the_third_vote(chain, monkeypatch, iou, accepted):
+    # BOA-007642: white leather sleeves read as backdrop, so v2, v1 AND Gemini were
+    # refused and the old 896x1195 cut-out was kept. Gemini agreeing with one of our
+    # refused parsers means the check misread the garment (0.975: under v2/v1's 0.98,
+    # over the fallback's 0.97).
+    monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (GEMINI, None))
+    monkeypatch.setattr(cutout, "_kept_backdrop",
+                        lambda s, o, c=None: (False, "a single 2% region is its own backdrop colour"))
+    monkeypatch.setattr(cutout, "_alpha_agreement", lambda a, b: iou)
+    chain(lambda cut: True)
+    out, err, provider, report = run()
+    assert (provider == "gemini-paint") is accepted, err
