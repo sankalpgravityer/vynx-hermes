@@ -1654,6 +1654,16 @@ def judge(p: Any, pol: dict[str, Any] | None, *,
     """
     from app.net import fetch_all, image_dims_all
     from app.rules import imagery
+    from app.imaging import neckline as _neckline
+
+    # ONLY A GARMENT WITH A NECKLINE IS ASKED ABOUT ONE (5 Nov 2026). The neckline
+    # window is the top of the garment: on a shoe that is the heel collar and laces,
+    # on a bag its handles, on shorts the waistband — and the 5 Nov review run held 31
+    # such products (10 shoes, 5 bags, 16 bottoms) as "x% of the garment was cut away
+    # at the collar". The same rule the neck finishing uses (neckline.applies_to): tops
+    # and an unknown type, never bottoms, footwear or accessories.
+    necked = _neckline.applies_to(" ".join(x for x in (getattr(p, "category", None),
+                                                       getattr(p, "subcategory", None)) if x) or None)
 
     from app.imaging import framing
 
@@ -1777,7 +1787,7 @@ def judge(p: Any, pol: dict[str, Any] | None, *,
                     check["problems"].append(why)
                 elif why:
                     check["note"] = why
-                else:
+                elif necked:
                     why, fixable = hole_problem(measured_garment, cfg)
                     if why and fixable:
                         check["problems"].append(why)

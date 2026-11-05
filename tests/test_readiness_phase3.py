@@ -1682,3 +1682,28 @@ def test_the_canvas_fallback_can_be_switched_off():
 
 def test_the_shipped_policy_has_the_canvas_fallback():
     assert cutouts.config(POL)["resolution_canvas_max"] == 3.0
+
+
+@pytest.mark.parametrize("category,sub", [("Shoes", "Lifestyle"), ("Backpacks & Bags", "Bag"),
+                                          ("Bottoms", "Shorts"), ("Bottoms", "Trousers")])
+def test_a_product_without_a_neckline_is_never_held_for_one(category, sub):
+    # 5 Nov 2026: 31 shoes, bags and bottoms were held as "x% cut away at the collar".
+    raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg", width=300, height=400)
+    cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png")
+    c, r = neck_pair("collar")
+    fetch, read_dims = fake_io({"https://r2/cut.png": c, "https://r2/raw.jpg": r})
+    p = snap([cut, raw])
+    p.category, p.subcategory = category, sub
+    v = cutouts.judge(p, POL, fetch=fetch, read_dims=read_dims)
+    assert not any("neckline" in r for r in v.reasons + list(getattr(v, "unfixable_reasons", []) or []))
+
+
+def test_a_top_is_still_held_for_a_lost_collar():
+    raw = asset("FRONT", "RAW", id="r1", current=False, url="https://r2/raw.jpg", width=300, height=400)
+    cut = asset("FRONT", "BG_REMOVED", id="c1", derived="r1", url="https://r2/cut.png")
+    c, r = neck_pair("collar")
+    fetch, read_dims = fake_io({"https://r2/cut.png": c, "https://r2/raw.jpg": r})
+    p = snap([cut, raw])
+    p.category, p.subcategory = "T-Shirts & Tops", "T-Shirts"
+    v = cutouts.judge(p, POL, fetch=fetch, read_dims=read_dims)
+    assert any(r.startswith("FRONT: neckline") and "cut away" in r for r in v.reasons)
