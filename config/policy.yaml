@@ -880,9 +880,11 @@ imagery:
       model: null
       on_unavailable: accept
       max_concurrent: 4
-    # GEMINI WHEN THE AI CHECK REFUSES OUR MODELS (5 Nov 2026, the user). Added at
-    # the END of every chain and asked ONLY when the AI check above refused one of
-    # our models' cut-outs this call — our models always go first. Gemini draws the
+    # GEMINI WHEN OUR MODELS ARE REFUSED (5 Nov 2026, the user). Added at the END
+    # of every chain and asked ONLY when none of our models produced a cut-out that
+    # passed every check (the AI check, or the pixel checks — BOA-006449's masks all
+    # "tore" the jeans, so the old low-resolution cut-out was kept). Our models
+    # always go first. Gemini draws the
     # garment on magenta; only its OUTLINE is used, applied to the photograph's own
     # pixels at full size, so the cut-out keeps the photo's resolution and colours
     # (KLE-000361: v2 cut a hole in a grey ribbed waistband; this kept it whole).
@@ -891,6 +893,14 @@ imagery:
     # stored cut-out is still flagged after our models' re-cut. [] turns it off.
     # One Gemini image call + one AI check per refused photo.
     ai_fallback: ["gemini-paint"]
+    # Gemini as the THIRD VOTE (5 Nov 2026, BOA-007642 — white leather sleeves read
+    # as backdrop by the leftover check, so v2, v1 and Gemini were all refused and an
+    # old 896x1195 cut-out with a missing shoulder was kept against a 3000x4000
+    # photo). Gemini's cut-out refused only by that check is accepted when its outline
+    # agrees with one of our refused parsers' at least this well (different vendors
+    # agreeing = the check misread the garment). Tear, rival and AI checks still run.
+    # 0 turns it off.
+    ai_fallback_agreement_iou: 0.97
     # PHOTOS HUNG ON THE WALL (1 Oct 2026; app/imaging/hanger_cutout.py, the
     # `hanger-isnet` strategy). IS-Net finds the whole garment, clips included;
     # only THIN parts at the top — the bar, the hook, the wall wire — are masked,
