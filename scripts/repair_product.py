@@ -2994,6 +2994,60 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         category = " > ".join(x for x in (prod.get("category"), prod.get("sub")) if x) or None
         return _ci.check(rows, list(prod.get("images") or []), category=category, pol=policy())
 
+    def _gemini_fallback() -> list[str]:
+        """`imagery.cutout.ai_fallback` (5 Nov 2026, the user): the strategies a
+        cut-out the AI check still refuses after our models' re-cut goes to."""
+        from app.imaging import cutout as _co
+
+        return [str(n) for n in (_co.config(policy()).get("ai_fallback") or [])
+                if n in _co.STRATEGY_NAMES]
+
+    def _recut_views(views: list[str], plan: list[str] | None) -> tuple[int | None, int | None]:
+        """Re-cut `views` (FRONT/BACK…) through vnyx-api with `plan` strategies; (written, kept)."""
+        provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
+        args = [*common, *live, *(["--provider", provider] if provider else []),
+                "--replace", "--keep-better"]
+        if remote_supports("matteViews"):
+            args.extend(["--views", ",".join(views)])
+        if plan:
+            args.extend(["--bg-strategies", ",".join(plan)])
+        ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args, timeout_s=600, quiet=quiet)
+        pair_parents.update(parents_updated(out))
+        if not ok:
+            raise StepFailed("the re-cut returned non-zero")
+        written = kept = None
+        for line in (out or "").splitlines():
+            low = line.lower()
+            if "cut-outs written" in low:
+                written = _trailing_int(line)
+            elif "kept" in low and ":" in line:
+                kept = _trailing_int(line)
+        if _gc.classify(_media_rows(), [])["duplicates"]:
+            _dedupe()
+        return written, kept
+
+    def _cutcheck_gemini(views: list[str], note: str) -> str:
+        """THE GEMINI FALLBACK (5 Nov 2026): our models' cut-out of these views is
+        still refused by the AI check — re-cut them with Gemini (its silhouette on
+        the photograph's own pixels) and look once more. KLE-000361."""
+        nonlocal integrity_verdict
+        plan = _gemini_fallback()
+        if not plan or not remote_supports("bgStrategies"):
+            return note
+        written, kept = _recut_views(views, plan)
+        cutcheck_report["gemini"] = {"views": views, "strategies": plan, "written": written, "kept": kept}
+        third = _integrity_now()
+        integrity_verdict = third
+        cutcheck_report["after"] = third.as_dict()
+        note += f" — then re-cut {', '.join(views)} with {', '.join(plan)} (our models' cut-out still refused)"
+        if third.action == "unknown":
+            vision_unavailable.append("cutcheck")
+            raise StepFailed(note + " — the AI could not look again: " + third.note)
+        if third.action == "bad":
+            return note + " — STILL: " + "; ".join(third.reasons) + (
+                " (holds as CUTOUT_DEFECT)" if third.blocks else " (soft — readiness.cutouts.hold)")
+        return note + " — looked again: " + _ci.summary(third)
+
     def _cutcheck() -> str:
         nonlocal integrity_verdict
 
@@ -3034,8 +3088,11 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             alt_asked = set(matte_state.get("escalated") or []) | (
                 set(rematte_report.get("views") or []) if rematte_report.get("strategies") else set())
             if not plan or not remote_supports("bgStrategies") or set(views) <= alt_asked:
-                return (f"{found} — not re-cut: every segmenter configured has cut "
+                note = (f"{found} — every segmenter configured has cut "
                         f"{', '.join(views)} this run already")
+                if apply and _gemini_fallback() and remote_supports("bgStrategies"):
+                    return _cutcheck_gemini(views, note)
+                return note.replace(" — every", " — not re-cut: every", 1)
         if not apply:
             # A dry run never holds on what it would fix (the matte step's rule).
             integrity_verdict = _ci.IntegrityVerdict(
@@ -3044,31 +3101,14 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             return (f"{found} — would re-cut {', '.join(views)}"
                     + (f" with {', '.join(plan)}" if plan else "") + " and look again")
 
-        provider = os.getenv("AUTO_APPROVAL_BG_PROVIDER", "hermes").strip()
-        args = [*common, *live, *(["--provider", provider] if provider else []),
-                "--replace", "--keep-better"]
-        if remote_supports("matteViews"):
-            args.extend(["--views", ",".join(views)])
-        if plan:
-            args.extend(["--bg-strategies", ",".join(plan)])
-        ok, out, _ = run_step(vnyx_api, "backfill-bg-removal.ts", args, timeout_s=600, quiet=quiet)
-        pair_parents.update(parents_updated(out))
-        if not ok:
-            raise StepFailed(f"{found} — the re-cut returned non-zero")
-        written = kept = None
-        for line in (out or "").splitlines():
-            low = line.lower()
-            if "cut-outs written" in low:
-                written = _trailing_int(line)
-            elif "kept" in low and ":" in line:
-                kept = _trailing_int(line)
+        try:
+            written, kept = _recut_views(views, plan)
+        except StepFailed as exc:
+            raise StepFailed(f"{found} — {exc}") from exc
         cutcheck_report["recut"] = {"views": views, "strategies": plan, "written": written, "kept": kept}
         note = (f"{found} — re-cut {', '.join(views)}"
                 + (f" with {', '.join(plan)}" if plan else "")
                 + (f" ({kept} kept: the new cut-out had less garment)" if kept else ""))
-        # A re-cut replaces, it does not add: the duplicate it may leave goes first.
-        if _gc.classify(_media_rows(), [])["duplicates"]:
-            _dedupe()
         second = _integrity_now()
         integrity_verdict = second
         cutcheck_report["after"] = second.as_dict()
@@ -3076,8 +3116,13 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             vision_unavailable.append("cutcheck")
             raise StepFailed(note + " — the AI could not look again: " + second.note)
         if second.action == "bad":
-            return note + " — STILL: " + "; ".join(second.reasons) + (
-                " (holds as CUTOUT_DEFECT)" if second.blocks else " (soft — readiness.cutouts.hold)")
+            still = [v for v in dict.fromkeys(b.split()[0] for b in second.bad_views)
+                     if shot_sequence.is_cutout_view(v, _view_roles())]
+            note += " — STILL: " + "; ".join(second.reasons)
+            if still and _gemini_fallback() and remote_supports("bgStrategies"):
+                return _cutcheck_gemini(still, note)
+            return note + (" (holds as CUTOUT_DEFECT)" if second.blocks
+                           else " (soft — readiness.cutouts.hold)")
         return note + " — looked again: " + _ci.summary(second)
 
     if not _ci.config(policy()).get("enabled", True):

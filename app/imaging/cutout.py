@@ -183,6 +183,16 @@ DEFAULTS: dict[str, Any] = {
     # per process, 0 = no cap. `model`: null = llm.model_fast.
     "ai_check": {"enabled": True, "model": None, "on_unavailable": "accept",
                  "max_concurrent": 4},
+    # --- GEMINI WHEN THE AI CHECK REFUSES OUR MODELS (5 Nov 2026, the user) ---
+    # These strategies join the END of every chain, whatever the caller allowed,
+    # and run ONLY when the AI check above has refused a candidate this call: our
+    # models first, Gemini only for what they got wrong. KLE-000361: v2 cut a hole
+    # in the grey ribbed waistband (grey like the booth's form); Gemini's
+    # silhouette, applied to the photograph's own pixels (`converted`), kept it
+    # whole at full size with the colours untouched. A refusal by the PIXEL checks
+    # alone does not ask Gemini — that case goes to vnyx-api's own fallback, as
+    # before. [] turns it off; the caller's `skip` and `ai_check=False` win.
+    "ai_fallback": ["gemini-paint"],
     "torn_check": True,
     "torn_min": 0.0025,
     # The most one paid call (Gemini, gpt-image) may take, whatever the
@@ -374,11 +384,13 @@ PROMPT = (
     "Isolate ONLY the garment in this photograph and place it on a solid "
     "background of pure magenta, RGB (255, 0, 255).\n"
     "\n"
-    "EVERYTHING that is not the garment must become magenta — to the very edges "
-    "of the frame, top to bottom. That includes the mannequin, the mannequin's "
-    "stand and base, the podium or table it rests on, the floor, the walls, any "
-    "backdrop, and anything else in the room such as a ladder, a rail or a "
-    "clamp. Do not leave the lower part of the frame untouched.\n"
+    "EVERYTHING outside the garment must become magenta — to the very edges "
+    "of the frame, top to bottom. That includes the mannequin's stand, pole and "
+    "base, the podium or table it rests on, the floor, the walls, any backdrop, "
+    "and anything else in the room such as a ladder, a rail or a clamp. Do not "
+    "leave the lower part of the frame untouched.\n"
+    "\n"
+    "KEEP THE MANNEQUIN'S NECK: the mannequin's neck where it fills the collar or neckline — and a display head under a cap or hat — stays EXACTLY as it is in the photograph. It belongs to the product picture: without it the collar looks hollow and broken. Everything else of the mannequin is background: the clamp, hook, hanger or bracket ABOVE the neck, and ALL of the mannequin BELOW the garment's bottom hem — its lower body, hips and legs showing under the hem — and its pole, stand and base.\n"
     "\n"
     "Return the SAME garment, unchanged: identical colour, identical texture, "
     "identical shape, identical orientation, identical framing and scale. Do not "
@@ -398,8 +410,9 @@ OPENAI_PROMPT = (
     "Remove the background from this photograph and return ONLY the garment on a "
     "fully transparent background.\n"
     "\n"
-    "Remove everything that is not the garment: the mannequin, its stand and base, "
+    "Remove everything outside the garment: the mannequin's stand, pole and base, "
     "the podium, the hanger, the floor, the walls and anything else in the room. "
+    "KEEP THE MANNEQUIN'S NECK: the mannequin's neck where it fills the collar or neckline — and a display head under a cap or hat — stays EXACTLY as it is in the photograph. It belongs to the product picture: without it the collar looks hollow and broken. Everything else of the mannequin is background: the clamp, hook, hanger or bracket ABOVE the neck, and ALL of the mannequin BELOW the garment's bottom hem — its lower body, hips and legs showing under the hem — and its pole, stand and base. "
     "Any gap you can see through — between a strap and the body, under an arm — "
     "must be transparent too.\n"
     "\n"
@@ -443,9 +456,12 @@ MASK_PROMPT = (
     "\n"
     "Output a pure black-and-white image, the same shape and framing as the "
     "input. Paint PURE WHITE, RGB (255,255,255), over every pixel that is part "
-    "of the garment. Paint PURE BLACK, RGB (0,0,0), over every other pixel — "
-    "the mannequin, its stand and base, the podium, the floor, the walls, the "
-    "backdrop, and anything else in the room such as a ladder or a rail.\n"
+    "of the garment — and over the mannequin's neck where it fills the collar or "
+    "neckline (or a display head under a cap or hat), which belongs to the product "
+    "picture. Paint PURE BLACK, RGB (0,0,0), over everything else — the clamp, hook or "
+    "hanger above the neck, ALL of the mannequin below the garment's bottom hem, its "
+    "pole, stand and base, the podium, the floor, the walls, the backdrop, and anything "
+    "else in the room such as a ladder or a rail.\n"
     "\n"
     "Black must reach the very edges of the frame, top to bottom and left to "
     "right. Do not leave any part of the frame unpainted.\n"
@@ -3192,6 +3208,7 @@ def _remove_background(
                         and not ({"cloth-seg-ft", "cloth-seg-ft-backup", "cloth-seg", BAG_PARSER} & wanted))
     # The bag parser is the bags route's own first step: allowed wherever the object cut is.
     allowed = (lambda n: wanted is None or n in wanted or (n == BAG_PARSER and OBJECT in wanted))
+    every_strategy = {s[0]: s for s in chain}
     chain = tuple(s for s in chain if allowed(s[0]) and s[0] not in banned
                   and (s[0] != HANGER or on_hanger) and (s[0] != OBJECT or family or object_asked)
                   and (s[0] != BAG_PARSER or bag_parsed))
@@ -3213,6 +3230,15 @@ def _remove_background(
         first = [s for s in chain if s[0] == HANGER]
         paid = sorted((s for s in chain if s[0] in then), key=lambda s: then.index(s[0]))
         chain = tuple(first + paid + [s for s in chain if s not in first and s not in paid])
+    # THE AI-CHECK FALLBACK (`ai_fallback` in DEFAULTS): appended LAST, asked only
+    # once the AI check has refused a candidate (see the loop).
+    fallback_only: set[str] = set()
+    if ai_on:
+        present = {s[0] for s in chain}
+        for n in (str(x) for x in (cfg.get("ai_fallback") or [])):
+            if n in every_strategy and n not in present and n not in banned:
+                chain = tuple(chain) + (every_strategy[n],)
+                fallback_only.add(n)
     # ONE ASK PER PAID STRATEGY unless policy says otherwise (`paid_attempts`).
     paid_attempts = max(1, int(cfg.get("paid_attempts") or 1))
     if not chain:
@@ -3289,6 +3315,14 @@ def _remove_background(
 
     chain = list(chain)
     for idx, (name, kind, fn) in enumerate(chain):
+        if name in fallback_only and not ai_report["flagged"]:
+            # Our models' answer was refused by the pixel checks, not the AI: no
+            # Gemini call (`ai_fallback`).
+            log.info("bg-removal %s not asked: the AI check refused no candidate", name)
+            attempts.append(f"{name}: not asked — the AI check refused no candidate")
+            continue
+        if name in fallback_only:
+            log.info("bg-removal: the AI check refused our models' cut-out — asking %s", name)
         for attempt in range(1, (paid_attempts if kind != "direct" else 1) + 1):
             label = f"{name}#{attempt}"
             converted = False       # a paint answer turned into a mask on the original
