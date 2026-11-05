@@ -244,3 +244,25 @@ def test_a_switch_to_the_guide_already_attached_escalates_instead():
                           catalog=CATALOG)
     guide = [a for a in g["repair_plan"] if a.get("field") == "sizingGuide"]
     assert guide and all(a["kind"] == "escalate" for a in guide)
+
+
+# --------------------------------------------------------------------------- #
+# One Size (5 Nov 2026)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("size", ["One Size", "One Size (EU One Size)", "one-size", "OneSize", "OS"])
+def test_a_one_size_product_gets_one_size_as_its_eu_size(images, size):
+    # 113 Review products (bags, caps) said "One Size (EU One Size)" with the EU size
+    # "Unknown" — escalated to a person for a value the size already states.
+    g = approval.run_gate(raw(size=size, internationalSize=size, sizingGuide="Backpacks & Bags",
+                              category="Backpacks & Bags", subCategory="Bags", mannequinType=None),
+                          catalog=CATALOG)
+    assert [a["value"] for a in eu_writes(g)] == ["One Size"]
+    assert images == []
+
+
+def test_a_real_size_is_not_taken_for_one_size(images):
+    g = approval.run_gate(raw(size="S", internationalSize="S", sizingGuide="Men Uppers",
+                              category="T-Shirts & Polos", subCategory="T-Shirt",
+                              mannequinType="Men Top"), catalog=CATALOG)
+    assert [a["value"] for a in eu_writes(g)] == ["46"]
