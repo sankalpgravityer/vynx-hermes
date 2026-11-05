@@ -112,7 +112,13 @@ def test_a_flagged_v2_hands_over_to_v1(chain):
     assert "strap" in ai["verdicts"][0]["defects"][0]
 
 
-def test_every_model_flagged_is_no_cut_out_with_every_verdict(chain):
+def _no_fallback(monkeypatch):
+    base = cutout.config()
+    monkeypatch.setattr(cutout, "config", lambda pol=None: {**base, "ai_fallback": []})
+
+
+def test_every_model_flagged_is_no_cut_out_with_every_verdict(chain, monkeypatch):
+    _no_fallback(monkeypatch)
     chain(lambda cut: False)
     out, err, provider, report = run()
     assert out is None and provider == "none"
@@ -121,13 +127,68 @@ def test_every_model_flagged_is_no_cut_out_with_every_verdict(chain):
     assert ai["flagged"] and [v["ok"] for v in ai["verdicts"]] == [False, False]
 
 
-def test_the_judge_never_adds_a_paid_strategy(chain, monkeypatch):
+GEMINI = png(garment((42, 50, 120)))   # what the Gemini fallback answers
+
+
+def test_with_the_fallback_off_the_judge_adds_no_paid_strategy(chain, monkeypatch):
+    _no_fallback(monkeypatch)
     paid: list[str] = []
     monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (paid.append("gemini"), (None, "x"))[1])
     monkeypatch.setattr(cutout, "_openai", lambda *a, **k: (paid.append("openai"), (None, "x"))[1])
     chain(lambda cut: False)
     out, err, provider, report = run()
     assert out is None and paid == []
+
+
+# --------------------------------------------------------------------------- #
+# Gemini when the AI check refuses our models (5 Nov 2026, `ai_fallback`)
+# --------------------------------------------------------------------------- #
+
+def test_an_ai_refusal_of_our_models_asks_gemini_last(chain, monkeypatch):
+    # KLE-000361: v2 cut a hole in the waistband; Gemini's outline kept it.
+    paid: list[str] = []
+    monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (paid.append("gemini"), (GEMINI, None))[1])
+    seen = []
+    # our two models refused, the third candidate (Gemini's, on the photo's own
+    # pixels — byte-identical here, so judged by order) passed
+    asked = chain(lambda cut: (seen.append(1), len(seen) > 2)[1])
+    out, err, provider, report = run()
+    assert provider == "gemini-paint" and out is not None, err
+    assert paid == ["gemini"]
+    # our two models were judged first, Gemini third
+    assert [v["strategy"] for v in report["ai_check"]["verdicts"]] == [
+        "cloth-seg-ft#1", "cloth-seg-ft-backup#1", "gemini-paint#1"]
+    assert len(asked) == 3
+
+
+def test_a_cut_out_the_judge_passes_never_asks_gemini(chain, monkeypatch):
+    paid: list[str] = []
+    monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (paid.append("gemini"), (GEMINI, None))[1])
+    chain(lambda cut: True)
+    out, err, provider, report = run()
+    assert provider == "cloth-seg-ft" and paid == []
+
+
+def test_a_pixel_refusal_alone_never_asks_gemini(chain, monkeypatch):
+    paid: list[str] = []
+    monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (paid.append("gemini"), (GEMINI, None))[1])
+    monkeypatch.setattr(cutout, "_is_cutout", lambda b: (False, "no garment found"))
+    chain(lambda cut: True)
+    out, err, provider, report = run()
+    assert paid == [] and out is None
+    assert "not asked" in err
+
+
+def test_the_caller_can_skip_the_fallback(chain, monkeypatch):
+    paid: list[str] = []
+    monkeypatch.setattr(cutout, "_gemini", lambda *a, **k: (paid.append("gemini"), (GEMINI, None))[1])
+    chain(lambda cut: False)
+    out, err, provider, report = run(skip=["gemini-paint"])
+    assert paid == [] and out is None
+
+
+def test_the_shipped_policy_falls_back_to_gemini_paint():
+    assert cutout.config().get("ai_fallback") == ["gemini-paint"]
 
 
 def test_an_unavailable_judge_accepts_on_the_pixel_checks(chain):
