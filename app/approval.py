@@ -882,6 +882,10 @@ def _plan_subcategory(p: ProductSnapshot, findings: list[Finding],
     })
 
 
+# "One Size", "One size (EU One Size)", "OneSize", "OS" — a size that is no size.
+_ONE_SIZE = re.compile(r"^\s*(?:one[\s-]?size|onesize|os)\b", re.IGNORECASE)
+
+
 def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
                   plan: list[dict[str, Any]], pol: dict[str, Any]) -> None:
     """Fill an absent EU size from the product's own sizing chart, or correct a
@@ -972,6 +976,20 @@ def _plan_eu_size(p: ProductSnapshot, findings: list[Finding],
     )
     sizes = [s for s in (planned_size, p.size, p.international_size)
              if s and str(s).strip() and not _placeholder(s)]
+    # ONE SIZE (5 Nov 2026): a bag, cap or scarf sold as "One Size" has no EU number —
+    # its EU size IS "One Size", which is what the tenants' own charts pair it with
+    # (BOAS / Klekt "Backpacks & Bags": One Size <-> One Size). 113 Review products
+    # carried "One Size (EU One Size)" with the EU size empty or "Unknown", and
+    # approve-products.ts refuses a blank one, so they were escalated to a person for
+    # a value the size already states. The chart lookup below missed them because the
+    # stored size is "One Size (EU One Size)", not the chart's bare "One Size".
+    if any(_ONE_SIZE.match(str(s)) for s in sizes):
+        plan.append({
+            "kind": "set_property", "field": "eu_size", "value": "One Size",
+            "reason": "DATA.010",
+            "detail": "the size is One Size, so the EU size is One Size",
+        })
+        return
     found = _eu_lookup(p, sizes, pol)
     if found:
         eu, detail = found
