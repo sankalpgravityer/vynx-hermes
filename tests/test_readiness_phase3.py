@@ -477,9 +477,29 @@ def test_a_brighter_patch_of_the_same_wall_is_not_a_form_and_is_not_reported():
     dc.rectangle((165, 60, 180, 130), fill=(60, 60, 90, 255))
     m = cutouts.garment_hole(_png(cut), _png(lit), CFG)
     assert m["aligned"] and m["loss"] == 0                          # nothing was cut away
-    assert m["residue"] > 0.008                                     # and it still measures "an object"
-    assert cutouts.hole_problem(m, CFG) == (None, False)            # …which is why it is off
-    assert cutouts.hole_problem(m, ON)[0]                           # switched on, it would fire
+    # 6 Nov 2026: the wall NEXT TO the garment is the lit wall, so the gap now reads
+    # as an opening — no residue, and not even the residue switch can fire on it.
+    assert m["residue"] == 0 and m["opening"] > 0.008
+    assert cutouts.hole_problem(m, CFG) == (None, False)
+    assert cutouts.hole_problem(m, ON) == (None, False)
+
+
+def test_a_white_top_on_a_vignetted_wall_is_not_a_cut_away_collar():
+    """VIN-000724 (6 Nov 2026): a white top hung in front of a wall that is bright
+    behind the garment and dark at the photo's border. The neck opening shows the
+    bright wall — garment colour, far from the border — and read 13.8% "cut away"."""
+    lit = Image.new("RGB", (300, 400), (98, 97, 97))
+    d = ImageDraw.Draw(lit)
+    d.rectangle((40, 20, 260, 380), fill=(186, 185, 185))          # the lit wall
+    d.rectangle((90, 60, 210, 340), fill=(178, 178, 177))          # the white top
+    d.rectangle((125, 60, 175, 110), fill=(186, 185, 185))         # wall seen through the neck
+    cut = Image.new("RGBA", (300, 400), (255, 255, 255, 0))
+    dc = ImageDraw.Draw(cut)
+    dc.rectangle((90, 60, 210, 340), fill=(178, 178, 177, 255))
+    dc.rectangle((125, 60, 175, 110), fill=(255, 255, 255, 0))
+    m = cutouts.garment_hole(_png(cut), _png(lit), CFG)
+    assert m["loss"] < 0.005, m
+    assert cutouts.hole_problem(m, CFG) == (None, False)
 
 
 def test_a_collar_the_mask_cut_away_is_garment_in_the_photograph_and_is_re_cut():
