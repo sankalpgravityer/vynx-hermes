@@ -339,3 +339,34 @@ def test_gemini_refused_only_by_the_backdrop_check_is_the_third_vote(chain, monk
     chain(lambda cut: True)
     out, err, provider, report = run()
     assert (provider == "gemini-paint") is accepted, err
+
+
+def test_a_magenta_that_fades_at_the_edge_is_still_keyed():
+    # KLE-001619 (6 Nov 2026): Gemini's bottom fifth drifted to (205,100,182).
+    rgb = np.full((H, W, 3), (253, 0, 251), np.uint8)
+    rgb[320:] = (205, 100, 182)                       # the fade, touching the frame's foot
+    rgb[60:280, 70:230] = (60, 60, 90)                # the garment
+    rgb[150:200, 120:180] = (205, 100, 182)           # a pink print INSIDE it: never keyed
+    buf = io.BytesIO(); Image.fromarray(rgb, "RGB").save(buf, format="PNG")
+    out, err = cutout._key_out(buf.getvalue())
+    a = np.asarray(Image.open(io.BytesIO(out)).getchannel("A"))
+    assert err is None and a[390, 150] == 0 and a[175, 150] == 255
+
+
+def test_a_floor_strip_bigger_than_the_garment_is_dropped():
+    # KLE-001619: an unpainted strip of floor across the frame, larger than the hoodie.
+    a = np.zeros((H, W, 4), np.uint8)
+    a[40:220, 80:220] = (60, 60, 90, 255)             # the garment, clear of every edge
+    a[240:, :] = (200, 200, 200, 255)                 # the floor, bigger, at the foot
+    out, n = cutout._drop_stray_pieces(png(a))
+    alpha = np.asarray(Image.open(io.BytesIO(out)).getchannel("A"))
+    assert n == 1 and alpha[300, 150] == 0 and alpha[100, 150] == 255
+
+
+def test_a_garment_that_reaches_the_edge_keeps_its_large_second_piece():
+    # A tight WEB crop: the garment runs into the frame, so no edge rule applies.
+    a = np.zeros((H, W, 4), np.uint8)
+    a[0:300, 0:200] = (60, 60, 90, 255)
+    a[330:390, 230:290] = (60, 60, 90, 255)           # 6% of it, clear: the old size rule keeps it
+    out, n = cutout._drop_stray_pieces(png(a))
+    assert n == 0

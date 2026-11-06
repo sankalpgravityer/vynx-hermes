@@ -1235,8 +1235,34 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
     hole = inside & ~garment & window
     to_garment = dist(r, garment_rgb)
     to_back = dist(r, raw_back)
+    # THE WALL NEXT TO THE GARMENT, NOT ONLY THE BORDER (6 Nov 2026). Vinted's
+    # hung photos are vignetted: the border is dark grey, the wall behind the
+    # garment bright white. A white top's neck opening then showed the WALL in
+    # garment colour and "far from the backdrop" — VIN-000724, VIN-000742,
+    # VIN-001448 read 13-18% "cut away at the collar" on correct cut-outs, and
+    # 75 Review products were held on it. The wall is also taken from a band
+    # just outside the garment's upper half; a hole pixel that matches it is an
+    # opening, never loss. A white top on that white wall cannot be told apart,
+    # which this answers by saying nothing — the AI check still looks at it.
+    near_back = None
+    try:
+        import cv2
+
+        g8 = garment.astype(np.uint8)
+        k = max(3, int(round(width * float(gc.get("near_wall_band") or 0.04))))
+        ring = cv2.dilate(g8, np.ones((k, k), np.uint8)).astype(bool) & \
+            ~cv2.dilate(g8, np.ones((3, 3), np.uint8)).astype(bool)
+        ring[top + max(1, int(gh * 0.5)):] = False
+        if int(ring.sum()) >= 50:
+            near_back = np.median(r[ring], axis=0)
+    except Exception:  # noqa: BLE001 — no cv2: the border alone, as before
+        near_back = None
+    to_near = dist(r, near_back) if near_back is not None else None
     loss = hole & (to_garment < garm_tol) & (to_back > back_tol)
     opening = hole & (to_back <= back_tol)
+    if to_near is not None:
+        loss &= to_near > back_tol
+        opening |= hole & (to_near <= back_tol)
     residue = hole & ~loss & ~opening
     out = {
         "aligned": aligned, "overlap": round(overlap, 3),
@@ -1263,6 +1289,7 @@ def garment_hole(cut_data: bytes, raw_data: bytes, cfg: dict[str, Any]) -> dict[
         "residue": round(float(residue.sum()) / area, 4),
         "opening": round(float(opening.sum()) / area, 4),
         "residue_rgb": [int(v) for v in np.median(r[residue], axis=0)] if residue.any() else None,
+        "near_backdrop_rgb": None if near_back is None else [int(v) for v in near_back],
     }
     return out
 

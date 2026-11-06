@@ -430,6 +430,10 @@ OPENAI_PROMPT = (
 # a saturated field — the ringing around the garment outline is the whole reason
 # this is a distance rather than an equality test.
 KEY_TOLERANCE = 90
+# A fading magenta, keyed only where it reaches the frame's edge (see _key_out):
+# red and blue each at least this far above green, within this distance of the key.
+KEY_LOOSE_MIN = 60
+KEY_LOOSE_DIST = 180
 
 
 # ASK FOR A MASK, NOT A PICTURE. This is the primary strategy; the magenta
@@ -506,6 +510,27 @@ def _key_out(data: bytes) -> tuple[bytes | None, str | None]:
         + ((arr[:, :, 2] - KEY_RGB[2]) ** 2)
     )
     mask = dist <= KEY_TOLERANCE
+
+    # A MAGENTA THAT FADES (6 Nov 2026, KLE-001619): Gemini painted the top flat
+    # magenta and let the bottom fifth drift to (205,100,182) — 130 from the key,
+    # so it stayed "garment", the cut-out kept a pink floor and was refused, and
+    # the old 577x770 cut-out stayed on the product. Magenta-ish pixels (red and
+    # blue well above green) are background too, but ONLY in regions that reach
+    # the frame's edge: a pink or purple garment sits inside the picture and is
+    # never keyed out by this.
+    try:
+        import cv2
+
+        r_, g_, b_ = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+        loose = ((r_ - g_) > KEY_LOOSE_MIN) & ((b_ - g_) > KEY_LOOSE_MIN) & (dist <= KEY_LOOSE_DIST)
+        n, lbl = cv2.connectedComponents(loose.astype(np.uint8), connectivity=8)
+        if n > 1:
+            edge = np.unique(np.concatenate([lbl[0], lbl[-1], lbl[:, 0], lbl[:, -1]]))
+            edge = edge[edge > 0]
+            if edge.size:
+                mask |= np.isin(lbl, edge)
+    except Exception:  # noqa: BLE001 — no cv2: the strict key alone
+        pass
 
     covered = float(mask.mean())
     if covered < 0.02:
@@ -2679,6 +2704,29 @@ def _drop_stray_pieces(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[b
             return png, 0
         areas = stats[1:, cv2.CC_STAT_AREA]
         main = int(np.argmax(areas)) + 1
+        H_, W_ = hard.shape
+
+        def at_edge(i: int) -> bool:
+            x0, y0 = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
+            return x0 == 0 or y0 == 0 or x0 + int(stats[i, cv2.CC_STAT_WIDTH]) >= W_ or \
+                y0 + int(stats[i, cv2.CC_STAT_HEIGHT]) >= H_
+
+        # THE FLOOR IS NOT THE GARMENT (6 Nov 2026, KLE-001619): Gemini left the bottom
+        # fifth of the photo unpainted — a strip of floor across the whole frame,
+        # LARGER than the hoodie hung clear above it — so "the biggest piece" was the
+        # floor and the hoodie could never be kept alone. A garment that floats
+        # clear of the frame's edges, beside a piece that runs into the edge, is
+        # the garment; the edge piece clear of it is the set and goes whatever its size.
+        inner = [i for i in range(1, n) if not at_edge(i)]
+        edge_main = at_edge(main)
+        if edge_main and inner:
+            best = max(inner, key=lambda i: int(stats[i, cv2.CC_STAT_AREA]))
+            if float(stats[best, cv2.CC_STAT_AREA]) >= 0.3 * float(stats[main, cv2.CC_STAT_AREA]):
+                main = best
+            else:
+                edge_main = False
+        else:
+            edge_main = False
         lx0, ly0 = int(stats[main, cv2.CC_STAT_LEFT]), int(stats[main, cv2.CC_STAT_TOP])
         lx1 = lx0 + int(stats[main, cv2.CC_STAT_WIDTH])
         ly1 = ly0 + int(stats[main, cv2.CC_STAT_HEIGHT])
@@ -2686,7 +2734,9 @@ def _drop_stray_pieces(png: bytes, cfg: dict[str, Any] | None = None) -> tuple[b
         min_gap = max(12.0, float(cfg.get("stray_gap_frac") or 0.04) * max(lx1 - lx0, ly1 - ly0))
         drop = []
         for i in range(1, n):
-            if i == main or float(stats[i, cv2.CC_STAT_AREA]) >= max_area:
+            if i == main:
+                continue
+            if float(stats[i, cv2.CC_STAT_AREA]) >= max_area and not (edge_main and at_edge(i)):
                 continue
             x0, y0 = int(stats[i, cv2.CC_STAT_LEFT]), int(stats[i, cv2.CC_STAT_TOP])
             x1, y1 = x0 + int(stats[i, cv2.CC_STAT_WIDTH]), y0 + int(stats[i, cv2.CC_STAT_HEIGHT])
