@@ -2711,6 +2711,55 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             raise StepFailed("vision unavailable — " + "; ".join(photo_verdict.reasons))
         return photo_audit.summary(photo_verdict)
 
+    # ---- 4b-. seqtrim: an older set's renders the sequence no longer has --
+    #
+    # BOA-007881 (6 Nov 2026; shot_sequence.leftover_renders): a sequence re-render
+    # re-makes only the sequence's shots, so the earlier set's close-up and second
+    # front stayed live and the photo audit held 43 BOAS caps for "a different model
+    # than the other renders" on every run. Soft-deleted like `dedupe`'s cut-outs,
+    # then the gallery cache rebuilt so the sync step pushes the cleaner set.
+    def _leftover_renders() -> list[dict[str, Any]]:
+        from app.services.auto_approval import db as _db
+
+        resolved = shot_sequence.from_payload(
+            (needs(dsn, product_id)["loaded"]["record"] or {}).get("shotSequence"))
+        if resolved is None:
+            return []
+        rows = _db.fetch_all(
+            'SELECT id::text, url, view::text, "shotKey", "createdAt" FROM "ProductMedia"'
+            ' WHERE "productId" = %(p)s::uuid AND "deletedAt" IS NULL AND "isCurrent" = true'
+            "   AND \"mediaType\"::text = 'IMAGE' AND view::text LIKE 'AI\\_%%'",
+            {"p": product_id})
+        return shot_sequence.leftover_renders(resolved, rows)
+
+    def _seqtrim() -> str:
+        from app.rules import imagery as _im
+        from app.services.auto_approval import db as _db
+
+        old = _leftover_renders()
+        names = ", ".join(f'{r["view"]} ({r["createdAt"]:%d %b})' for r in old)
+        if not old:
+            return "no render left over from an older set"
+        if not apply:
+            return f"would retire {len(old)} render(s) left over from an older set: {names}"
+        n = _db.execute(
+            'UPDATE "ProductMedia" SET "deletedAt" = now(), "deletedById" = NULL'
+            ' WHERE "productId" = %(p)s::uuid AND id::text = ANY(%(ids)s) AND "deletedAt" IS NULL',
+            {"p": product_id, "ids": [r["id"] for r in old]})
+        respect = bool(_im.gallery_config(policy()).get("respect_manual", True))
+        ok, _, _ = run_step(vnyx_api, "rebuild-media-cache.ts",
+                            [*common, *([] if respect else ["--include-manual"]), *live],
+                            timeout_s=120, quiet=quiet)
+        if not ok:
+            raise StepFailed(f"retired {n} old render(s) but the gallery rebuild failed")
+        return f"retired {n} render(s) the sequence no longer has, left over from an older set: {names}"
+
+    try:
+        seqtrim_why = "" if _leftover_renders() else "no render left over from an older set"
+    except Exception as exc:  # noqa: BLE001 — a failed look is not a reason to fail the chain
+        seqtrim_why = f"could not read the renders ({type(exc).__name__})"
+    step("seqtrim", seqtrim_why, _seqtrim)
+
     photos_why = ("" if (policy().get("photo_audit") or {}).get("enabled", True)
                   else "disabled in policy (photo_audit.enabled)")
     step("photos", photos_why, _photos)

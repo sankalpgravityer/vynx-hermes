@@ -467,11 +467,12 @@ def test_the_default_chain_is_the_free_one(providers):
 
     MID-000132 is what this stops: a photograph cloth-seg could not cut walked
     six paid attempts across the other three strategies, four views over, and
-    produced no cut-out at all."""
+    produced no cut-out at all. 5 Nov 2026 (the user): ONE paid call is allowed —
+    `ai_fallback`'s Gemini, asked once after our models are refused, never retried."""
     providers["answers"]["cloth-seg"] = (None, "cloth-seg declined")
     out, _err, _provider = cutout.remove_background(lit_sweep(), timeout_s=1)
     assert out is None, "nothing usable, and nothing is written"
-    assert providers["calls"] == ["cloth-seg"], providers["calls"]
+    assert providers["calls"] == ["cloth-seg", "gemini-paint"], providers["calls"]
 
 
 def test_banning_the_only_funded_strategy_runs_nothing(providers):
@@ -555,7 +556,8 @@ def test_without_the_model_files_the_policy_chain_is_the_free_stock_parser(provi
                         lambda data: pytest.fail("cloth-seg-ft ran without a model file"))
     providers["answers"]["cloth-seg"] = (None, "declined")
     cutout.remove_background(lit_sweep(), timeout_s=1)
-    assert providers["calls"] == ["cloth-seg"], "and no paid call"
+    # 5 Nov 2026: then the one `ai_fallback` ask, as on every chain whose models refused.
+    assert providers["calls"] == ["cloth-seg", "gemini-paint"], "and only the fallback's paid call"
 
 
 def test_with_the_model_files_the_policy_chain_is_v2_v1_then_gemini(providers, monkeypatch, tmp_path,

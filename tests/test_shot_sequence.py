@@ -291,3 +291,49 @@ def test_the_step_runner_carries_sequence_and_shots(monkeypatch):
     assert sent["step"] == "render"
     assert sent["options"] == {"views": ["AI_CLOSEUP"], "sequence": True, "replace": True,
                                "shots": ["closeup_back"]}
+
+
+# --------------------------------------------------------------------------- #
+# Renders an older set left behind (seqtrim, 6 Nov 2026)
+# --------------------------------------------------------------------------- #
+
+from datetime import datetime, timedelta  # noqa: E402
+
+FOUR = [{"shot": s, "count": 1, "enabled": True} for s in (
+    "three_quarter_front", "three_quarter_back", "full_front", "full_back")]
+OLD, NEW = datetime(2026, 10, 27, 14, 59), datetime(2026, 11, 6, 8, 22)
+
+
+def _r(view, when, key=None):
+    return {"id": f"{view}-{when:%d}", "url": f"x/{view}-{when:%d}.png", "view": view,
+            "shotKey": key, "createdAt": when}
+
+
+def _four(when):
+    return [_r(v, when) for v in ("AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK")]
+
+
+def test_boa_007881_the_old_closeup_and_second_front_go():
+    res = ss.resolve(overrides=[], default_shots=FOUR)
+    rows = _four(NEW) + [_r("AI_CLOSEUP", OLD), _r("AI_FRONT", OLD)]
+    gone = ss.leftover_renders(res, rows)
+    assert sorted((g["view"], g["createdAt"]) for g in gone) == [("AI_CLOSEUP", OLD), ("AI_FRONT", OLD)]
+
+
+def test_one_set_loses_nothing_even_outside_the_sequence():
+    res = ss.resolve(overrides=[], default_shots=FOUR)
+    assert ss.leftover_renders(res, _four(OLD) + [_r("AI_CLOSEUP", OLD + timedelta(minutes=1))]) == []
+
+
+def test_an_incomplete_sequence_loses_nothing():
+    res = ss.resolve(overrides=[], default_shots=FOUR)
+    rows = [r for r in _four(NEW) if r["view"] != "AI_BACK"] + [_r("AI_CLOSEUP", OLD)]
+    assert ss.leftover_renders(res, rows) == []
+
+
+def test_a_shot_the_sequence_has_twice_keeps_both_newest():
+    res = ss.resolve(overrides=[], default_shots=BOAS_DEFAULT)
+    rows = (_four(NEW) + [_r("AI_CLOSEUP", NEW), _r("AI_FRONT", NEW + timedelta(seconds=5))]
+            + [_r("AI_FRONT", OLD)])
+    gone = ss.leftover_renders(res, rows)
+    assert [(g["view"], g["createdAt"]) for g in gone] == [("AI_FRONT", OLD)]
