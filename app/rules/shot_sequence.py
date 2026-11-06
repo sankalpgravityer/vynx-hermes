@@ -436,6 +436,43 @@ def looks_mislabelled(p: Plan, ai_rows: list[Any]) -> bool:
             and not any(is_shot(_get(r, "shot_key", "shotKey")) for r in ai_rows))
 
 
+def leftover_renders(resolved: Resolved, ai_rows: Iterable[Any],
+                     margin_s: float = 600.0) -> list[Any]:
+    """Renders an OLDER set left behind, which the sequence no longer has: [] or the rows.
+
+    BOA-007881 (6 Nov 2026): BOAS accessories render 4 shots; the 27 Oct set also had a
+    close-up and a full-length front. --rerender re-made the 4 shots, the two old ones
+    stayed live beside them, and the photo audit held all 43 such caps for "a different
+    model than the other renders" — which no re-render could ever clear, because the
+    sequence has nothing there to re-render. A render goes only when
+      * every instance of the sequence has a render (never fewer images than it asks), and
+      * it is outside the sequence, or a surplus render of a shot (the NEWEST are kept), and
+      * it is older, by `margin_s`, than every render kept — a leftover of an earlier set.
+    A product whose renders are all one set loses nothing. Rows need `createdAt`."""
+    def when(r: Any) -> Any:
+        return _get(r, "created_at", "createdAt")
+
+    rows = [r for r in ai_rows if when(r) is not None]
+    by_shot: dict[str, list[Any]] = {}
+    outside: list[Any] = []
+    for r in rows:
+        shot = shot_of(r)
+        (by_shot.setdefault(shot, []) if shot else outside).append(r)
+    keep: list[Any] = []
+    for shot in {i.shot for i in resolved.expanded}:
+        wanted = sum(1 for i in resolved.expanded if i.shot == shot)
+        mine = sorted(by_shot.get(shot) or [], key=when, reverse=True)
+        if len(mine) < wanted:
+            return []
+        keep.extend(mine[:wanted])
+    if not keep:
+        return []
+    kept_ids = {id(r) for r in keep}
+    oldest_kept = min(when(r) for r in keep)
+    return [r for r in rows if id(r) not in kept_ids
+            and (oldest_kept - when(r)).total_seconds() > margin_s]
+
+
 def single_shot_views(p: Plan) -> dict[str, Instance]:
     """Views the sequence fills with exactly one LEGACY shot instance.
 

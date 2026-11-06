@@ -3285,9 +3285,11 @@ def _remove_background(
         paid = sorted((s for s in chain if s[0] in then), key=lambda s: then.index(s[0]))
         chain = tuple(first + paid + [s for s in chain if s not in first and s not in paid])
     # THE FALLBACK (`ai_fallback` in DEFAULTS): appended LAST, so it is asked only
-    # when none of our models' cut-outs was accepted.
+    # when none of our models' cut-outs was accepted — and only when at least one of
+    # our models is in the chain: a caller that excluded them all gets "nothing to
+    # run", never a Gemini-only cut-out it did not ask for.
     fallback_only: set[str] = set()
-    if ai_on:
+    if ai_on and chain:
         present = {s[0] for s in chain}
         for n in (str(x) for x in (cfg.get("ai_fallback") or [])):
             if n in every_strategy and n not in present and n not in banned:
