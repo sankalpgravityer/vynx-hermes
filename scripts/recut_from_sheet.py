@@ -117,6 +117,26 @@ def _look(product_id: str) -> Any:
                     category=category, pol=policy())
 
 
+# STRICTER THAN THE CHAIN (12 Nov 2026, BEV-000103). The chain holds broken cloth only
+# on a strap, waistband or belt (cutout_integrity._HOLDS_BROKEN — the AI cried wolf on
+# collars in the 17 Oct review) and NOTES the rest. Every product here was judged bad
+# by a person, so a CLEAR broken-cloth note is believed: BEV-000103's v2 cut-out lost
+# the black zip tape, the collar lining and the cuffs, the AI said so ("cloth broken
+# (zipper) [clear]", "(collar) [clear]"), and the note let it pass. Gemini's cut of the
+# same photo kept all three.
+_STRICT = re.compile(r"CUTOUT DEFECT — (\S+)(?: \d+)? cut-out: cloth broken.*\[clear\]")
+
+
+def _bad_views(verdict: Any) -> list[str]:
+    """The views the chain's verdict holds, plus those with a clear broken-cloth note."""
+    views = [b.split()[0] for b in (verdict.bad_views or [])] if verdict.action == "bad" else []
+    for note in verdict.soft or []:
+        m = _STRICT.match(note)
+        if m:
+            views.append(m.group(1))
+    return list(dict.fromkeys(views))
+
+
 def _fallback() -> list[str]:
     from app.imaging import cutout as co
 
@@ -145,11 +165,11 @@ def recut_one(dsn: str, product_id: str, sku: str, *, apply: bool, vnyx_api: Pat
     from app.imaging import cutout_integrity as ci
 
     verdict = _look(product_id)
-    if verdict.action == "bad":
-        bad = [v for v in dict.fromkeys(b.split()[0] for b in verdict.bad_views) if v in views]
-        log.append("AI check: " + "; ".join(verdict.reasons))
+    bad = [v for v in _bad_views(verdict) if v in views]
+    if bad:
+        log.append("AI check: " + "; ".join(verdict.reasons + [n for n in verdict.soft if _STRICT.match(n)]))
         plan = _fallback()
-        if bad and plan and rp.remote_supports("bgStrategies"):
+        if plan and rp.remote_supports("bgStrategies"):
             ok, lines = _recut(dsn, product_id, vnyx_api, bad, plan)
             log.append(f"re-cut {', '.join(bad)} with {', '.join(plan)}" + ("" if ok else " — non-zero"))
             log += [f"  {ln}" for ln in lines]
@@ -157,11 +177,13 @@ def recut_one(dsn: str, product_id: str, sku: str, *, apply: bool, vnyx_api: Pat
             if n:
                 log.append(f"removed {n} duplicate cut-out(s)")
             verdict = _look(product_id)
+            bad = [v for v in _bad_views(verdict) if v in views]
     if verdict.action == "unknown":
         log.append("AI check could not run: " + (verdict.note or ""))
+    elif bad:
+        log.append("AI check STILL: " + "; ".join(verdict.reasons + [n for n in verdict.soft if _STRICT.match(n)]))
     else:
-        log.append("AI check: " + ci.summary(verdict) if verdict.action != "bad"
-                   else "AI check STILL: " + "; ".join(verdict.reasons))
+        log.append("AI check: " + ci.summary(verdict))
 
     ok, _, _ = rp.run_step(vnyx_api, "rebuild-media-cache.ts",
                            ["--db", dsn, "--product", product_id, "--apply"], timeout_s=120, quiet=True)
@@ -184,7 +206,7 @@ def recut_one(dsn: str, product_id: str, sku: str, *, apply: bool, vnyx_api: Pat
         pushed = "Shopify push queued" if ok and m and int(m.group(1)) else "Shopify push NOT queued"
     log.append(pushed)
 
-    if verdict.action == "bad":
+    if bad:
         res["result"] = "RE-CUT, but the AI check still refuses it — look at it"
     elif verdict.action == "unknown":
         res["result"] = "RE-CUT — the AI check could not run"

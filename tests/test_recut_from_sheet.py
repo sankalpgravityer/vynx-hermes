@@ -101,3 +101,30 @@ def test_nothing_to_cut_is_skipped(world):
     world["views"] = []
     assert _one()["result"].startswith("SKIPPED")
     assert world["calls"] == []
+
+
+NOTED = ci.IntegrityVerdict("ok", soft=[
+    "CUTOUT DEFECT — FRONT cut-out: cloth broken (zipper) — along the central front zipper [clear]",
+    "CUTOUT DEFECT — FRONT cut-out: cloth broken (collar) — left side of the collar opening [clear]"])
+
+
+def test_a_clear_broken_cloth_note_is_believed_and_goes_to_gemini(world):
+    # BEV-000103 (12 Nov 2026): the chain only NOTES a broken zipper and collar; every
+    # product here was judged bad by a person, so the note sends FRONT to Gemini.
+    world["verdicts"] = [NOTED, OK]
+    r = _one()
+    cuts = [c for c in world["calls"] if c[0] == "backfill-bg-removal.ts"]
+    assert len(cuts) == 2 and cuts[1][cuts[1].index("--views") + 1] == "FRONT"
+    assert r["result"].startswith("RE-CUT — passed")
+
+
+def test_a_clear_note_still_there_after_gemini_says_look_at_it(world):
+    world["verdicts"] = [NOTED, NOTED]
+    assert "still refuses" in _one()["result"]
+
+
+def test_a_minor_note_is_not_a_failure(world):
+    world["verdicts"] = [ci.IntegrityVerdict("ok", soft=[
+        "CUTOUT DEFECT — BACK cut-out: cloth broken (hem) — slight [minor]"])]
+    _one()
+    assert len([c for c in world["calls"] if c[0] == "backfill-bg-removal.ts"]) == 1
