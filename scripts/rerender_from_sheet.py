@@ -117,7 +117,9 @@ def _judge(dsn: str, product_id: str) -> tuple[list[str], list[str]]:
         gender=(readiness.root_gender(record.get("masterCategory"), pol) or record.get("gender")),
         category=record.get("category"), subcategory=record.get("subCategory"), pol=pol,
         size=record.get("size") or record.get("internationalSize"),
-        kids=readiness.is_kids(record.get("masterCategory"), record.get("mannequinType"), pol),
+        kids=readiness.is_kids(record.get("masterCategory"), record.get("mannequinType"), pol,
+                             size=record.get("internationalSize") or record.get("size"),
+                             category=record.get("category")),
     )
     photos = photo_audit.judge(
         fresh["media"],
@@ -140,17 +142,26 @@ def _judge(dsn: str, product_id: str) -> tuple[list[str], list[str]]:
 
 
 def rerender_one(dsn: str, product_id: str, sku: str, *, before: datetime, apply: bool,
-                 rounds: int, vnyx_api: Path) -> dict[str, Any]:
+                 rounds: int, vnyx_api: Path, only: list[str] | None = None,
+                 via_hermes: bool = False) -> dict[str, Any]:
     """One product: stale views → render → check → re-render refused → order → Shopify."""
     t0 = time.monotonic()
     log: list[str] = []
     res: dict[str, Any] = {"sku": sku, "id": product_id, "result": "", "log": log}
     stale = rp.stale_render_views(dsn, product_id, before)
+    if only:
+        # --views (13 Nov 2026): the three-quarter back alone, say — the other renders
+        # are fine and each costs a paid call.
+        stale = [v for v in stale if v in only]
     if not stale:
         res["result"] = "SKIPPED — every AI image is already on the current prompt"
         return res
     state = rp.needs(dsn, product_id)
-    by_seq = rp._sequence_render(state)
+    # --via-hermes (13 Nov 2026): render through vnyx-api's non-sequence path, which
+    # asks Hermes' /v1/imagery/generate for the picture — Hermes' prompt (the fixed rear
+    # three-quarter, the kids-size re-cast) without waiting for a vnyx-api deploy.
+    # `--views` without `--sequence` re-makes each named view and retires its old render.
+    by_seq = rp._sequence_render(state) and not via_hermes
     if by_seq:
         seq_views = rp._sequence_views(state) or []
         outside = [v for v in stale if v not in seq_views]
@@ -245,6 +256,10 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=1, metavar="N", help="products at a time (default 1)")
     ap.add_argument("--rounds", type=int, default=2,
                     help="render rounds per product, the first included (default 2: one retry of what the checks refuse)")
+    ap.add_argument("--views", default="", metavar="AI_BACK_34[,…]",
+                    help="only these AI views (e.g. AI_BACK_34); default every old one")
+    ap.add_argument("--via-hermes", action="store_true",
+                    help="render through Hermes' generator (the non-sequence path), not vnyx-api's sequence renderer")
     ap.add_argument("--limit", type=int, default=0, help="stop after N products")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     args = ap.parse_args()
@@ -278,7 +293,9 @@ def main() -> int:
     def run(i: int, pid: str, sku: str) -> None:
         try:
             r = rerender_one(dsn, pid, sku, before=args.before, apply=args.apply,
-                             rounds=max(1, args.rounds), vnyx_api=vnyx_api)
+                             rounds=max(1, args.rounds), vnyx_api=vnyx_api,
+                             only=[v.strip().upper() for v in args.views.split(",") if v.strip()] or None,
+                             via_hermes=args.via_hermes)
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             r = {"sku": sku, "result": f"FAILED — {type(exc).__name__}: {exc}", "log": []}
         key = r["result"].split(" ")[0].rstrip(",")

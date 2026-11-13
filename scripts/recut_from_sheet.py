@@ -82,16 +82,51 @@ def _cut_views(product_id: str) -> list[str]:
 
 def _recut(dsn: str, product_id: str, vnyx_api: Path, views: list[str] | None,
            strategies: list[str] | None) -> tuple[bool, list[str]]:
-    """One backfill-bg-removal.ts call: (ok, its summary lines)."""
+    """One backfill-bg-removal.ts call: (ok, its summary lines). Never raises."""
     args = ["--db", dsn, "--product", product_id, "--apply", "--provider", "hermes", "--replace"]
+    if views is not None:
+        # SKU-000055 (12 Nov 2026): vnyx-api's re-cut call takes FRONT and BACK only and
+        # answered 400 for OTHER, which also threw away the product's whole log.
+        named = [v for v in views if v in REDO_VIEWS]
+        if not named:
+            return False, [f"- {v} FAILED: vnyx-api re-cuts FRONT and BACK only — {v} left as it was"
+                           for v in views]
+        views = named
     if views and rp.remote_supports("matteViews"):
         args += ["--views", ",".join(views)]
     if strategies:
         args += ["--bg-strategies", ",".join(strategies)]
-    ok, out, _ = rp.run_step(vnyx_api, "backfill-bg-removal.ts", args, timeout_s=900, quiet=True)
+    try:
+        ok, out, _ = rp.run_step(vnyx_api, "backfill-bg-removal.ts", args, timeout_s=900, quiet=True)
+    except rp.StepFailed as exc:
+        return False, [f"- {v} FAILED: {exc}" for v in (views or ["ALL"])]
     lines = [ln.strip() for ln in (out or "").splitlines()
              if re.search(r"->|KEPT|FAILED|failed|error|written|cut-outs", ln)]
-    return ok, lines[-8:]
+    return ok, lines
+
+
+def _outcome(lines: list[str], written: set[str], failed: dict[str, str]) -> None:
+    """Fold one re-cut's per-view lines into (views written, views refused → why).
+
+    12 Nov 2026 (BOA-002434, BOA-006434, VIN-000639, VIN-001449): every attempt was
+    refused, so vnyx-api wrote nothing and the OLD cut-out stayed — and the AI, shown
+    that old cut-out, passed it, so the run said "passed the AI check" about a picture
+    it never changed. What was written is now counted, not inferred from the look."""
+    for ln in lines:
+        m = re.match(r"\S+ (\w+)\s+(->|KEPT|FAILED:?)\s*(.*)", ln)
+        if not m:
+            continue
+        view, what, why = m.groups()
+        if what == "->":
+            written.add(view)
+            failed.pop(view, None)
+        else:
+            failed[view] = ("network error (fetch failed) — run it again" if "fetch failed" in why
+                            else (why.split(": ", 1)[-1][:160] or what))
+
+
+# The views vnyx-api's backfill-bg-removal.ts accepts in --views.
+REDO_VIEWS = ("FRONT", "BACK")
 
 
 def _dedupe(dsn: str, product_id: str) -> int:
@@ -155,9 +190,12 @@ def recut_one(dsn: str, product_id: str, sku: str, *, apply: bool, vnyx_api: Pat
         res["result"] = f"WOULD re-cut {', '.join(views)}"
         return res
 
+    written: set[str] = set()
+    failed: dict[str, str] = {}
     ok, lines = _recut(dsn, product_id, vnyx_api, None, None)
+    _outcome(lines, written, failed)
     log.append(f"re-cut {', '.join(views)}" + ("" if ok else " — backfill-bg-removal.ts returned non-zero"))
-    log += [f"  {ln}" for ln in lines]
+    log += [f"  {ln}" for ln in lines[-8:]]
     n = _dedupe(dsn, product_id)
     if n:
         log.append(f"removed {n} duplicate cut-out(s) the re-cut made redundant")
@@ -171,8 +209,9 @@ def recut_one(dsn: str, product_id: str, sku: str, *, apply: bool, vnyx_api: Pat
         plan = _fallback()
         if plan and rp.remote_supports("bgStrategies"):
             ok, lines = _recut(dsn, product_id, vnyx_api, bad, plan)
+            _outcome(lines, written, failed)
             log.append(f"re-cut {', '.join(bad)} with {', '.join(plan)}" + ("" if ok else " — non-zero"))
-            log += [f"  {ln}" for ln in lines]
+            log += [f"  {ln}" for ln in lines[-8:]]
             n = _dedupe(dsn, product_id)
             if n:
                 log.append(f"removed {n} duplicate cut-out(s)")
@@ -185,6 +224,27 @@ def recut_one(dsn: str, product_id: str, sku: str, *, apply: bool, vnyx_api: Pat
     else:
         log.append("AI check: " + ci.summary(verdict))
 
+    log.append(_order_and_push(dsn, product_id, vnyx_api, log))
+
+    kept = {v: w for v, w in failed.items() if v not in written}
+    kept_txt = "; ".join(f"{v}: {w}" for v, w in kept.items())
+    if not written:
+        res["result"] = f"NOT RE-CUT — every attempt was refused, the old cut-outs are still live ({kept_txt})"
+    elif kept:
+        res["result"] = (f"PARTLY — {', '.join(sorted(written))} re-cut; {', '.join(kept)} kept the old "
+                         f"cut-out ({kept_txt})" + (" — and the AI check still refuses it" if bad else ""))
+    elif bad:
+        res["result"] = "RE-CUT, but the AI check still refuses it — look at it"
+    elif verdict.action == "unknown":
+        res["result"] = "RE-CUT — the AI check could not run"
+    else:
+        res["result"] = "RE-CUT — passed the AI check"
+    res["secs"] = round(time.monotonic() - t0)
+    return res
+
+
+def _order_and_push(dsn: str, product_id: str, vnyx_api: Path, log: list[str]) -> str:
+    """The gallery rebuilt, then the Shopify push under the safety rules. Returns the push line."""
     ok, _, _ = rp.run_step(vnyx_api, "rebuild-media-cache.ts",
                            ["--db", dsn, "--product", product_id, "--apply"], timeout_s=120, quiet=True)
     log.append("gallery re-ordered" if ok else "gallery re-order FAILED")
@@ -204,16 +264,18 @@ def recut_one(dsn: str, product_id: str, sku: str, *, apply: bool, vnyx_api: Pat
                                  timeout_s=120, quiet=True)
         m = re.search(r"queued\s*:\s*(\d+)", out or "")
         pushed = "Shopify push queued" if ok and m and int(m.group(1)) else "Shopify push NOT queued"
-    log.append(pushed)
+    return pushed
 
-    if bad:
-        res["result"] = "RE-CUT, but the AI check still refuses it — look at it"
-    elif verdict.action == "unknown":
-        res["result"] = "RE-CUT — the AI check could not run"
-    else:
-        res["result"] = "RE-CUT — passed the AI check"
-    res["secs"] = round(time.monotonic() - t0)
-    return res
+
+def push_one(dsn: str, product_id: str, sku: str, *, apply: bool, vnyx_api: Path) -> dict[str, Any]:
+    """--push-only: no re-cut — the gallery rebuilt and the Shopify push re-sent (12 Nov
+    2026: 16 products' image calls were rate-limited by Shopify during the big run)."""
+    log: list[str] = []
+    if not apply:
+        return {"sku": sku, "id": product_id, "result": "WOULD re-push to Shopify", "log": log}
+    pushed = _order_and_push(dsn, product_id, vnyx_api, log)
+    log.append(pushed)
+    return {"sku": sku, "id": product_id, "result": f"PUSH — {pushed}", "log": log}
 
 
 def main() -> int:
@@ -225,6 +287,8 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=1, metavar="N", help="products at a time (default 1)")
     ap.add_argument("--limit", type=int, default=0, help="stop after N products")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    ap.add_argument("--push-only", action="store_true",
+                    help="no re-cut: rebuild the gallery and re-push to Shopify (same safety rules)")
     args = ap.parse_args()
 
     pf = preflight.check()
@@ -254,7 +318,7 @@ def main() -> int:
 
     def run(i: int, pid: str, sku: str) -> None:
         try:
-            r = recut_one(dsn, pid, sku, apply=args.apply, vnyx_api=vnyx_api)
+            r = (push_one if args.push_only else recut_one)(dsn, pid, sku, apply=args.apply, vnyx_api=vnyx_api)
         except Exception as exc:  # noqa: BLE001 — one product must not stop the batch
             r = {"sku": sku, "result": f"FAILED — {type(exc).__name__}: {exc}", "log": []}
         key = r["result"].split(" — ")[0].split(",")[0]

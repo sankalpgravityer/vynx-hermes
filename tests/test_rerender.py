@@ -56,3 +56,36 @@ def test_the_flag_re_renders_the_stale_views_though_every_check_passed(renders):
 def test_rendered_before_reads_utc_by_default():
     assert rfs._when("2026-11-01 14:30") == datetime(2026, 11, 1, 14, 30, tzinfo=timezone.utc)
     assert rfs._when("2026-11-01T20:00+05:30").utcoffset().total_seconds() == 19800
+
+
+def test_a_sequence_re_render_retires_the_older_sets_leftovers(renders, monkeypatch):
+    # BOA-007716 (13 Nov 2026): the sequence re-made its 4 shots; the 26 Oct second
+    # front and close-up (another model) stayed live. They are retired after the
+    # re-render, when they can first be told apart from the new set.
+    from datetime import datetime as dt
+    from app.services.auto_approval import db as aadb
+
+    monkeypatch.setattr(rp, "_sequence_render", lambda st: True)
+    monkeypatch.setattr(rp, "_sequence_views", lambda st: ["AI_FRONT_34", "AI_BACK_34", "AI_FRONT", "AI_BACK"])
+    rendered = {"done": False}
+    real = rp.run_step
+
+    def step(vnyx_api, script, args, **kw):
+        if script == "backfill-imagery.ts":
+            rendered["done"] = True
+        return real(vnyx_api, script, args, **kw)
+    monkeypatch.setattr(rp, "run_step", step)
+    four = rp.shot_sequence.resolve(overrides=[], default_shots=[
+        {"shot": k, "count": 1, "enabled": True}
+        for k in ("three_quarter_front", "three_quarter_back", "full_front", "full_back")])
+    monkeypatch.setattr(rp.shot_sequence, "from_payload", lambda v: four)
+    old = [{"id": "x", "view": "AI_CLOSEUP", "createdAt": dt(2026, 10, 26)}]
+    monkeypatch.setattr(rp.shot_sequence, "leftover_renders",
+                        lambda res, rows: list(old) if rendered["done"] else [])
+    monkeypatch.setattr(aadb, "fetch_all", lambda *a, **k: [])
+    deleted = []
+    monkeypatch.setattr(aadb, "execute", lambda sql, params=None: (deleted.append(params), 1)[1])
+    r = _repair(approve_from_rejected=False, skip_render=False, force_rerender=True)
+    assert deleted and deleted[0]["ids"] == ["x"]
+    regen = next(s for s in r["steps"] if s["step"] == "regen")
+    assert "retired 1 render(s)" in regen["note"]

@@ -615,3 +615,33 @@ def test_generate_says_so_when_the_tenant_has_no_cast(
     first = [x.getMessage() for x in caplog.records
              if x.name == "model-image-generator"][0]
     assert "NO CAST" in first and "personalities disabled" in first
+
+
+def test_a_childs_size_under_women_is_re_cast_on_a_kid_model(client: TestClient, stub_generation):
+    """VIN-000421 (13 Nov 2026): "10 (140 cm)" shorts filed under Women were rendered on
+    an adult woman. The stored adult traits are ignored, a KID personality is cast, and
+    the prompt is built on the Kids rig at the size's age."""
+    kid = {"name": "Mia", "gender": "female", "age": "10", "group": "kids", "skinTone": "light",
+           "hairColor": "blonde", "hairStyle": "ponytail", "enabled": True}
+    stored = {"personalityName": "Emma Smith", "age": "24", "skinTone": "fair",
+              "hairColor": "dark brown", "hairStyle": "long sleek straight hair"}
+    product = {**PRODUCT, "imageSettings": stored, "category": "Bottoms", "subCategory": "Shorts",
+               "mannequinType": "Bottom", "properties": {"international_size": "10 (140 cm)"}}
+    r = client.post("/v1/imagery/generate", json={
+        "product": product, "media": MEDIA,
+        "settings": {**SETTINGS, "personalities": CAST + [kid]}, "views": ["AI_FRONT"],
+    })
+    assert r.status_code == 200, r.text
+    ctx = stub_generation["ctx"]
+    assert ctx.mannequin_type == "Kids"
+    assert r.json()["image_settings"]["personalityName"] == "Mia"
+
+
+def test_an_adult_size_keeps_the_stored_model(client: TestClient, stub_generation):
+    stored = {"personalityName": "Emma Smith", "age": "24", "skinTone": "fair",
+              "hairColor": "dark brown", "hairStyle": "long sleek straight hair"}
+    product = {**PRODUCT, "imageSettings": stored, "properties": {"international_size": "M"}}
+    r = client.post("/v1/imagery/generate", json={
+        "product": product, "media": MEDIA, "settings": SETTINGS, "views": ["AI_FRONT"]})
+    assert r.status_code == 200
+    assert stub_generation["ctx"].mannequin_type == "Top"

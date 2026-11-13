@@ -123,3 +123,20 @@ def test_not_on_shopify_pushes_nothing(world):
 def test_it_reads_the_render_summary():
     assert rr._read_render("x\nwrote [full_front, closeup]\ncould not produce [full_back]") == (
         ["full_front", "closeup"], ["full_back"])
+
+
+def test_views_limits_the_re_render(world):
+    # 13 Nov 2026: re-make only the three-quarter back.
+    world["stale"] = ["AI_BACK", "AI_BACK_34", "AI_FRONT"]
+    _one(only=["AI_BACK_34"])
+    render = world["calls"][0]
+    assert render[render.index("--views") + 1] == "AI_BACK_34"
+
+
+def test_via_hermes_skips_the_sequence_renderer(world):
+    # 13 Nov 2026: Hermes' prompt, today, without a vnyx-api deploy.
+    world["seq"] = True
+    world["stale"] = ["AI_BACK_34"]
+    _one(only=["AI_BACK_34"], via_hermes=True)
+    render = world["calls"][0]
+    assert "--sequence" not in render and render[render.index("--views") + 1] == "AI_BACK_34"

@@ -128,3 +128,66 @@ def test_a_minor_note_is_not_a_failure(world):
         "CUTOUT DEFECT — BACK cut-out: cloth broken (hem) — slight [minor]"])]
     _one()
     assert len([c for c in world["calls"] if c[0] == "backfill-bg-removal.ts"]) == 1
+
+
+def _answer(world, text):
+    def fake_step(vnyx_api, script, args, **kw):
+        world["calls"].append([script, *map(str, args)])
+        if script == "resync-listings.ts":
+            return True, "queued: 1", None
+        return True, text if script == "backfill-bg-removal.ts" else "", None
+    rc.rp.run_step = fake_step
+
+
+def test_nothing_written_is_not_called_passed(world, monkeypatch):
+    # BOA-002434 (12 Nov 2026): every attempt refused, the old cut-outs stayed, and the
+    # AI passed the OLD ones — the run said "passed". It must say nothing was re-cut.
+    monkeypatch.setattr(rc.rp, "run_step", rc.rp.run_step)
+    _answer(world, "  abc FRONT  FAILED: background removal failed: gemini-paint#1: re-drew the garment\n"
+                   "  abc BACK   FAILED: background removal failed: cloth-seg-ft#1: tore")
+    r = _one()
+    assert r["result"].startswith("NOT RE-CUT") and "FRONT" in r["result"]
+
+
+def test_one_view_refused_is_partly(world, monkeypatch):
+    monkeypatch.setattr(rc.rp, "run_step", rc.rp.run_step)
+    _answer(world, "  abc BACK   -> hermes + #ebebeb  2000x2667 on source 3000x4000  [replace]\n"
+                   "  abc FRONT  FAILED: fetch failed")
+    r = _one()
+    assert r["result"].startswith("PARTLY — BACK re-cut; FRONT kept the old cut-out")
+    assert "run it again" in r["result"]
+
+
+def test_push_only_never_recuts(world):
+    r = rc.push_one("dsn", "pid", "SKU-1", apply=True, vnyx_api=Path("."))
+    assert _scripts(world) == ["rebuild-media-cache.ts", "resync-listings.ts"]
+    assert r["result"] == "PUSH — Shopify push queued"
+
+
+def test_push_only_keeps_the_safety_rules(world):
+    world["status"] = "Draft"
+    rc.push_one("dsn", "pid", "SKU-1", apply=True, vnyx_api=Path("."))
+    assert "resync-listings.ts" not in _scripts(world)
+
+
+def test_an_other_view_the_ai_refuses_is_reported_not_sent(world):
+    # SKU-000055 (12 Nov 2026): --views OTHER made vnyx-api answer 400 and the product's
+    # whole log was lost. OTHER is reported as left as it was; nothing is sent for it.
+    world["views"] = ["BACK", "FRONT", "OTHER"]
+    world["verdicts"] = [ci.IntegrityVerdict("bad", reasons=["CUTOUT DEFECT — OTHER cut-out: colour (x)"],
+                                             bad_views=["OTHER"])]
+    r = _one()
+    cuts = [c for c in world["calls"] if c[0] == "backfill-bg-removal.ts"]
+    assert len(cuts) == 1                                   # no --views OTHER call
+    assert "OTHER kept the old cut-out" in r["result"] and "FRONT and BACK only" in r["result"]
+
+
+def test_a_vnyx_api_error_does_not_lose_the_product(world, monkeypatch):
+    def boom(vnyx_api, script, args, **kw):
+        world["calls"].append([script, *map(str, args)])
+        if script == "backfill-bg-removal.ts":
+            raise rc.rp.StepFailed("backfill-bg-removal.ts: vnyx-api returned 400")
+        return True, "queued: 1", None
+    monkeypatch.setattr(rc.rp, "run_step", boom)
+    r = _one()
+    assert r["result"].startswith("NOT RE-CUT") and "returned 400" in r["result"]
