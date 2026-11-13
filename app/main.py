@@ -1374,6 +1374,24 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
     existing_renders: dict[str, Any] = {}
     for m in imagery_rules.ai_renders(snapshot):
         existing_renders.setdefault(m.view, m)
+
+    # A CHILD'S SIZE ON A PRODUCT FILED AS ADULT (13 Nov 2026, VIN-000421 / VIN-000313:
+    # "10 (140 cm)" under Women, rendered on adult women). The renders already on it
+    # show an adult, so neither they nor the stored traits may carry the identity: the
+    # set is re-cast from the tenant's KID models, on the Kids rig (nanobanana's child
+    # prompt), at the age the size implies.
+    from app import readiness as _rd
+
+    _props = req.product.get("properties") or {}
+    kids_age = None
+    if not _rd.is_kids(snapshot.master_category, snapshot.mannequin, None):
+        if _rd.is_kids(snapshot.master_category, snapshot.mannequin, None,
+                       size=snapshot.international_size or snapshot.size
+                       or _props.get("international_size"), category=snapshot.category):
+            kids_age = _rd.kids_age_from_size(snapshot.international_size, snapshot.size,
+                                              _props.get("international_size"), _props.get("size"))
+    if kids_age is not None:
+        existing_renders = {}
     for candidate in ("AI_FRONT", "AI_FRONT_34", "AI_CLOSEUP", "AI_BACK_34", "AI_BACK"):
         m = existing_renders.get(candidate)
         if m is None or candidate in wanted:
@@ -1399,6 +1417,13 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
     gen_settings = snapshot.imagery_settings or ImagerySettings()
     gender = _product_gender(snapshot)
     stored = req.product.get("imageSettings") or {}
+    if kids_age is not None:
+        stored = {}
+        kid_pool = [p for p in (gen_settings.personalities or [])
+                    if isinstance(p, dict) and str(p.get("group") or "").lower() == "kids"]
+        gen_settings = gen_settings.model_copy(update={"personalities": kid_pool, "age": str(kids_age)})
+        notes.append(f"Kids size on a product filed as adult — re-cast on a child model, age {kids_age} "
+                     f"({len(kid_pool)} kid personality(ies)).")
     chosen: dict[str, Any] | None = None
     identity_from_reference = False
 
@@ -1471,7 +1496,7 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
         settings=gen_settings,
         category=snapshot.category,
         sub_category=snapshot.subcategory,
-        mannequin_type=snapshot.mannequin,
+        mannequin_type="Kids" if kids_age is not None else snapshot.mannequin,
         gender=gender,
         back_inferred=back_bytes is None,
         identity_from_reference=identity_from_reference,

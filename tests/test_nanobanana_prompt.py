@@ -1009,3 +1009,15 @@ def test_a_top_is_unaffected_by_any_of_this():
     for leaked in ("FOOTWEAR", "ACCESSORY", "DOWN TO THE FLOOR",
                    "CROPPED OR ROLLED"):
         assert leaked not in p, leaked
+
+
+def test_rear_three_quarter_of_bottoms_is_a_crop_not_a_full_back():
+    # 13 Nov 2026 (VIN-000988, 970, 974): the three-quarter back came back as a near-copy
+    # of the full-body back. Twin of vnyx-api shot-prompt.ts.
+    c = ctx(category="Jeans", sub_category="Straight Jeans", mannequin_type="Bottom")
+    p34 = build_prompt("back34", c, True)
+    assert "only the camera position changes" not in p34
+    assert "Take ONLY the model's identity" in p34 and "MID-CALF" in p34
+    assert p34.rstrip().endswith("the framing instruction wins.") or "FRAMING TAKES PRIORITY" in p34
+    full = build_prompt("back", c, True)
+    assert "only the camera position changes" in full and "FRAMING TAKES PRIORITY: this is a TIGHT CROP" not in full

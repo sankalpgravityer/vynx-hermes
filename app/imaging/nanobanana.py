@@ -873,8 +873,8 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
             )
         elif is_bottom:
             view_description = (
-                "Lower-body three-quarter back view (waist to feet) focused on the "
-                "bottoms"
+                "Lower-body three-quarter back view (waist to mid-calf, feet cropped "
+                "out) focused on the back of the bottoms"
             )
         else:
             view_description = (
@@ -1111,25 +1111,46 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
         # the model echo the front-facing pose, so the camera position has to be
         # stated in the strongest terms or the back view comes out looking like
         # the front.
+        # A REAR CROP IS NOT THE FRONT'S FRAMING TURNED AROUND (13 Nov 2026, vnyx-api
+        # shot-prompt.ts): "only the camera position changes" kept the full-length
+        # reference's framing on the three-quarter back, which came back as a near-copy
+        # of the full back (VIN-000988, 970, 974). Only the full-body back keeps it.
+        crop_back = view == "back34"
         prompt += (
             ". CRITICAL — REAR (BACK) VIEW: Photograph the model strictly FROM "
-            "BEHIND, with the model facing directly AWAY from the camera. Show ONLY "
-            "the back of the model: the back of the head and hair, the back of the "
-            "shoulders and torso, and the BACK of the garment. The model's face, "
-            "chest, and the front of the garment MUST NOT be visible at all — the "
-            "model's back is fully turned to the camera. This is a true 180° rear "
-            "view, NOT a front, side, or angled view."
+            "BEHIND, with the model facing directly AWAY from the camera. "
+            + ("Show the BACK of the bottoms garment as worn — the seat, rear pockets "
+               "and the back of the legs."
+               if crop_back and is_bottom else
+               "Show ONLY the back of the model: the back of the head and hair, the "
+               "back of the shoulders and torso, and the BACK of the garment.")
+            + " The model's face, chest, and the front of the garment MUST NOT be "
+            "visible at all — the model's back is fully turned to the camera. This is "
+            "a true 180° rear view, NOT a front, side, or angled view."
         )
-        prompt += (
-            " Use the EXACT SAME model as in the front reference image (identical "
-            "gender, hair type, hair color, skin tone, body type, tattoos, "
-            "piercings) — only the camera position changes: it is now directly "
-            "behind the model."
-            if has_front_reference else
-            " Keep the EXACT SAME model as the front view (identical gender, hair "
-            "type, hair color, skin tone, body type, tattoos, piercings) — only the "
-            "camera position changes: it is now directly behind the model."
-        )
+        if crop_back:
+            prompt += (
+                " Take ONLY the model's identity from the front reference image "
+                "(identical gender, hair type, hair color, skin tone, body type, "
+                "tattoos, piercings) — NOT its framing: the camera is now directly "
+                "behind the model AND much closer than in that full-length picture."
+                if has_front_reference else
+                " Keep the EXACT SAME model as the front view (identical gender, hair "
+                "type, hair color, skin tone, body type, tattoos, piercings), with the "
+                "camera directly behind the model and much closer than a full-length "
+                "picture."
+            )
+        else:
+            prompt += (
+                " Use the EXACT SAME model as in the front reference image (identical "
+                "gender, hair type, hair color, skin tone, body type, tattoos, "
+                "piercings) — only the camera position changes: it is now directly "
+                "behind the model."
+                if has_front_reference else
+                " Keep the EXACT SAME model as the front view (identical gender, hair "
+                "type, hair color, skin tone, body type, tattoos, piercings) — only the "
+                "camera position changes: it is now directly behind the model."
+            )
         # The one clause with no counterpart in the TypeScript.
         #
         # Without a back photograph the reference images show the front twice, and
@@ -1208,6 +1229,18 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
                 "appearance — do NOT copy its full-length framing; recompose this "
                 "shot tighter on the product."
             )
+        elif is_bottom and view == "back34":
+            prompt += (
+                " Capture a LOWER-BODY three-quarter REAR shot focused on the bottoms "
+                "(trousers/skirt/shorts): frame from just above the WAIST down to "
+                "MID-CALF, so the seat, the rear pockets and the back of the legs fill "
+                "most of the frame. The FEET and SHOES are CROPPED OUT by the bottom "
+                "edge and the head and upper back are OUT of frame. This must look "
+                "clearly different from the full-body back shot — a much tighter crop "
+                "on the back of the bottoms. IMPORTANT: the front reference image is "
+                "provided ONLY for the model's identity — do NOT copy its full-length "
+                "framing."
+            )
         elif is_bottom:
             prompt += (
                 " Capture a LOWER-BODY three-quarter shot focused on the bottoms "
@@ -1255,6 +1288,17 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
         prompt += (
             " Include realistic skin details like freckles, pores, and fine lines "
             "for authenticity."
+        )
+
+    # The rear three-quarter defends its crop LAST, so it outranks the full-length
+    # reference (vnyx-api needsCropEmphasis, 13 Nov 2026).
+    if view == "back34" and not focus:
+        prompt += (
+            " FRAMING TAKES PRIORITY: this is a TIGHT CROP, not a full-length photograph. "
+            "The reference images show the entire model head-to-toe — do NOT reproduce "
+            "their framing or their subject distance. Move the camera much closer so the "
+            "crop matches the description above exactly. Where the reference images and "
+            "the framing instruction disagree, the framing instruction wins."
         )
 
     # The tenant's own prompt goes FIRST, exactly as banana-nano.ts places it.

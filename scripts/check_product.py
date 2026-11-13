@@ -329,7 +329,9 @@ def inspect(dsn: str, product_id: str, *, measure: bool = False, judge: bool = F
             gender=readiness.root_gender(record.get("masterCategory"), pol) or record.get("gender"),
             category=record.get("category"), subcategory=record.get("subCategory"), pol=pol,
             size=record.get("size") or record.get("internationalSize"),
-            kids=readiness.is_kids(record.get("masterCategory"), record.get("mannequinType"), pol),
+            kids=readiness.is_kids(record.get("masterCategory"), record.get("mannequinType"), pol,
+                                 size=record.get("internationalSize") or record.get("size"),
+                                 category=record.get("category")),
         ).as_dict()
         # EVERY render, not only the lead. The gate looks at one picture; the
         # photo audit sees the other four beside the cut-outs, and it is the

@@ -34,6 +34,8 @@ the thing under judgement and can never rewrite the record it is judged by.
 """
 from __future__ import annotations
 
+import re
+
 from copy import deepcopy
 from typing import Any
 
@@ -204,15 +206,55 @@ def root_gender(master: Any, pol: dict[str, Any] | None) -> str | None:
     return None
 
 
-def is_kids(master: Any, mannequin: Any = None, pol: dict[str, Any] | None = None) -> bool:
-    """A child model's product: a Kids root, or the Kids rig already on it.
+# A CHILD'S SIZE (13 Nov 2026) — twin of vnyx-api src/utils/kids-size.ts. VIN-000421 /
+# VIN-000313, "10 (140 cm)" filed under Women, were rendered on adult women: BOAS and
+# Vinted have no Kids root, so only the size says it. An age ("10Y", "8-9 years",
+# "14 ANS", "age 6", "10 (140 cm)") or a child's height (92-164 cm); a letter size
+# without an age is adult whatever height it quotes ("XL (158-170 cm)").
+_KIDS_AGE = re.compile(r"\b(1[0-6]|[2-9])(?:\s*[-/]\s*(1[0-6]|[2-9]))?\s*(?:y|yr|yrs|years?|ans|jahre|j|a)\b", re.I)
+_KIDS_AGE_WORD = re.compile(r"\bage\s*(1[0-6]|[2-9])\b", re.I)
+_KIDS_AGE_THEN_CM = re.compile(r"^\s*(1[0-6]|[2-9])\s*\(\s*(\d{2,3})\s*cm\s*\)", re.I)
+_KIDS_HEIGHT = re.compile(r"\b(\d{2,3})\s*cm\b", re.I)
+_LETTER_SIZE = re.compile(r"\b(?:XXS|XS|S|M|L|XL|XXL|XXXL|\dXL)\b")
+
+
+def kids_age_from_size(*sizes: Any) -> int | None:
+    """The child's age a size implies, or None for an adult (or unreadable) size."""
+    for raw in sizes:
+        s = str(raw or "").strip()
+        if not s:
+            continue
+        m = _KIDS_AGE_THEN_CM.match(s)
+        if m:
+            return int(m.group(1))
+        m = _KIDS_AGE.search(s) or _KIDS_AGE_WORD.search(s)
+        if m:
+            a = int(m.group(1))
+            b = int(m.group(2)) if m.lastindex and m.lastindex >= 2 and m.group(2) else a
+            return int((a + b) / 2 + 0.5)
+        if _LETTER_SIZE.search(s):
+            continue
+        m = _KIDS_HEIGHT.search(s)
+        if m and 92 <= int(m.group(1)) <= 164:
+            return min(16, max(2, int((int(m.group(1)) - 80) / 6 + 0.5)))
+    return None
+
+
+def is_kids(master: Any, mannequin: Any = None, pol: dict[str, Any] | None = None,
+            size: Any = None, category: Any = None) -> bool:
+    """A child model's product: a Kids root, the Kids rig already on it, or (13 Nov
+    2026) a child's size — not on footwear, where a size is not an age.
 
     Readiness phase 4. The prompt builder renders a child for the `Kids` rig
     (nanobanana.py) and phase 1 derives that rig from a Kids root, so either
     says the same thing; the gate uses it to expect no adult build.
     """
     roots = {flat(r) for r in (config(pol).get("kids_roots") or [])}
-    return flat(master) in roots or flat(mannequin) == "kids"
+    if flat(master) in roots or flat(mannequin) == "kids":
+        return True
+    if size and not re.search(r"shoe|sneaker|boot|footwear|sandal", str(category or ""), re.I):
+        return kids_age_from_size(size) is not None
+    return False
 
 
 def is_genderless_root(master: Any, pol: dict[str, Any] | None) -> bool:

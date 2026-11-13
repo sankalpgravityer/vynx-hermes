@@ -2486,7 +2486,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
 
     from app import readiness as _rd
 
-    is_kids = _rd.is_kids(state.get("master"), state.get("mannequin"), policy())
+    is_kids = _rd.is_kids(state.get("master"), state.get("mannequin"), policy(), size=state.get("size"))
     if skip_render:
         render_why = "--no-render"
     elif state["renders_missing"] <= 0:
@@ -2555,7 +2555,9 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             pol=policy(),
             size=record.get("size") or record.get("internationalSize"),
             kids=readiness.is_kids(record.get("masterCategory"),
-                                   record.get("mannequinType"), policy()),
+                                   record.get("mannequinType"), policy(),
+                                   size=record.get("internationalSize") or record.get("size"),
+                                   category=record.get("category")),
         )
 
     def _gate() -> str:
@@ -3388,6 +3390,21 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         if not ok:
             raise StepFailed("regeneration returned non-zero")
 
+        # THE OLDER SET'S RENDERS GO WITH IT (13 Nov 2026, BOA-007716). A sequence
+        # re-render re-makes only the sequence's shots; the 26 Oct set's second full
+        # front and close-up (a woman, made while the master read Women) stayed live
+        # beside the 5 Nov men's set. `seqtrim` ran BEFORE this step, when everything
+        # was one batch, so only now can it see them.
+        trimmed = ""
+        if apply and plan.get("sequence"):
+            try:
+                if _leftover_renders():
+                    trimmed = _seqtrim()
+            except StepFailed:
+                raise
+            except Exception as exc:  # noqa: BLE001 — a failed look is not a failed render
+                trimmed = f"could not look for an older set's renders ({type(exc).__name__})"
+
         scope = "the whole set" if set(views) >= set(plan["all_views"]) else ", ".join(views)
         why = plan["why"]
         if not apply:
@@ -3396,7 +3413,7 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             # live run would re-render.
             return f"would regenerate {scope} ({why}); the checks would judge the new set", False
 
-        note = f"regenerated {scope} ({why})"
+        note = f"regenerated {scope} ({why})" + (f"; {trimmed}" if trimmed else "")
         if regen_report["failed"]:
             note += f' — could not produce {", ".join(regen_report["failed"])}'
             if regen_report["refused"]:
@@ -3421,7 +3438,11 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
         else:
             outcomes.append(f"gate again: {second.summary()}")
 
-        if "photos" in plan["askers"] or "rerender" in plan["askers"]:
+        # The photo audit looks at EVERY render ("a different model than the other
+        # renders"); the gate's second look sees only the lead — so a whole-set
+        # re-render, or one that retired an older set, is audited again too.
+        if ("photos" in plan["askers"] or "rerender" in plan["askers"]
+                or scope == "the whole set" or trimmed):
             second_p = _judge_photos()
             regeneration["photos_after"] = second_p.as_dict()
             photo_verdict = second_p
