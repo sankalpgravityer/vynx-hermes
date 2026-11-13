@@ -252,8 +252,9 @@ def is_kids(master: Any, mannequin: Any = None, pol: dict[str, Any] | None = Non
     roots = {flat(r) for r in (config(pol).get("kids_roots") or [])}
     if flat(master) in roots or flat(mannequin) == "kids":
         return True
-    if size and not re.search(r"shoe|sneaker|boot|footwear|sandal", str(category or ""), re.I):
-        return kids_age_from_size(size) is not None
+    sizes = size if isinstance(size, (list, tuple)) else (size,)
+    if any(sizes) and not re.search(r"shoe|sneaker|boot|footwear|sandal", str(category or ""), re.I):
+        return kids_age_from_size(*sizes) is not None
     return False
 
 

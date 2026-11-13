@@ -379,7 +379,11 @@ SYSTEM = (
     # 'text overlay' or 'watermark' on renders — the platform's own small badge
     # in a corner, present on every render by design. Not a defect.
     "A small logo badge or watermark in a corner of a render is placed there by "
-    "the platform on purpose and is NOT a defect. Text is a defect only when it "
+    "the platform on purpose and is NOT a defect — but there is exactly ONE. A "
+    "SECOND logo or badge, two marks overlapping each other, or a mark that is "
+    "half-drawn, smeared or garbled is a `clear` render defect (13 Nov 2026: the "
+    "model copied an old badge from its reference under the platform's new one). "
+    "Text is a defect only when it "
     "is generated into the scene itself — on the garment, the body or the "
     "background. Wear on the garment is never an image defect.\n"
     "Separately, say who the GARMENT is cut for from the garment photographs "

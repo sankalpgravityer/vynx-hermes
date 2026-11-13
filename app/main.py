@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -1384,13 +1385,17 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
 
     _props = req.product.get("properties") or {}
     kids_age = None
-    if not _rd.is_kids(snapshot.master_category, snapshot.mannequin, None):
-        if _rd.is_kids(snapshot.master_category, snapshot.mannequin, None,
-                       size=snapshot.international_size or snapshot.size
-                       or _props.get("international_size"), category=snapshot.category):
-            kids_age = _rd.kids_age_from_size(snapshot.international_size, snapshot.size,
-                                              _props.get("international_size"), _props.get("size"))
-    if kids_age is not None:
+    if not _rd.is_kids(snapshot.master_category, snapshot.mannequin, None) and not re.search(
+            r"shoe|sneaker|boot|footwear|sandal", f"{snapshot.category or ''} {snapshot.subcategory or ''}", re.I):
+        # EVERY size field: VIN-000421's column says "M", its label "10 (140 cm)".
+        kids_age = _rd.kids_age_from_size(snapshot.international_size, snapshot.size,
+                                          _props.get("international_size"), _props.get("size"))
+    # A child already on the product (its stored age) is the identity to keep: only an
+    # ADULT set is re-cast, or one view re-rendered would show a different child.
+    _stored_age = str((req.product.get("imageSettings") or {}).get("age") or "").strip()
+    kid_already = _stored_age.isdigit() and int(_stored_age) <= 16
+    recast_kid = kids_age is not None and not kid_already
+    if recast_kid:
         existing_renders = {}
     for candidate in ("AI_FRONT", "AI_FRONT_34", "AI_CLOSEUP", "AI_BACK_34", "AI_BACK"):
         m = existing_renders.get(candidate)
@@ -1398,7 +1403,7 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
             continue
         got = generator.fetch([m.url])
         if m.url in got:
-            front_reference, reference_view = got[m.url], candidate
+            front_reference, reference_view = nanobanana.scrub_marks(got[m.url]), candidate
             notes.append(
                 f"Kept the model identity from the product's existing {candidate} render."
             )
@@ -1417,7 +1422,7 @@ def imagery_generate(req: ImageryGenerateRequest) -> ImageryGenerateResponse:
     gen_settings = snapshot.imagery_settings or ImagerySettings()
     gender = _product_gender(snapshot)
     stored = req.product.get("imageSettings") or {}
-    if kids_age is not None:
+    if recast_kid:
         stored = {}
         kid_pool = [p for p in (gen_settings.personalities or [])
                     if isinstance(p, dict) and str(p.get("group") or "").lower() == "kids"]

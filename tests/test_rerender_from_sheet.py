@@ -46,6 +46,7 @@ def world(monkeypatch):
     monkeypatch.setattr(rr.rp, "vnyx_status", lambda dsn, pid: w["status"])
     monkeypatch.setattr(rr.rp, "vnyx_sellable", lambda dsn, pid: w["sellable"])
     monkeypatch.setattr(rr, "_judge", fake_judge)
+    monkeypatch.setattr(rr, "_badge_views", lambda pid, views: list(w.get("badge", [])))
     monkeypatch.setattr(rr, "_price_change_pending", lambda pid: w.get("pending", False))
     return w
 
@@ -140,3 +141,20 @@ def test_via_hermes_skips_the_sequence_renderer(world):
     _one(only=["AI_BACK_34"], via_hermes=True)
     render = world["calls"][0]
     assert "--sequence" not in render and render[render.index("--views") + 1] == "AI_BACK_34"
+
+
+def test_still_refused_after_the_last_round_is_never_pushed(world):
+    # VIN-000421 (13 Nov 2026): the 3/4 back faded into a white haze, was refused twice
+    # and pushed anyway. A refused picture stays in vnyx only.
+    world["refuse"] = [["AI_BACK_34"], ["AI_BACK_34"]]
+    r = _one()
+    assert "resync-listings.ts" not in _scripts(world)
+    assert "still refuse AI_BACK_34" in r["result"]
+
+
+def test_a_copied_old_badge_is_rendered_again(world):
+    world["badge"] = ["AI_BACK_34"]
+    world["stale"] = ["AI_BACK_34"]
+    r = _one()
+    renders = [c for c in world["calls"] if c[0] == "backfill-imagery.ts"]
+    assert len(renders) == 2 and "resync-listings.ts" not in _scripts(world)

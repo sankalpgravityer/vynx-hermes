@@ -645,3 +645,28 @@ def test_an_adult_size_keeps_the_stored_model(client: TestClient, stub_generatio
         "product": product, "media": MEDIA, "settings": SETTINGS, "views": ["AI_FRONT"]})
     assert r.status_code == 200
     assert stub_generation["ctx"].mannequin_type == "Top"
+
+
+def test_the_label_size_counts_when_the_size_column_is_a_letter(client: TestClient, stub_generation):
+    # VIN-000421: column "M", label "10 (140 cm)" — the child is in the label.
+    kid = {"name": "Mia", "gender": "female", "age": "10", "group": "kids", "skinTone": "light",
+           "hairColor": "blonde", "hairStyle": "ponytail", "enabled": True}
+    product = {**PRODUCT, "internationalSize": "M", "category": "Bottoms", "subCategory": "Shorts",
+               "mannequinType": "Bottom", "properties": {"international_size": "10 (140 cm)"}}
+    r = client.post("/v1/imagery/generate", json={
+        "product": product, "media": MEDIA,
+        "settings": {**SETTINGS, "personalities": CAST + [kid]}, "views": ["AI_FRONT"]})
+    assert r.status_code == 200, r.text
+    assert stub_generation["ctx"].mannequin_type == "Kids"
+
+
+def test_a_child_already_on_the_product_is_kept_not_recast(client: TestClient, stub_generation):
+    stored = {"personalityName": "Mia", "age": "10", "skinTone": "light", "hairColor": "blonde",
+              "hairStyle": "ponytail"}
+    product = {**PRODUCT, "imageSettings": stored, "category": "Bottoms", "subCategory": "Shorts",
+               "mannequinType": "Bottom", "properties": {"international_size": "10 (140 cm)"}}
+    r = client.post("/v1/imagery/generate", json={
+        "product": product, "media": MEDIA, "settings": SETTINGS, "views": ["AI_BACK"]})
+    assert r.status_code == 200
+    assert r.json()["image_settings"]["personalityName"] == "Mia"
+    assert stub_generation["ctx"].mannequin_type == "Kids"
