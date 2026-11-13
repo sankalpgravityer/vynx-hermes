@@ -118,7 +118,8 @@ def _judge(dsn: str, product_id: str) -> tuple[list[str], list[str]]:
         category=record.get("category"), subcategory=record.get("subCategory"), pol=pol,
         size=record.get("size") or record.get("internationalSize"),
         kids=readiness.is_kids(record.get("masterCategory"), record.get("mannequinType"), pol,
-                             size=record.get("internationalSize") or record.get("size"),
+                             size=(record.get("internationalSize"), record.get("size"),
+                                   (record.get("properties") or {}).get("international_size")),
                              category=record.get("category")),
     )
     photos = photo_audit.judge(
@@ -139,6 +140,54 @@ def _judge(dsn: str, product_id: str) -> tuple[list[str], list[str]]:
         views += pv
         why.append("photos: " + "; ".join(r for r in photos.reasons if r.startswith("RENDER DEFECT")))
     return sorted(set(views)), why
+
+
+# THE OLD "vnyx.ai" PILL, COPIED (13 Nov 2026, VIN-000988). Renders made before the
+# VNYX wordmark carry a teal "vnyx.ai" pill; handed over as the identity reference, the
+# model drew it into the new picture, and vnyx-api stamped the wordmark on top — two
+# logos. The pill is never stamped on a new render, so its teal in a bottom corner of
+# one is the copy. Measured, because the photo audit was told the corner badge is fine.
+_PILL_RGB = (64, 180, 160)
+
+
+def copied_badge(data: bytes) -> bool:
+    """Does a NEW render carry the legacy teal pill in a bottom corner?"""
+    import io
+    import numpy as np
+    from PIL import Image
+
+    try:
+        a = np.asarray(Image.open(io.BytesIO(data)).convert("RGB")).astype(np.int32)
+    except Exception:  # noqa: BLE001
+        return False
+    h, w = a.shape[:2]
+    band = a[int(h * 0.86):]
+    hits = 0
+    for x0, x1 in ((0, int(w * 0.35)), (int(w * 0.65), w)):
+        c = band[:, x0:x1]
+        d = np.sqrt(((c - np.array(_PILL_RGB)) ** 2).sum(axis=2))
+        hits = max(hits, float((d < 45).mean()))
+    return hits > 0.01
+
+
+def _badge_views(product_id: str, views: list[str]) -> list[str]:
+    """The just-rendered views whose current render carries the copied pill."""
+    import urllib.request
+
+    rows = db.fetch_all(
+        'SELECT DISTINCT ON (view) view::text AS view, url FROM "ProductMedia"'
+        ' WHERE "productId" = %(p)s::uuid AND "deletedAt" IS NULL AND "isCurrent" = true'
+        '   AND view::text = ANY(%(v)s) ORDER BY view, "createdAt" DESC',
+        {"p": product_id, "v": views})
+    bad = []
+    for r in rows:
+        try:
+            req = urllib.request.Request(r["url"], headers={"User-Agent": "Mozilla/5.0"})
+            if copied_badge(urllib.request.urlopen(req, timeout=60).read()):
+                bad.append(r["view"])
+        except Exception:  # noqa: BLE001 — unreadable is not proof of a copy
+            continue
+    return bad
 
 
 def rerender_one(dsn: str, product_id: str, sku: str, *, before: datetime, apply: bool,
@@ -197,6 +246,10 @@ def rerender_one(dsn: str, product_id: str, sku: str, *, before: datetime, apply
             log.append(f"round {n}: the checks could not run ({type(exc).__name__}: {exc})")
             refused, why = [], []
             break
+        badge = _badge_views(product_id, views)
+        if badge:
+            refused = sorted(set(refused) | set(badge))
+            why = why + [f"the old vnyx.ai badge was drawn into {', '.join(badge)} (copied from the reference)"]
         if not refused:
             log.append(f"round {n}: checks passed")
             break
@@ -217,7 +270,12 @@ def rerender_one(dsn: str, product_id: str, sku: str, *, before: datetime, apply
         #   * no price change waiting on the listing (pendingPriceSync): the push
         #     sends vnyx's price, and with a change pending that would move it.
         status = rp.vnyx_status(dsn, product_id)
-        if not rp.shopify_product_id(dsn, product_id):
+        if refused:
+            # NEVER A REFUSED PICTURE TO THE SHOP (13 Nov 2026, VIN-000421: the 3/4 back
+            # faded into a white haze, the photo audit refused it twice, and the push
+            # sent it anyway). It stays in vnyx only, on the "look at it" list.
+            log.append(f"the checks still refuse {', '.join(refused)} — NOT pushed to Shopify")
+        elif not rp.shopify_product_id(dsn, product_id):
             log.append("not on Shopify — nothing pushed")
         elif status != "Active":
             log.append(f"{status} in vnyx — NOT pushed (a push would send its status); "
@@ -254,8 +312,8 @@ def main() -> int:
                     help="re-render the AI images made before this time (UTC unless an offset is given)")
     ap.add_argument("--apply", action="store_true", help="render and write; without it the plan is printed")
     ap.add_argument("--workers", type=int, default=1, metavar="N", help="products at a time (default 1)")
-    ap.add_argument("--rounds", type=int, default=2,
-                    help="render rounds per product, the first included (default 2: one retry of what the checks refuse)")
+    ap.add_argument("--rounds", type=int, default=3,
+                    help="render rounds per product, the first included (default 3: two retries of what the checks refuse)")
     ap.add_argument("--views", default="", metavar="AI_BACK_34[,…]",
                     help="only these AI views (e.g. AI_BACK_34); default every old one")
     ap.add_argument("--via-hermes", action="store_true",

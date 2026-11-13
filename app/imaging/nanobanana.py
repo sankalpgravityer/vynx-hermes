@@ -815,6 +815,61 @@ def product_focus_framing(view: str, wf: dict[str, Any], has_front_reference: bo
     return out + _PRODUCT_FOCUS_EMPHASIS
 
 
+# THE MARKS ON A REFERENCE RENDER ARE NOT THE PHOTOGRAPH (13 Nov 2026, VIN-000988). An
+# existing render handed over for the model's identity carries the watermark and the
+# "Real product on AI model" caption vnyx-api stamped on it — the old green "vnyx.ai"
+# pill on renders made before the VNYX wordmark — and the image model copied the pill
+# into the new picture, under the new wordmark vnyx-api stamped afterwards: two logos.
+# Both sit in the bottom corners, so those are painted over with the backdrop just
+# above them before the render is sent. The garment and the feet are in the middle.
+MARK_CORNER_W = 0.29
+MARK_CORNER_H = 0.10
+NO_MARKS = (" Do NOT draw any logo, watermark, badge, caption or text anywhere in the image — "
+            "a mark in a reference image is not part of the photograph.")
+# A CROP IS A CUT, NEVER A FADE (13 Nov 2026, VIN-000421): told to crop the rear
+# three-quarter of bottoms at mid-calf, the model faded the lower legs and feet into a
+# white haze instead — a picture the photo audit refused and the shop received.
+CLEAN_EDGES = (" The photograph stays sharp and evenly lit right to every edge of the frame: "
+               "where the framing leaves part of the body out, the frame edge cuts it cleanly — "
+               "never fade, blur, vignette or wash the body or the floor out into white or grey.")
+
+
+def scrub_marks(data: bytes) -> bytes:
+    """`data` with its bottom-left and bottom-right corners painted with the backdrop."""
+    try:
+        from PIL import Image
+        import numpy as np
+
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        a = np.asarray(im).copy()
+        h, w = a.shape[:2]
+        bh, bw = max(1, int(h * MARK_CORNER_H)), max(1, int(w * MARK_CORNER_W))
+        y0 = h - bh
+        for x0, x1 in ((0, bw), (w - bw, w)):
+            strip = a[max(0, y0 - max(2, bh // 4)):y0, x0:x1].reshape(-1, 3)
+            colour = np.median(strip, axis=0) if strip.size else np.array([235, 235, 235])
+            # ONLY THE MARK (13 Nov 2026, VIN-000421): a flat painted box left a washed
+            # patch at the foot of the reference, and the new render faded its own foot
+            # into a white haze. Pixels that are the backdrop keep their own shading;
+            # those that differ from it — the badge, the caption — take its colour.
+            box = a[y0:, x0:x1].astype(np.int32)
+            mark = np.sqrt(((box - colour.astype(np.int32)) ** 2).sum(axis=2)) > 28
+            if mark.any():
+                try:
+                    import cv2
+
+                    mark = cv2.dilate(mark.astype(np.uint8), np.ones((7, 7), np.uint8)).astype(bool)
+                except Exception:  # noqa: BLE001 — undilated is still the mark
+                    pass
+                box[mark] = colour.astype(np.int32)
+                a[y0:, x0:x1] = box.astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(a).save(buf, format="JPEG", quality=95)
+        return buf.getvalue()
+    except Exception:  # noqa: BLE001 — an unreadable reference is sent as it was
+        return data
+
+
 def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> str:
     """The full instruction for one view.
 
@@ -1290,16 +1345,23 @@ def build_prompt(view: str, ctx: PromptContext, has_front_reference: bool) -> st
             "for authenticity."
         )
 
-    # The rear three-quarter defends its crop LAST, so it outranks the full-length
-    # reference (vnyx-api needsCropEmphasis, 13 Nov 2026).
+    # Marks, and the rear three-quarter's crop defence (vnyx-api needsCropEmphasis,
+    # 13 Nov 2026), go just BEFORE the closing "Return ONLY …" so they are the last
+    # instructions and outrank the full-length reference.
+    tail = NO_MARKS + CLEAN_EDGES
     if view == "back34" and not focus:
-        prompt += (
+        tail += (
             " FRAMING TAKES PRIORITY: this is a TIGHT CROP, not a full-length photograph. "
             "The reference images show the entire model head-to-toe — do NOT reproduce "
             "their framing or their subject distance. Move the camera much closer so the "
             "crop matches the description above exactly. Where the reference images and "
             "the framing instruction disagree, the framing instruction wins."
         )
+    closing = " Return ONLY the generated image."
+    if prompt.endswith(closing):
+        prompt = prompt[: -len(closing)] + tail + closing
+    else:
+        prompt += tail
 
     # The tenant's own prompt goes FIRST, exactly as banana-nano.ts places it.
     # A tenant that has written a full specification — BOAS's is 2,825 characters

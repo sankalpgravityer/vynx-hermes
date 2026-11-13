@@ -2556,7 +2556,8 @@ def repair(dsn: str, product_id: str, *, apply: bool, vnyx_api: Path,
             size=record.get("size") or record.get("internationalSize"),
             kids=readiness.is_kids(record.get("masterCategory"),
                                    record.get("mannequinType"), policy(),
-                                   size=record.get("internationalSize") or record.get("size"),
+                                   size=(record.get("internationalSize"), record.get("size"),
+                                   (record.get("properties") or {}).get("international_size")),
                                    category=record.get("category")),
         )
 

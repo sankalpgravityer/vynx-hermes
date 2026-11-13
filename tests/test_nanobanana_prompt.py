@@ -1021,3 +1021,23 @@ def test_rear_three_quarter_of_bottoms_is_a_crop_not_a_full_back():
     assert p34.rstrip().endswith("the framing instruction wins.") or "FRAMING TAKES PRIORITY" in p34
     full = build_prompt("back", c, True)
     assert "only the camera position changes" in full and "FRAMING TAKES PRIORITY: this is a TIGHT CROP" not in full
+
+
+def test_reference_marks_are_scrubbed_and_never_drawn():
+    # VIN-000988 (13 Nov 2026): the old green "vnyx.ai" pill on the reference render was
+    # copied into the new picture, under the wordmark vnyx-api stamped afterwards.
+    import io as _io
+    from PIL import Image, ImageDraw
+    from app.imaging import nanobanana as nb
+
+    im = Image.new("RGB", (300, 400), (230, 230, 230))
+    d = ImageDraw.Draw(im)
+    d.rectangle((120, 60, 180, 380), fill=(30, 40, 90))          # the model, centre
+    d.rectangle((250, 375, 295, 395), fill=(40, 180, 160))       # the pill, bottom right
+    d.rectangle((5, 380, 80, 395), fill=(20, 20, 20))            # the caption, bottom left
+    buf = _io.BytesIO(); im.save(buf, format="PNG")
+    out = Image.open(_io.BytesIO(nb.scrub_marks(buf.getvalue()))).convert("RGB")
+    assert all(abs(c - 230) < 12 for c in out.getpixel((270, 385)))
+    assert all(abs(c - 230) < 12 for c in out.getpixel((40, 388)))
+    assert out.getpixel((150, 385))[2] > 60                     # the model is untouched
+    assert "Do NOT draw any logo, watermark" in build_prompt("back34", ctx(), True)

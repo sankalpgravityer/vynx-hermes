@@ -22,3 +22,8 @@ def test_is_kids_reads_the_size_but_not_on_shoes():
     assert not r.is_kids("Women", "Bottom", None, size="M", category="Trousers")
     assert not r.is_kids("Women", None, None, size="10Y", category="Shoes")
     assert not r.is_kids("Women", "Bottom", None)            # no size: as before
+
+
+def test_is_kids_reads_every_size_field():
+    # VIN-000421: column "M", label "10 (140 cm)".
+    assert r.is_kids("Women", "Bottom", None, size=("M", None, "10 (140 cm)"), category="Shorts")
